@@ -1,0 +1,129 @@
+{
+  "affected_users": {
+    "attribute_name": "task_assignees",
+    "created_at": "2026-08-29T12:00:06Z",
+    "entity": { "id": 31, "type": "Task" },
+    "event_type": "Shotgun_Task_Change",
+    "id": 7,
+    "meta": {
+      "affected_human_user_ids": [17, 23],
+      "attribute_name": "task_assignees",
+      "entity_id": 31,
+      "entity_type": "Task",
+      "type": "attribute_change"
+    },
+    "project": { "id": 5, "type": "Project" },
+    "session_uuid": "00000000-0000-0000-0000-000000000007",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "api_user_retirement": {
+    "attribute_name": null,
+    "created_at": "2026-08-29T12:00:04Z",
+    "entity": { "id": 13, "type": "ApiUser" },
+    "event_type": "Shotgun_ApiUser_Retirement",
+    "id": 5,
+    "meta": { "entity_id": 13, "entity_type": "ApiUser", "type": "retirement" },
+    "project": null,
+    "session_uuid": null,
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "asset_change": {
+    "attribute_name": "code",
+    "created_at": "2026-08-29T12:00:01Z",
+    "entity": { "id": 7, "type": "Asset" },
+    "event_type": "Shotgun_Asset_Change",
+    "id": 2,
+    "meta": {
+      "attribute_name": "code",
+      "entity_id": 7,
+      "entity_type": "Asset",
+      "new_value": "Tree B",
+      "old_value": "Tree A",
+      "type": "attribute_change"
+    },
+    "project": { "id": 5, "type": "Project" },
+    "session_uuid": "00000000-0000-0000-0000-000000000002",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "asset_new": {
+    "attribute_name": null,
+    "created_at": "2026-08-29T12:00:00Z",
+    "entity": { "id": 7, "type": "Asset" },
+    "event_type": "Shotgun_Asset_New",
+    "id": 1,
+    "meta": { "entity_id": 7, "entity_type": "Asset", "type": "new_entity" },
+    "project": { "id": 5, "type": "Project" },
+    "session_uuid": "00000000-0000-0000-0000-000000000001",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "group_change": {
+    "attribute_name": "users",
+    "created_at": "2026-08-29T12:00:07Z",
+    "entity": { "id": 29, "type": "Group" },
+    "event_type": "Shotgun_Group_Change",
+    "id": 8,
+    "meta": {
+      "attribute_name": "users",
+      "entity_id": 29,
+      "entity_type": "Group",
+      "type": "attribute_change"
+    },
+    "project": null,
+    "session_uuid": "00000000-0000-0000-0000-000000000008",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "human_user_change": {
+    "attribute_name": "name",
+    "created_at": "2026-08-29T12:00:05Z",
+    "entity": { "id": 17, "type": "HumanUser" },
+    "event_type": "Shotgun_HumanUser_Change",
+    "id": 6,
+    "meta": {
+      "attribute_name": "name",
+      "entity_id": 17,
+      "entity_type": "HumanUser",
+      "type": "attribute_change"
+    },
+    "project": null,
+    "session_uuid": "00000000-0000-0000-0000-000000000006",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "permission_rule": {
+    "attribute_name": null,
+    "created_at": "2026-08-29T12:00:03Z",
+    "entity": { "id": 3, "type": "PermissionRuleSet" },
+    "event_type": "Shotgun_PermissionRuleSet_ChangeRule",
+    "id": 4,
+    "meta": {
+      "entity_id": 3,
+      "entity_type": "PermissionRuleSet",
+      "type": "permission_rule"
+    },
+    "project": null,
+    "session_uuid": null,
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
+  "schema_field_change": {
+    "attribute_name": "code",
+    "created_at": "2026-08-29T12:00:02Z",
+    "entity": null,
+    "event_type": "Shotgun_SchemaField_Change",
+    "id": 3,
+    "meta": {
+      "entity_type": "Asset",
+      "field_name": "code",
+      "type": "field_definition_change"
+    },
+    "project": null,
+    "session_uuid": null,
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  }
+}

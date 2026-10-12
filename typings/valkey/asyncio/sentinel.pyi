@@ -1,0 +1,9 @@
+from valkey.asyncio.connection import Connection, ConnectionPool
+
+class SentinelManagedConnection(Connection): ...
+
+class SentinelConnectionPool(ConnectionPool):
+    def __init__(
+        self, service_name: str, sentinel_manager: object, **connection_kwargs: object
+    ) -> None: ...
+    async def get_master_address(self) -> tuple[str, int]: ...

@@ -1,0 +1,128 @@
+{
+  "Asset": {
+    "active": {
+      "data_type": { "value": "checkbox" },
+      "properties": {}
+    },
+    "budget": {
+      "data_type": { "value": "currency" },
+      "properties": {}
+    },
+    "code": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    },
+    "created_at": {
+      "data_type": { "value": "date_time" },
+      "properties": {}
+    },
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "linked": {
+      "data_type": { "value": "entity" },
+      "properties": { "valid_types": { "value": ["Shot", "Asset"] } }
+    },
+    "project": {
+      "data_type": { "value": "entity" },
+      "properties": { "valid_types": { "value": ["Project"] } }
+    },
+    "related": {
+      "data_type": { "value": "multi_entity" },
+      "properties": { "valid_types": { "value": ["Shot", "Asset"] } }
+    },
+    "sg_url": {
+      "data_type": { "value": "url" },
+      "properties": {}
+    },
+    "status": {
+      "data_type": { "value": "status_list" },
+      "properties": {}
+    },
+    "tags": {
+      "data_type": { "value": "tag_list" },
+      "properties": { "valid_types": { "value": ["Tag"] } }
+    },
+    "task": {
+      "data_type": { "value": "entity" },
+      "properties": { "valid_types": { "value": ["Task"] } }
+    },
+    "thumbnail": {
+      "data_type": { "value": "image" },
+      "properties": {}
+    }
+  },
+  "Project": {
+    "archived": {
+      "data_type": { "value": "checkbox" },
+      "properties": {}
+    },
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "name": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    }
+  },
+  "Shot": {
+    "code": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    },
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    }
+  },
+  "Step": {
+    "code": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    },
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "owner": {
+      "data_type": { "value": "entity" },
+      "properties": { "valid_types": { "value": ["HumanUser"] } }
+    }
+  },
+  "HumanUser": {
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "name": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    }
+  },
+  "Tag": {
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "name": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    }
+  },
+  "Task": {
+    "content": {
+      "data_type": { "value": "text" },
+      "properties": {}
+    },
+    "id": {
+      "data_type": { "value": "number" },
+      "properties": {}
+    },
+    "step": {
+      "data_type": { "value": "entity" },
+      "properties": { "valid_types": { "value": ["Step"] } }
+    }
+  }
+}

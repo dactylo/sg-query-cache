@@ -1,0 +1,175 @@
+# ==========================================================
+# Build System
+# ==========================================================
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27" ]
+
+# ==========================================================
+# Project Metadata
+# ==========================================================
+[project]
+name = "sg-query-cache"
+version = "0.1.0"
+description = "Query caching for Autodesk Flow Production Tracking"
+keywords = [ "cache", "flow-production-tracking", "queries", "shotgrid", "shotgun", "valkey" ]
+license = "MIT"
+license-files = [ "LICENSE" ]
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Typing :: Typed",
+]
+dynamic = [ "readme" ]
+dependencies = [
+  "typing-extensions>=4.5",
+]
+# Tested minor family only: valkey_async.py overrides pool internals; see docs/development.md.
+optional-dependencies.valkey = [
+  "valkey>=6.1.1,<6.2",
+]
+urls.Documentation = "https://github.com/dactylo/sg-query-cache/tree/main/docs"
+urls.Homepage = "https://github.com/dactylo/sg-query-cache"
+urls.Issues = "https://github.com/dactylo/sg-query-cache/issues"
+urls.Repository = "https://github.com/dactylo/sg-query-cache"
+scripts.sg-query-cache = "sg_query_cache._cli:main"
+
+[dependency-groups]
+dev = [
+  "defsort==0.1; python_version>='3.13'",
+  "mdformat",
+  "mdformat-config",
+  "mdformat-frontmatter",
+  "mdformat-gfm",
+  "mdformat-pyproject",
+  "mdformat-ruff",
+  "mdformat-shfmt",
+  "pyproject-fmt",
+  "pyright",
+  "ruff",
+  { include-group = "test" },
+]
+test = [
+  "pytest",
+  "pytest-xdist>=3.2",
+]
+
+[tool.hatch]
+metadata.hooks.fancy-pypi-readme.content-type = "text/markdown"
+metadata.hooks.fancy-pypi-readme.fragments = [ { path = "README.md" } ]
+build.targets.wheel.packages = [ "src/sg_query_cache" ]
+build.targets.sdist.include = [ "/README.md", "/src" ]
+
+# Keep checkout links relative; package links target this release.
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(!\[[^\]\n]*\]\()(?![A-Za-z][A-Za-z0-9+.-]*:|[/#])(?:\./)?([^\s)]+)(\))'
+replacement = '\1https://raw.githubusercontent.com/dactylo/sg-query-cache/v$HFPR_VERSION/\2\3'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?<!!)(\[[^\]\n]+\]\()(?![A-Za-z][A-Za-z0-9+.-]*:|[/#])(?:\./)?([^\s)]+)(\))'
+replacement = '\1https://github.com/dactylo/sg-query-cache/blob/v$HFPR_VERSION/\2\3'
+
+[tool.uv]
+# CI supplies the native Taplo CLI; its Python package lacks Linux/Windows ARM wheels.
+exclude-dependencies = [
+  { package = { name = "mdformat-config", version = "0.2.1" }, dependencies = [ "taplo" ] },
+]
+
+# ==========================================================
+# Ruff Configuration
+# ==========================================================
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+format.quote-style = "single"
+format.exclude = [ "*.md" ]
+lint.select = [ "ALL" ]
+lint.ignore = [
+  "COM812", # Conflicts with the Ruff formatter
+  "CPY001", # Copyright notices are not required
+  "EM101",  # Exception must not use string literal
+  "EM102",  # Exception must not use f-string literal
+  "FBT001", # Boolean positional arg in function definition
+  "FBT002", # Boolean default value in function definition
+  "Q000",   # Conflicts with the Ruff formatter
+  "Q003",   # Conflicts with the Ruff formatter
+  "TRY003", # Avoid specifying long messages outside exception class
+]
+# Same-file collaborators use private implementation members.
+lint.per-file-ignores."benchmarks/async_query_cache.py" = [
+  "SLF001",
+  "T201",   # print() found
+]
+lint.per-file-ignores."benchmarks/query_cache.py" = [
+  "SLF001",
+  "T201",   # print() found
+]
+lint.per-file-ignores."src/sg_query_cache/_async_cache.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/_async_client.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/_cache.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/_cli.py" = [ "T201" ]  # print() found
+lint.per-file-ignores."src/sg_query_cache/_dependencies.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/_event_mapping.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/_local_store.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/daemon_plugin.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/valkey.py" = [ "SLF001" ]
+lint.per-file-ignores."src/sg_query_cache/valkey_async.py" = [ "SLF001" ]
+lint.per-file-ignores."tests/**/*.py" = [
+  "D",       # No docstrings required in tests
+  "PLR2004", # Allow magic values in tests
+  "S101",    # Allow asserts in tests
+  "S603",    # Allow subprocess calls in tests
+  "S607",    # Allow partial executable paths in tests
+  "SLF001",  # Tests intentionally inspect and patch private state
+  "T201",    # print() found
+]
+# Preserve the upstream exception names in local third-party stubs.
+lint.per-file-ignores."typings/valkey/exceptions.pyi" = [ "A001" ]
+lint.pydocstyle.convention = "google"
+
+[tool.pyproject-fmt]
+max_supported_python = "3.15"
+
+# ==========================================================
+# Pyright Configuration
+# ==========================================================
+[tool.pyright]
+pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
+typeCheckingMode = "strict"
+extraPaths = [ ".", "src" ]
+executionEnvironments = [
+  { root = "tests", reportPrivateUsage = "none" },
+  { root = "." },
+]
+
+# ==========================================================
+# Pytest Configuration
+# ==========================================================
+[tool.pytest]
+ini_options.testpaths = [ "tests" ]
+ini_options.pythonpath = [ "src" ]
+ini_options.addopts = [ "-q", "--strict-markers", "--tb=short" ]
+ini_options.markers = [
+  "elasticache: requires separately approved failover of disposable ElastiCache resources",
+  "integration: requires explicitly configured disposable services or sibling source",
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+ini_options.faulthandler_timeout = 300
+
+# ==========================================================
+# defsort Configuration
+# ==========================================================
+[tool.defsort]
+method-bodies = "across-categories"
+
+# ==========================================================
+# Mdformat Configuration (Requires mdformat-pyproject)
+# ==========================================================
+[tool.mdformat]
+wrap = 99  # Keep in sync with tool.ruff.line-length
+number = true

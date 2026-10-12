@@ -1,0 +1,9 @@
+class Connection:
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+
+class SSLConnection(Connection):
+    check_hostname: bool
+
+class ConnectionPool:
+    def make_connection(self) -> Connection: ...

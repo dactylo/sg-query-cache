@@ -1,0 +1,12 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+  "formatter": {
+    "useEditorconfig": true,
+    "includes": ["*.json", "*.jsonc", "src/**", "tests/**"]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  }
+}

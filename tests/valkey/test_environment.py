@@ -2,6 +2,7 @@ import pytest
 
 from tests.valkey import _integration_helpers as helpers
 from tests.valkey._environment import topology_settings
+from tests.valkey._integration_helpers import Profile
 
 
 def test_bracketed_ipv6_sentinel_addresses_reach_discovery_without_brackets(
@@ -35,3 +36,26 @@ def test_bracketed_ipv6_sentinel_addresses_reach_discovery_without_brackets(
     topology = helpers.Topology('sentinel', settings)
     helpers.primary(topology, 'metadata')
     assert seen == [(('::1', 26379), ('::2', 26380), ('::3', 26381))]
+
+
+@pytest.mark.parametrize('profile', ['sentinel', 'managed'])
+def test_failover_topology_uses_integration_timeout_budgets(profile: Profile) -> None:
+    environ = {
+        'SG_QUERY_CACHE_TEST_SENTINEL_ADDRESSES': ','.join(
+            f'127.0.0.1:{port}' for port in (26379, 26380, 26381)
+        )
+    }
+    for role in ('METADATA', 'RESULT'):
+        prefix = f'SG_QUERY_CACHE_TEST_{role}'
+        environ.update(
+            {
+                f'{prefix}_HOST': '127.0.0.1',
+                f'{prefix}_PORT': '6379' if role == 'METADATA' else '6380',
+                f'{prefix}_DATABASE': '0',
+                f'{prefix}_TLS': 'false',
+                f'SG_QUERY_CACHE_TEST_SENTINEL_{role}_SERVICE': role.lower(),
+            }
+        )
+    settings = topology_settings(profile, environ)
+    assert settings.limits.connect_timeout_seconds == 2.0
+    assert settings.limits.operation_timeout_seconds == 5.0

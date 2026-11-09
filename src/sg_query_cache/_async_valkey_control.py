@@ -12,9 +12,11 @@ from valkey.exceptions import NoScriptError
 
 from sg_query_cache._async_support import LoopAffinity
 from sg_query_cache._backend import (
+    BACKEND_ERRORS,
     BackendCapacity,
     BackendProtocolError,
     BackendUnavailable,
+    FailureClass,
     StaleIncarnation,
 )
 from sg_query_cache._metrics import MetricsSink, NullMetrics
@@ -54,6 +56,7 @@ from sg_query_cache._valkey_scripts import (
     CONTROL_CREATE_SCRIPT_SHA,
     CONTROL_ROTATE_SCRIPT,
     CONTROL_ROTATE_SCRIPT_SHA,
+    client_failure_class,
     translate_client_error,
 )
 
@@ -66,11 +69,19 @@ class ScriptClient(Protocol):
     """Execute and load cached scripts on one asynchronous connection."""
 
     async def evalsha(self, sha: str, numkeys: int, *args: ScriptArgument) -> object:
-        """Execute one cached script with ordered keys and arguments."""
+        """Execute a cached script for a backend metadata or result operation.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.evalsha`.
+        """
         ...
 
     async def script_load(self, script: bytes | str) -> object:
-        """Load one exact script and return its digest."""
+        """Load a backend script for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.script_load`.
+        """
         ...
 
 
@@ -78,15 +89,27 @@ class PinnedControlClient(ScriptClient, Protocol):
     """Read the commands needed to validate writable primary state."""
 
     async def exists(self, key: str) -> object:
-        """Return whether one key exists."""
+        """Check control-key presence for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.exists`.
+        """
         ...
 
     async def get(self, key: str) -> object:
-        """Return one raw string value."""
+        """Read the control record for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.get`.
+        """
         ...
 
     async def info(self, section: str) -> object:
-        """Return one server information section."""
+        """Read replication information for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.info`.
+        """
         ...
 
 
@@ -94,7 +117,39 @@ class ResultClient(Protocol):
     """Run result work on one prepared pin through role settlement."""
 
     async def run_operation(self, operation: Callable[[ScriptClient], Awaitable[_T]]) -> _T:
-        """Execute result work within one observed physical-connection span."""
+        """Run result work within one verified physical-connection span.
+
+        Borrowing uses `valkey.asyncio.Valkey.client`; discovery uses
+        `valkey.asyncio.sentinel.SentinelConnectionPool.get_master_address`.
+        Those methods own their upstream contracts. Callback command contracts
+        belong to the corresponding `valkey.asyncio.Valkey` methods.
+
+        Callback failures propagate after successful settlement; settlement
+        failures take precedence. Cancellation skips settlement and joins pin
+        release.
+
+        Args:
+            operation: Callback receiving a pinned client valid only for this
+                call. It may issue multiple commands. Await its result before
+                settlement.
+
+        Returns:
+            The callback result after endpoint and connection state settle
+            unchanged.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            Exception: The callback fails and role settlement succeeds.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         ...
 
 
@@ -106,15 +161,76 @@ class ControlClient(PinnedControlClient, Protocol):
         ...
 
     def pin(self) -> AbstractAsyncContextManager[PinnedControlClient]:
-        """Borrow one physical connection for a complete validation."""
+        """Borrow one physical connection for a complete backend operation.
+
+        Borrowing follows `valkey.asyncio.Valkey.client`; release follows
+        `valkey.asyncio.Valkey.aclose`. Those methods own their upstream
+        contracts.
+
+        Join release before propagating cancellation.
+
+        Returns:
+            A context manager yielding a command wrapper for one physical
+            connection, valid only inside its context and released on exit.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         ...
 
     async def refresh(self) -> None:
-        """Discard the current pool and construct a fresh connection."""
+        """Discard the current pool and construct its lazy replacement.
+
+        The replacement is constructed after detachment; it is not a borrowed
+        pin.
+
+        Pool release uses `valkey.asyncio.Valkey.aclose`, which owns the
+        upstream release contract. This boundary normalizes client failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         ...
 
     async def refresh_endpoint(self) -> None:
-        """Explicitly refresh Sentinel discovery when applicable."""
+        """Refresh primary discovery and discard a pool whose endpoint changed.
+
+        Do nothing when the role has no endpoint probe.
+
+        Discovery arguments, results and upstream errors are owned by
+        `valkey.asyncio.sentinel.SentinelConnectionPool.get_master_address`;
+        this boundary normalizes discovery failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         ...
 
 
@@ -163,11 +279,10 @@ class AsyncValkeyControl:
             metrics: Optional synchronous telemetry destination.
 
         Raises:
-            BackendProtocolError: The prefix or validation interval is invalid.
             BackendUnavailable: The jitter source fails or returns an invalid
                 interval.
         """
-        interval = validation_interval(key_prefix, validation_seconds, jitter_factory)
+        interval = validation_interval(validation_seconds, jitter_factory)
         self._client = client
         self._clock = clock
         self._control_key = control_key(key_prefix)
@@ -239,9 +354,14 @@ class AsyncValkeyControl:
         return decode_exists(await self._call(lambda: client.exists(candidate.counter_key)))
 
     async def _read_replication_id(self, client: PinnedControlClient) -> str:
-        """Read and validate the writable primary's replication identity."""
+        """Read the writable primary's replication identity, discarding a demoted pool."""
         raw = await self._call(lambda: client.info('replication'))
-        return primary_replication_id(raw)
+        try:
+            return primary_replication_id(raw)
+        except BackendUnavailable:
+            # A replica reply identifies a demoted node, like a READONLY error.
+            await self._discard_pool()
+            raise
 
     async def _refresh_endpoint(self) -> None:
         """Refresh Sentinel discovery explicitly when the client supports it."""
@@ -311,7 +431,12 @@ class AsyncValkeyControl:
             return (), error, False
         return (), None, True
 
-    async def _settle(self, client: PinnedControlClient, initial_epoch: RoleEpoch) -> None:
+    async def _settle(
+        self,
+        client: PinnedControlClient,
+        initial_epoch: RoleEpoch,
+        operation_class: FailureClass | None,
+    ) -> None:
         """Settle one returned or raised operation outcome against its epoch."""
         failure: Exception | None = None
         try:
@@ -320,7 +445,13 @@ class AsyncValkeyControl:
             failure = error
         if span_epoch(self._client.epoch(), client) != initial_epoch:
             await self._discard_pool()
-            raise BackendUnavailable('Valkey role changed during operation')
+            failure_class = (
+                client_failure_class(failure) if failure is not None else operation_class
+            )
+            del failure
+            raise BackendUnavailable(
+                'Valkey role changed during operation', failure_class=failure_class
+            ) from None
         if failure is not None:
             raise failure
 
@@ -380,7 +511,9 @@ class AsyncValkeyControl:
                         candidate,
                         operation,
                     )
-                    await self._settle(client, initial_epoch)
+                    await self._settle(
+                        client, initial_epoch, client_failure_class(operation_failure)
+                    )
                     if rotation_required:
                         self._increment('old_incarnation_rejected')
                         self._clear_validation()
@@ -451,19 +584,6 @@ class AsyncValkeyControl:
 
         return await self.run(identity, force=force)
 
-    async def _rotate_incarnation(self, observed: Incarnation) -> Incarnation:
-        """Rotate the observed incarnation and adopt the winning state."""
-
-        async def rotate_active(client: PinnedControlClient, _active: Incarnation) -> bool:
-            replication_id = await self._read_replication_id(client)
-            status, _candidate = await self._rotate(client, observed.record, replication_id)
-            return status == 'rotated'
-
-        if await self.run(rotate_active, force=True):
-            self._increment('rotated')
-        self._clear_validation()
-        return await self._validate_incarnation(force=True)
-
 
 async def execute_commit(  # noqa: PLR0913 - explicit commit deadline inputs
     client: ResultClient,
@@ -522,7 +642,7 @@ async def execute_commit(  # noqa: PLR0913 - explicit commit deadline inputs
     failure: Exception | None = None
     try:
         return await client.run_operation(operation)
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error
@@ -560,7 +680,7 @@ async def execute_script(
         return await client.evalsha(sha, len(keys), *keys, *args)
     except NoScriptError:
         pass
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error
@@ -572,7 +692,7 @@ async def execute_script(
         return await client.evalsha(sha, len(keys), *keys, *args)
     except NoScriptError:
         raise BackendUnavailable('Valkey script cache remained unavailable') from None
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error

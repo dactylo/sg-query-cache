@@ -1,10 +1,13 @@
 import asyncio
 import socket
 import ssl
+import subprocess
+import sys
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from traceback import format_exception
 from typing import Any, Literal, Protocol, TypeAlias, TypeVar, cast
 
 import pytest
@@ -14,7 +17,7 @@ from valkey.asyncio.connection import AbstractConnection, SSLConnection
 from valkey.asyncio.retry import Retry
 from valkey.backoff import NoBackoff
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
-from valkey.exceptions import DataError, NoScriptError, ReadOnlyError
+from valkey.exceptions import DataError, NoScriptError, ReadOnlyError, ResponseError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
 import sg_query_cache._async_support as support
@@ -60,11 +63,20 @@ from sg_query_cache._valkey_scripts import (
     RESOLVE_SCRIPT_SHA,
 )
 from tests._exceptions import exception_text as _exception_text
-from tests._fakes import _FakeClock, _RecordingMetrics
+from tests._fakes import (
+    PRIMARY_INFO,
+    FakeClock,
+    RecordingMetrics,
+    valkey_passwords,
+    valkey_test_settings,
+)
 from tests._tls import TLS_CA, perform_tls_handshake
-from tests._valkey_control_cases import _RECORD_A, _RECORD_B
+from tests._valkey_control_cases import RECORD_A, RECORD_B
 from tests.valkey._async_helpers import BackendClient
 
+# Fake transports answer at once, so only host scheduling delay can spend an operation or
+# close budget; a generous one keeps that delay from failing tests about other behavior.
+_FAKE_TRANSPORT_LIMITS = LimitSettings(operation_timeout_seconds=5.0)
 _T = TypeVar('_T')
 
 _AsyncClientPath: TypeAlias = Literal[
@@ -73,6 +85,85 @@ _AsyncClientPath: TypeAlias = Literal[
     'sentinel-primary',
     'standalone',
 ]
+
+
+class _DeadlineRole:
+    def __init__(self, role: str, clock: FakeClock, *, half_open: bool) -> None:
+        self.role = role
+        self.metrics = RecordingMetrics()
+        settings = CacheSettings(
+            limits=LimitSettings(operation_timeout_seconds=5, circuit_failure_threshold=1)
+        )
+        self.client = BackendClient(
+            [
+                ('info', {'role': 'master', 'master_replid': 'primary'}),
+                ('get', RECORD_A),
+                ('exists', 1),
+                ('info', {'role': 'master', 'master_replid': 'primary'}),
+                ('get', RECORD_A),
+                ('exists', 1),
+            ]
+        )
+        metadata = module.AsyncValkeyMetadataStore(self.client, settings, self.metrics)
+        if role == 'metadata':
+            self.owner = metadata
+            self.guard = metadata._guard
+            self.breaker = metadata._breaker
+        else:
+            backend = module.AsyncValkeyBackend(self.client, metadata, settings, self.metrics)
+            self.owner = backend
+            self.guard = backend._result_guard
+            self.breaker = backend._result_breaker
+        self.breaker._clock = clock
+        if half_open:
+            self.breaker.fail()
+            clock.advance(settings.limits.circuit_probe_seconds)
+        self.metrics.increments.clear()
+
+    async def operation(self) -> object:
+        if isinstance(self.owner, module.AsyncValkeyBackend):
+            return await self.owner.lookup('key')
+        return await self.owner.resolve((DependencyTag.site('site'),))
+
+    def transitions(self, outcome: str) -> list[dict[str, str]]:
+        return [
+            labels
+            for name, labels in self.metrics.increments
+            if name == 'backend_failure'
+            and labels.get('backend_operation') == self.role
+            and labels.get('outcome') == outcome
+        ]
+
+
+class _DeadlineStall:
+    def __init__(self, clock: FakeClock, settlement: str) -> None:
+        self.clock = clock
+        self.settlement = settlement
+        self.cleanup_entered = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        self.cancellations = 0
+        self.calls = 0
+        self.expired_at: float | None = None
+
+    async def __call__(self, _sha: str, _numkeys: int, *_args: object) -> object:
+        self.calls += 1
+        self.clock.advance(1)
+        try:
+            await _deadline_turn()
+            # Advance the fallback timer so an ignored deadline fails without hanging.
+            self.clock.advance(5)
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            self.expired_at = self.clock()
+            if self.settlement != 'stalled':
+                self.cleanup_entered.set()
+                try:
+                    await self.cleanup_release.wait()
+                except asyncio.CancelledError:
+                    self.cancellations += 1
+                    raise
+            raise
 
 
 class _PrimaryDiscovery:
@@ -86,50 +177,50 @@ class _TLSContextConnection(Protocol):
 
 class _Transport:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._wires: list[_Wire] = []
-        self._replies: deque[bytes] = deque()
-        self._connect_entered = asyncio.Event()
-        self._connect_proceed = asyncio.Event()
-        self._connect_proceed.set()
+        self.wires: list[_Wire] = []
+        self.replies: deque[bytes] = deque()
+        self.connect_entered = asyncio.Event()
+        self.connect_proceed = asyncio.Event()
+        self.connect_proceed.set()
 
         async def connect(connection: Connection) -> None:
-            wire = _Wire(self._replies)
-            self._wires.append(wire)
-            connection._reader = wire._reader
+            wire = _Wire(self.replies)
+            self.wires.append(wire)
+            connection._reader = wire.reader
             connection._writer = cast('asyncio.StreamWriter', wire)
-            self._connect_entered.set()
-            await self._connect_proceed.wait()
+            self.connect_entered.set()
+            await self.connect_proceed.wait()
 
         monkeypatch.setattr(Connection, '_connect', connect)
 
 
 class _Wire:
     def __init__(self, replies: deque[bytes]) -> None:
-        self._reader = asyncio.StreamReader()
-        self._sent: list[bytes] = []
-        self._closed = False
-        self._drain_entered = asyncio.Event()
-        self._drain_proceed = asyncio.Event()
-        self._drain_proceed.set()
-        self._close_error: Exception | None = None
+        self.reader = asyncio.StreamReader()
+        self.sent: list[bytes] = []
+        self.closed = False
+        self.drain_entered = asyncio.Event()
+        self.drain_proceed = asyncio.Event()
+        self.drain_proceed.set()
+        self.close_error: Exception | None = None
         self._replies = replies
 
     def close(self) -> None:
-        self._closed = True
-        if self._close_error is not None:
-            raise self._close_error
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
     async def drain(self) -> None:
-        self._drain_entered.set()
-        await self._drain_proceed.wait()
+        self.drain_entered.set()
+        await self.drain_proceed.wait()
 
     async def wait_closed(self) -> None:
         pytest.fail('owned connections must not wait for graceful shutdown')
 
     def writelines(self, lines: Iterable[bytes]) -> None:
-        self._sent.append(b''.join(lines))
+        self.sent.append(b''.join(lines))
         if self._replies:
-            self._reader.feed_data(self._replies.popleft())
+            self.reader.feed_data(self._replies.popleft())
 
 
 def _bulk(payload: bytes) -> bytes:
@@ -157,6 +248,13 @@ async def _configured_connection(
     return configured, raw.connection_pool.make_connection()
 
 
+async def _deadline_turn() -> None:
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    loop.call_soon(ready.set_result, None)
+    await ready
+
+
 def _proving_role(mode: str) -> module._RoleClient:
     tracker = module._ConnectionGeneration(prove_primary=True)
 
@@ -165,13 +263,13 @@ def _proving_role(mode: str) -> module._RoleClient:
             module._SentinelConnectionPool(
                 'service',
                 _PrimaryDiscovery(),
-                valkey_connect_func=tracker._initialize,
+                valkey_connect_func=tracker.initialize,
                 lib_name=None,
                 lib_version=None,
             )
             if mode == 'sentinel'
             else module._ConnectionPool(
-                valkey_connect_func=tracker._initialize,
+                valkey_connect_func=tracker.initialize,
                 lib_name=None,
                 lib_version=None,
             )
@@ -186,20 +284,21 @@ def _proving_role(mode: str) -> module._RoleClient:
 def test_backend_close_applies_one_budget_after_join_and_attempts_later_roles() -> None:
     async def scenario() -> None:
         result, metadata = BackendClient([]), BackendClient([])
-        result._close_proceed.clear()
+        result.close_proceed.clear()
         settings = CacheSettings(limits=LimitSettings(operation_timeout_seconds=0.001))
         backend = module.AsyncValkeyBackend(
             result, cast('module.AsyncValkeyMetadataStore', metadata), settings, NullMetrics()
         )
         closer = asyncio.create_task(backend.close())
         try:
-            done, _pending = await asyncio.wait((closer,), timeout=0.1)
+            # Only a hung close should exhaust this guard; host load can delay the budget's expiry.
+            done, _pending = await asyncio.wait((closer,), timeout=5.0)
             assert done == {closer}
             with pytest.raises(BackendUnavailable, match='deadline'):
                 await closer
-            assert result._closed == metadata._closed == 1
+            assert result.closed == metadata.closed == 1
         finally:
-            result._close_proceed.set()
+            result.close_proceed.set()
             await asyncio.gather(closer, return_exceptions=True)
 
     asyncio.run(scenario())
@@ -208,8 +307,8 @@ def test_backend_close_applies_one_budget_after_join_and_attempts_later_roles() 
 def test_backend_close_joins_repeated_caller_cancellation_and_attempts_all_failures() -> None:
     async def scenario() -> None:
         result, metadata = BackendClient([]), BackendClient([])
-        result._close_proceed.clear()
-        result._close_error = ValueError('first close failed')
+        result.close_proceed.clear()
+        result.close_error = ValueError('first close failed')
         backend = module.AsyncValkeyBackend(
             result,
             cast('module.AsyncValkeyMetadataStore', metadata),
@@ -217,19 +316,19 @@ def test_backend_close_joins_repeated_caller_cancellation_and_attempts_all_failu
             NullMetrics(),
         )
         first, second = asyncio.create_task(backend.close()), asyncio.create_task(backend.close())
-        await result._close_entered.wait()
+        await result.close_entered.wait()
         first.cancel('first')
         barrier = asyncio.Event()
         asyncio.get_running_loop().call_soon(barrier.set)
         await barrier.wait()
         first.cancel('second')
-        result._close_proceed.set()
+        result.close_proceed.set()
         with pytest.raises(asyncio.CancelledError, match='first'):
             await first
         with pytest.raises(ValueError, match='first close failed'):
             await second
         assert first.cancelling() == 2
-        assert result._closed == metadata._closed == 1
+        assert result.closed == metadata.closed == 1
 
     asyncio.run(scenario())
 
@@ -245,7 +344,7 @@ def test_backend_close_keeps_first_interruption_before_later_ordinary_failure() 
                 await asyncio.Event().wait()
 
         result, metadata = _InterruptedClose([]), BackendClient([])
-        metadata._close_error = ValueError('later resource failure')
+        metadata.close_error = ValueError('later resource failure')
         backend = module.AsyncValkeyBackend(
             result,
             cast('module.AsyncValkeyMetadataStore', metadata),
@@ -254,7 +353,7 @@ def test_backend_close_keeps_first_interruption_before_later_ordinary_failure() 
         )
         with pytest.raises(BackendUnavailable, match='cleanup task cancelled'):
             await backend.close()
-        assert result._closed == metadata._closed == 1
+        assert result.closed == metadata.closed == 1
 
     asyncio.run(scenario())
 
@@ -263,7 +362,7 @@ def test_backend_expired_operation_opens_breaker_without_mutation_retry() -> Non
     async def scenario() -> None:
         class _BlockingClient(BackendClient):
             async def evalsha(self, sha: str, numkeys: int, *args: object) -> object:
-                self._source._calls.append(('evalsha', sha, numkeys, *args))
+                self.source.calls.append(('evalsha', sha, numkeys, *args))
                 await asyncio.Event().wait()
                 raise AssertionError('blocked command returned')
 
@@ -278,7 +377,7 @@ def test_backend_expired_operation_opens_breaker_without_mutation_retry() -> Non
             await backend.reserve('key', 5)
         with pytest.raises(BackendUnavailable, match='breaker'):
             await backend.reserve('key', 5)
-        assert len(result._source._calls) == 1
+        assert len(result.source.calls) == 1
         await backend.close()
 
     asyncio.run(scenario())
@@ -289,10 +388,10 @@ def test_backend_metadata_operations_use_one_fenced_script_and_distinct_role() -
         metadata = BackendClient(
             [
                 ('info', {'role': 'master', 'master_replid': 'primary'}),
-                ('get', _RECORD_A),
+                ('get', RECORD_A),
                 ('exists', 1),
                 ('info', {'role': 'master', 'master_replid': 'primary'}),
-                ('get', _RECORD_A),
+                ('get', RECORD_A),
                 ('exists', 1),
                 ('evalsha', [b'ok', 3, 4]),
                 ('evalsha', [b'ok', 2, 0]),
@@ -300,7 +399,10 @@ def test_backend_metadata_operations_use_one_fenced_script_and_distinct_role() -
             ]
         )
         result = BackendClient([])
-        settings, metrics = CacheSettings(l2=L2Settings(enabled=True)), _RecordingMetrics()
+        settings, metrics = (
+            CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS),
+            RecordingMetrics(),
+        )
         store = module.AsyncValkeyMetadataStore(metadata, settings, metrics)
         backend = module.AsyncValkeyBackend(result, store, settings, metrics)
         tags = (
@@ -311,8 +413,8 @@ def test_backend_metadata_operations_use_one_fenced_script_and_distinct_role() -
         assert vector.entries == tuple(zip(tags, (3, 4), strict=True))
         await backend.change(tuple(GenerationChange(tag) for tag in tags))
         await backend.flush_site('production', 'operator')
-        assert len([call for call in metadata._source._calls if call[0] == 'evalsha']) == 3
-        assert result._source._calls == []
+        assert len([call for call in metadata.source.calls if call[0] == 'evalsha']) == 3
+        assert result.source.calls == []
         await backend.close()
 
     asyncio.run(scenario())
@@ -334,7 +436,7 @@ def test_backend_result_lease_round_trip_decodes_hit_and_closes_both_roles() -> 
         backend = backend_type(
             result,
             cast('module.AsyncValkeyMetadataStore', metadata),
-            CacheSettings(l2=L2Settings(enabled=True)),
+            CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS),
             NullMetrics(),
         )
         lease = await backend.reserve('qualified', 5)
@@ -348,7 +450,30 @@ def test_backend_result_lease_round_trip_decodes_hit_and_closes_both_roles() -> 
         assert await backend.release(lease)
         await backend.close()
         await backend.close()
-        assert (result._closed, metadata._closed) == (1, 1)
+        assert (result.closed, metadata.closed) == (1, 1)
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_retranslation_keeps_failure_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        configured = await module._create_client(
+            ValkeyRoleSettings('cache.test', 'PASSWORD', tls=False),
+            CacheSettings(),
+            'password',
+            NullMetrics(),
+        )
+
+        async def close(_client: Valkey, **_kwargs: object) -> None:
+            raise ValkeyTimeoutError('credential-canary-cleanup')
+
+        monkeypatch.setattr(Valkey, 'aclose', close)
+        with pytest.raises(BackendUnavailable) as caught:
+            await configured.close()
+        assert caught.value.failure_class == 'timeout'
+        assert str(caught.value) == 'Valkey operation is unavailable (timeout)'
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
 
     asyncio.run(scenario())
 
@@ -359,8 +484,8 @@ def test_configured_backend_uses_maintained_native_protocol_for_all_roles(
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
         payload = encode_value({'id': 7})
-        primary = b'role:master\r\nmaster_replid:primary\r\n'
-        transport._replies.extend(
+        primary = PRIMARY_INFO
+        transport.replies.extend(
             (
                 b'+OK\r\n',
                 b'+OK\r\n',
@@ -373,32 +498,18 @@ def test_configured_backend_uses_maintained_native_protocol_for_all_roles(
                 b'+OK\r\n',
                 b'+OK\r\n',
                 _bulk(primary),
-                _bulk(_RECORD_A),
+                _bulk(RECORD_A),
                 b':1\r\n',
                 _bulk(primary),
-                _bulk(_RECORD_A),
+                _bulk(RECORD_A),
                 b':1\r\n',
                 b'*2\r\n' + _bulk(b'ok') + b':7\r\n',
             )
         )
-        base = CacheSettings()
-        settings = replace(
-            base,
-            l2=L2Settings(
-                enabled=True,
-                valkey=replace(
-                    base.l2.valkey,
-                    metadata=replace(base.l2.valkey.metadata, tls=False),
-                    result=replace(base.l2.valkey.result, tls=False),
-                ),
-            ),
-        )
+        settings = valkey_test_settings(limits=_FAKE_TRANSPORT_LIMITS, mode='standalone')
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             NullMetrics(),
         )
         lease = await backend.reserve('key', 5)
@@ -411,12 +522,10 @@ def test_configured_backend_uses_maintained_native_protocol_for_all_roles(
         tag = DependencyTag.site('production')
         assert (await backend.resolve((tag,))).entries == ((tag, 7),)
         await backend.close()
-        assert len(transport._wires) == 2
-        assert all(wire._closed for wire in transport._wires)
-        assert not transport._replies
-        assert (
-            sum(b'EVALSHA' in command for wire in transport._wires for command in wire._sent) == 5
-        )
+        assert len(transport.wires) == 2
+        assert all(wire.closed for wire in transport.wires)
+        assert not transport.replies
+        assert sum(b'EVALSHA' in command for wire in transport.wires for command in wire.sent) == 5
 
     asyncio.run(scenario())
 
@@ -425,13 +534,10 @@ def test_configured_pool_replacement_redacts_constructor_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        settings = CacheSettings(l2=L2Settings(enabled=True))
+        settings = CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS)
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             NullMetrics(),
         )
 
@@ -450,16 +556,41 @@ def test_configured_pool_replacement_redacts_constructor_failures(
     asyncio.run(scenario())
 
 
+def test_construction_and_factory_cleanup_metrics_carry_failure_class() -> None:
+    async def scenario() -> None:
+        class _FailingClose:
+            async def close(self) -> None:
+                raise BackendUnavailable('redacted', failure_class='connection')
+
+        metrics = RecordingMetrics()
+        resource = _FailingClose()
+        await module._cleanup_construction((resource.close,), ValueError('construction'), metrics)
+        assert (
+            'backend_failure',
+            {
+                'backend_operation': 'construction_close',
+                'outcome': 'failure',
+                'failure_class': 'connection',
+            },
+        ) in metrics.increments
+
+    asyncio.run(scenario())
+
+
 def test_expired_commit_keeps_original_sg_result_and_releases_original_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        clock = _FakeClock()
+        clock = FakeClock()
         monkeypatch.setattr(module, 'monotonic', clock)
-        settings = CacheSettings(l1=L1Settings(enabled=False), l2=L2Settings(enabled=True))
+        settings = CacheSettings(
+            l1=L1Settings(enabled=False),
+            l2=L2Settings(enabled=True),
+            limits=_FAKE_TRANSPORT_LIMITS,
+        )
 
         def load(_call: tuple[object, ...]) -> object:
-            clock._advance(1.0)
+            clock.advance(1.0)
             return COMMIT_SCRIPT_SHA
 
         result = BackendClient(
@@ -481,7 +612,7 @@ def test_expired_commit_keeps_original_sg_result_and_releases_original_lease(
         cache = AsyncQueryCache(
             settings,
             Identity('script', 'studio', 'render'),
-            KeyBuilder(),
+            key_builder=KeyBuilder(),
             l2=backend,
         )
         answer = {'items': [1]}
@@ -497,11 +628,11 @@ def test_expired_commit_keeps_original_sg_result_and_releases_original_lease(
             per_call_age=0.05,
         )
         assert value is answer
-        assert result._source._replies == []
+        assert result.source.replies == []
         reserve, attempt, release = (
-            result._source._calls[1],
-            result._source._calls[3],
-            result._source._calls[-1],
+            result.source.calls[1],
+            result.source.calls[3],
+            result.source.calls[-1],
         )
         assert reserve[-2] == attempt[-3] == release[-1]
         await cache.close()
@@ -511,13 +642,10 @@ def test_expired_commit_keeps_original_sg_result_and_releases_original_lease(
 
 def test_factory_owns_native_two_role_pools_and_zero_retry() -> None:
     async def scenario() -> None:
-        settings = CacheSettings(l2=L2Settings(enabled=True))
+        settings = CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS)
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             NullMetrics(),
         )
         metadata = cast(
@@ -577,6 +705,33 @@ def test_factory_partial_construction_closes_already_owned_primary(
     asyncio.run(scenario())
 
 
+def test_guard_failure_metrics_carry_failure_class() -> None:
+    async def scenario() -> None:
+        metrics = RecordingMetrics()
+        settings = CacheSettings(limits=_FAKE_TRANSPORT_LIMITS)
+        store = module.AsyncValkeyMetadataStore(BackendClient([]), settings, metrics)
+        backend = module.AsyncValkeyBackend(BackendClient([]), store, settings, metrics)
+
+        async def fail() -> None:
+            raise BackendUnavailable('redacted', failure_class='timeout')
+
+        with pytest.raises(BackendUnavailable):
+            await store._guard('metadata', fail)
+        with pytest.raises(BackendUnavailable):
+            await backend._result_guard('result', fail)
+
+        assert (
+            'backend_failure',
+            {'backend_operation': 'metadata', 'outcome': 'failure', 'failure_class': 'timeout'},
+        ) in metrics.increments
+        assert (
+            'backend_failure',
+            {'backend_operation': 'result', 'outcome': 'failure', 'failure_class': 'timeout'},
+        ) in metrics.increments
+
+    asyncio.run(scenario())
+
+
 def test_inline_backend_timeout_does_not_replace_actual_caller_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -632,7 +787,7 @@ def test_inline_backend_timeout_does_not_replace_actual_caller_cancellation(
         assert closer.cancelling() == 1
         with pytest.raises(BackendUnavailable):
             await ordinary
-        assert result._closed == metadata._closed == 1
+        assert result.closed == metadata.closed == 1
         assert backend._lifecycle._admission.closed
 
     asyncio.run(scenario())
@@ -672,7 +827,7 @@ def test_installed_maintained_pool_releases_reuses_and_disconnects_owned_connect
         assert second_connection is not None
         assert first_connection is not second_connection
         await first.aclose()
-        await pool._settle_release(second_connection)
+        await pool.settle_release(second_connection, pool.borrow_tokens[second_connection])
         second.connection = None
         await second.aclose()
         reused = owner.client()
@@ -682,7 +837,7 @@ def test_installed_maintained_pool_releases_reuses_and_disconnects_owned_connect
         assert len(disconnected) == 1
         assert reused.connection not in disconnected
         disconnected.clear()
-        await pool._settle_disconnect()
+        await pool.settle_disconnect()
         assert set(disconnected) == {first_connection, second_connection}
         await reused.aclose()
         await owner.aclose()
@@ -705,7 +860,7 @@ def test_maintained_sentinel_discovers_primary_and_uses_owned_pool(
                 sentinel_kwargs={'connection_pool': discovery_pool},
                 lib_name=None,
                 lib_version=None,
-                valkey_connect_func=tracker._initialize,
+                valkey_connect_func=tracker.initialize,
             ),
         )
         fields = [
@@ -723,25 +878,25 @@ def test_maintained_sentinel_discovers_primary_and_uses_owned_pool(
         reply = b'*1\r\n*10\r\n' + b''.join(
             b'$' + str(len(field)).encode() + b'\r\n' + field + b'\r\n' for field in fields
         )
-        transport._replies.append(reply)
+        transport.replies.append(reply)
         assert await sentinel.discover_master('service') == ('primary', 6379)
         client = sentinel.master_for(
             'service', connection_pool_class=module._SentinelConnectionPool
         )
         pinned = client.client()
-        transport._replies.extend((reply, _bulk(b'role:master\r\nmaster_replid:primary\r\n')))
+        transport.replies.extend((reply, _bulk(PRIMARY_INFO)))
         await pinned.initialize()
-        assert tracker._for_connection(pinned.connection) == 1
-        transport._replies.append(b'$2\r\nok\r\n')
+        assert tracker.for_connection(pinned.connection) == 1
+        transport.replies.append(b'$2\r\nok\r\n')
         assert await pinned.execute_command('GET', 'key') == b'ok'
         await pinned.aclose(close_connection_pool=False)
         await client.aclose(close_connection_pool=True)
         for discovery in sentinel.sentinels:
             await discovery.aclose(close_connection_pool=True)
-        assert all(wire._closed for wire in transport._wires)
-        assert not any(b'INFO' in command for command in transport._wires[0]._sent)
-        assert b'INFO' in transport._wires[1]._sent[0]
-        assert b'GET' in transport._wires[1]._sent[1]
+        assert all(wire.closed for wire in transport.wires)
+        assert not any(b'INFO' in command for command in transport.wires[0].sent)
+        assert b'INFO' in transport.wires[1].sent[0]
+        assert b'GET' in transport.wires[1].sent[1]
 
     asyncio.run(scenario())
 
@@ -751,52 +906,90 @@ def test_managed_warm_hit_sends_only_two_scripts_across_both_roles(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
+        primary = _bulk(PRIMARY_INFO)
         setup = (b'+OK\r\n',) * 3
-        validation = (primary, _bulk(_RECORD_A), b':1\r\n') * 2
+        validation = (primary, _bulk(RECORD_A), b':1\r\n') * 2
         resolved = b'*2\r\n' + _bulk(b'ok') + b':7\r\n'
         payload = encode_value({'id': 7})
         hit = b'*3\r\n' + _bulk(b'hit') + _bulk(payload) + b':5000\r\n'
-        transport._replies.extend((*setup, primary, *validation, resolved, *setup, primary, hit))
-        base = CacheSettings()
-        settings = replace(
-            base,
-            l2=L2Settings(
-                enabled=True,
-                valkey=replace(
-                    base.l2.valkey,
-                    metadata=replace(base.l2.valkey.metadata, mode='managed', tls=False),
-                    result=replace(base.l2.valkey.result, mode='managed', tls=False),
-                ),
-            ),
-        )
+        transport.replies.extend((*setup, primary, *validation, resolved, *setup, primary, hit))
+        settings = valkey_test_settings(limits=_FAKE_TRANSPORT_LIMITS, mode='managed')
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             NullMetrics(),
         )
         tags = (DependencyTag.site('production'),)
         assert (await backend.resolve(tags)).entries == ((tags[0], 7),)
         assert await backend.lookup('key') is not None
-        assert len(transport._wires) == 2
-        marks = [len(wire._sent) for wire in transport._wires]
-        transport._replies.extend((resolved, hit))
+        assert len(transport.wires) == 2
+        marks = [len(wire.sent) for wire in transport.wires]
+        transport.replies.extend((resolved, hit))
         assert (await backend.resolve(tags)).entries == ((tags[0], 7),)
         assert await backend.lookup('key') is not None
         commands = [
             command
-            for wire, mark in zip(transport._wires, marks, strict=True)
-            for command in wire._sent[mark:]
+            for wire, mark in zip(transport.wires, marks, strict=True)
+            for command in wire.sent[mark:]
         ]
         assert len(commands) == 2
         assert all(b'EVALSHA' in command and b'INFO' not in command for command in commands)
-        assert not transport._replies
+        assert not transport.replies
         await backend.close()
 
     asyncio.run(scenario())
+
+
+def test_missing_valkey_async_submodule_is_not_rewritten() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            """
+import sys
+import valkey
+
+sys.modules['valkey.asyncio'] = None
+try:
+    import sg_query_cache.valkey_async
+except ModuleNotFoundError as error:
+    assert error.name == 'valkey.asyncio'
+    assert error.__cause__ is None
+else:
+    raise AssertionError('missing valkey.asyncio import succeeded')
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_missing_valkey_async_symbol_is_not_rewritten() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            """
+import valkey.asyncio
+
+del valkey.asyncio.Valkey
+try:
+    import sg_query_cache.valkey_async
+except ImportError as error:
+    assert type(error) is ImportError
+    assert "cannot import name 'Valkey'" in str(error)
+    assert error.__cause__ is None
+else:
+    raise AssertionError('missing valkey.asyncio.Valkey import succeeded')
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_partial_sentinel_discovery_construction_closes_every_allocated_client(
@@ -849,48 +1042,69 @@ def test_partial_sentinel_discovery_construction_closes_every_allocated_client(
     asyncio.run(scenario())
 
 
+def test_project_import_missing_valkey_name_is_not_rewritten() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            """
+import builtins
+import sg_query_cache
+import valkey
+
+original_import = builtins.__import__
+
+def fail_project_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == 'sg_query_cache._async_valkey_control':
+        raise ModuleNotFoundError('project import failed', name='valkey')
+    return original_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = fail_project_import
+try:
+    import sg_query_cache.valkey_async
+except ModuleNotFoundError as error:
+    assert str(error) == 'project import failed'
+    assert error.name == 'valkey'
+    assert error.__cause__ is None
+else:
+    raise AssertionError('project import failure was suppressed')
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_rotation_required_rotates_control_before_reporting_stale(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
-        transport._replies.extend(
+        primary = _bulk(PRIMARY_INFO)
+        transport.replies.extend(
             (
                 *((b'+OK\r\n',) * 3),
-                *((primary, _bulk(_RECORD_A), b':1\r\n') * 2),
+                *((primary, _bulk(RECORD_A), b':1\r\n') * 2),
                 b'*1\r\n' + _bulk(b'rotation-required'),
                 primary,
-                b'*2\r\n' + _bulk(b'rotated') + _bulk(_RECORD_B),
+                b'*2\r\n' + _bulk(b'rotated') + _bulk(RECORD_B),
             )
         )
-        base = CacheSettings()
-        settings = replace(
-            base,
-            l2=L2Settings(
-                enabled=True,
-                valkey=replace(
-                    base.l2.valkey,
-                    metadata=replace(base.l2.valkey.metadata, tls=False),
-                    result=replace(base.l2.valkey.result, tls=False),
-                ),
-            ),
-        )
+        settings = valkey_test_settings(limits=_FAKE_TRANSPORT_LIMITS, mode='standalone')
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
-            _RecordingMetrics(),
+            valkey_passwords(settings),
+            RecordingMetrics(),
         )
         try:
             with pytest.raises(StaleIncarnation):
                 await backend.resolve((DependencyTag.site('production'),))
             scripts = [
                 command
-                for wire in transport._wires
-                for command in wire._sent
+                for wire in transport.wires
+                for command in wire.sent
                 if b'EVALSHA' in command
             ]
             assert len(scripts) == 2
@@ -910,41 +1124,28 @@ def test_script_write_refusal_opens_role_breaker_without_replaying(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        metrics = _RecordingMetrics()
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
+        metrics = RecordingMetrics()
+        primary = _bulk(PRIMARY_INFO)
         error = (
             b"-READONLY You can't write against a read only replica.\r\n"
             if refusal == 'readonly'
             else b'-NOREPLICAS Not enough good replicas to write.\r\n'
         )
-        transport._replies.extend((b'+OK\r\n',) * 3)
+        transport.replies.extend((b'+OK\r\n',) * 3)
         if operation in ('resolve', 'change'):
-            transport._replies.extend((primary, _bulk(_RECORD_A), b':1\r\n') * 2)
+            transport.replies.extend((primary, _bulk(RECORD_A), b':1\r\n') * 2)
         elif operation == 'control_create':
-            transport._replies.extend((primary, b'$-1\r\n'))
+            transport.replies.extend((primary, b'$-1\r\n'))
         else:
-            transport._replies.append(b'*1\r\n' + _bulk(b'reserved'))
-        transport._replies.append(error)
-        base = CacheSettings()
-        settings = replace(
-            base,
+            transport.replies.append(b'*1\r\n' + _bulk(b'reserved'))
+        transport.replies.append(error)
+        settings = valkey_test_settings(
             # Deadline behavior is covered separately; this test exercises write refusal.
             limits=LimitSettings(circuit_failure_threshold=1, operation_timeout_seconds=5.0),
-            l2=L2Settings(
-                enabled=True,
-                valkey=replace(
-                    base.l2.valkey,
-                    metadata=replace(base.l2.valkey.metadata, tls=False),
-                    result=replace(base.l2.valkey.result, tls=False),
-                ),
-            ),
         )
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             metrics,
         )
         role = 'result' if operation == 'commit' else 'metadata'
@@ -970,28 +1171,29 @@ def test_script_write_refusal_opens_role_breaker_without_replaying(
                 await attempt()
 
             assert (owned.epoch()[0] > epoch) is (refusal == 'readonly')
-            assert ('backend_failure', {'backend_operation': role, 'outcome': 'open'}) in (
-                metrics._increments
-            )
+            assert (
+                'backend_failure',
+                {'backend_operation': role, 'outcome': 'open', 'failure_class': 'unknown'},
+            ) in (metrics.increments)
             assert not any(
-                name == 'cache_metadata_write_rejection' for name, _ in metrics._increments
+                name == 'cache_metadata_write_rejection' for name, _ in metrics.increments
             )
             if role == 'result':
                 assert (
                     'cache_commit',
                     {'layer': 'l2', 'outcome': 'rejected'},
-                ) not in metrics._increments
-                assert not any(name == 'cache_lease_rejection' for name, _ in metrics._increments)
+                ) not in metrics.increments
+                assert not any(name == 'cache_lease_rejection' for name, _ in metrics.increments)
             expected_scripts = 2 if role == 'result' else 1
             assert (
-                sum(b'EVALSHA' in command for wire in transport._wires for command in wire._sent)
+                sum(b'EVALSHA' in command for wire in transport.wires for command in wire.sent)
                 == expected_scripts
             )
             if operation == 'control_create':
                 assert CONTROL_CREATE_SCRIPT_SHA.encode() in next(
                     command
-                    for wire in transport._wires
-                    for command in wire._sent
+                    for wire in transport.wires
+                    for command in wire.sent
                     if b'EVALSHA' in command
                 )
         finally:
@@ -1007,33 +1209,20 @@ def test_script_capacity_keeps_existing_caller_outcome(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        metrics = _RecordingMetrics()
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
-        transport._replies.extend((b'+OK\r\n',) * 3)
+        metrics = RecordingMetrics()
+        primary = _bulk(PRIMARY_INFO)
+        transport.replies.extend((b'+OK\r\n',) * 3)
         if operation == 'resolve':
-            transport._replies.extend((primary, _bulk(_RECORD_A), b':1\r\n') * 2)
+            transport.replies.extend((primary, _bulk(RECORD_A), b':1\r\n') * 2)
         else:
-            transport._replies.append(b'*1\r\n' + _bulk(b'reserved'))
-        transport._replies.append(b'*1\r\n' + _bulk(b'capacity'))
-        base = CacheSettings()
-        settings = replace(
-            base,
-            limits=LimitSettings(circuit_failure_threshold=1),
-            l2=L2Settings(
-                enabled=True,
-                valkey=replace(
-                    base.l2.valkey,
-                    metadata=replace(base.l2.valkey.metadata, tls=False),
-                    result=replace(base.l2.valkey.result, tls=False),
-                ),
-            ),
+            transport.replies.append(b'*1\r\n' + _bulk(b'reserved'))
+        transport.replies.append(b'*1\r\n' + _bulk(b'capacity'))
+        settings = valkey_test_settings(
+            limits=LimitSettings(circuit_failure_threshold=1, operation_timeout_seconds=5.0),
         )
         backend = await module.AsyncValkeyBackend.from_settings(
             settings,
-            {
-                settings.l2.valkey.metadata.password_env: 'metadata',
-                settings.l2.valkey.result.password_env: 'result',
-            },
+            valkey_passwords(settings),
             metrics,
         )
         role = 'metadata' if operation == 'resolve' else 'result'
@@ -1049,7 +1238,7 @@ def test_script_capacity_keeps_existing_caller_outcome(
                 with pytest.raises(BackendCapacity):
                     await backend.resolve((DependencyTag.site('production'),))
                 assert ('cache_metadata_write_rejection', {'reason': 'noeviction'}) in (
-                    metrics._increments
+                    metrics.increments
                 )
             else:
                 lease = await backend.reserve('qualified-result', 2.0)
@@ -1057,7 +1246,7 @@ def test_script_capacity_keeps_existing_caller_outcome(
                 assert await backend.commit(lease, encode_value({'id': 7}), 3.5) is False
             assert not any(
                 name == 'backend_failure' and labels['outcome'] == 'open'
-                for name, labels in metrics._increments
+                for name, labels in metrics.increments
             )
             assert owned.epoch()[0] == epoch
         finally:
@@ -1074,8 +1263,8 @@ def test_configured_managed_role_rejects_replica_and_discards_before_mutation(
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
         replica = b'role:slave\r\nmaster_replid:primary\r\n'
-        transport._replies.extend((b'+OK\r\n', b'+OK\r\n', b'+OK\r\n', _bulk(replica)))
-        base = CacheSettings()
+        transport.replies.extend((b'+OK\r\n', b'+OK\r\n', b'+OK\r\n', _bulk(replica)))
+        base = CacheSettings(limits=_FAKE_TRANSPORT_LIMITS)
         role = replace(base.l2.valkey.result, mode='managed', tls=False)
         settings = replace(
             base,
@@ -1109,11 +1298,11 @@ def test_configured_managed_role_rejects_replica_and_discards_before_mutation(
                 await operation
             assert caught.value.__cause__ is None
             assert caught.value.__context__ is None
-            assert b'INFO' in transport._wires[0]._sent[3]
+            assert b'INFO' in transport.wires[0].sent[3]
             assert owned.epoch()[0] == 1
-            assert transport._wires[0]._closed
+            assert transport.wires[0].closed
             assert not any(
-                b'EVALSHA' in command for wire in transport._wires for command in wire._sent
+                b'EVALSHA' in command for wire in transport.wires for command in wire.sent
             )
         finally:
             await backend.close()
@@ -1202,7 +1391,7 @@ def test_backend_independently_cancelled_close_settles_every_owned_role(
         entered, proceed = asyncio.Event(), asyncio.Event()
 
         async def admitted() -> None:
-            with backend._lifecycle._operation():
+            with backend._lifecycle.operation():
                 entered.set()
                 await proceed.wait()
 
@@ -1232,13 +1421,13 @@ def test_backend_independently_cancelled_close_settles_every_owned_role(
         if phase == 'waiting-idle':
             close_task.cancel('independent')
         other = asyncio.create_task(backend.close())
-        assert result._closed == metadata._closed == 0
+        assert result.closed == metadata.closed == 0
         proceed.set()
         await active
         for caller in (closer, other):
             with pytest.raises(BackendUnavailable):
                 await caller
-        assert result._closed == metadata._closed == 1
+        assert result.closed == metadata.closed == 1
         await backend.close()
 
     asyncio.run(scenario())
@@ -1302,7 +1491,7 @@ def test_inline_backend_close_distinguishes_child_and_caller_cancellation(
             with pytest.raises(BackendUnavailable, match='interrupted'):
                 await backend.close()
         assert caller.cancelling() == int(cancel_mode != 'ordinary')
-        assert result._closed == metadata._closed == 1
+        assert result.closed == metadata.closed == 1
         assert backend._lifecycle._admission.closed
 
     asyncio.run(scenario())
@@ -1315,7 +1504,7 @@ def test_construction_cleanup_preserves_cancellation_provenance(cancel_mode: str
         assert caller is not None
         attempts: list[str] = []
         original = ValueError('original construction')
-        metrics = _RecordingMetrics()
+        metrics = RecordingMetrics()
         if cancel_mode in {'stale', 'pending'}:
             caller.cancel(cancel_mode)
             if cancel_mode == 'stale':
@@ -1350,7 +1539,7 @@ def test_construction_cleanup_preserves_cancellation_provenance(cancel_mode: str
         assert (
             'backend_failure',
             {'backend_operation': 'construction_close', 'outcome': 'failure'},
-        ) in metrics._increments
+        ) in metrics.increments
 
     asyncio.run(scenario())
 
@@ -1364,7 +1553,7 @@ def test_close_resources_resubmit_only_unstarted_action_with_original_expired_de
     async def scenario() -> None:
         first, second = BackendClient([]), BackendClient([])
         if blocks:
-            first._close_proceed.clear()
+            first.close_proceed.clear()
         deadline = asyncio.get_running_loop().time()
         submissions: list[float | None] = []
         original_join = support.joined_cleanup
@@ -1388,11 +1577,15 @@ def test_close_resources_resubmit_only_unstarted_action_with_original_expired_de
             return await original_join(action, deadline=deadline)
 
         monkeypatch.setattr(support, 'joined_cleanup', submit)
-        outcome = await module._close_resources((first.close, second.close), deadline=deadline)
+        record = support.DeadlineRecord(deadline)
+        with support.publish_deadline(record):
+            outcome = await module._close_resources((first.close, second.close), deadline=deadline)
         assert isinstance(outcome.error, BackendUnavailable)
+        assert str(outcome.error) == 'cleanup task cancelled'
+        assert record.expired is blocks
         assert outcome.cancellation is None
         assert submissions == [deadline] * (3 if pre_entry else 2)
-        assert first._closed == second._closed == 1
+        assert first.closed == second.closed == 1
 
     asyncio.run(scenario())
 
@@ -1402,21 +1595,21 @@ def test_backend_lookup_debits_decode_and_guard_telemetry_once(
     elapsed: float, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        clock = _FakeClock()
+        clock = FakeClock()
         monkeypatch.setattr(module, 'monotonic', clock)
         decoded: list[bytes] = []
         original = common_module.decode_value
 
         def decode(payload: bytes) -> object:
             decoded.append(payload)
-            clock._advance(elapsed)
+            clock.advance(elapsed)
             return original(payload)
 
-        class _Metrics(_RecordingMetrics):
+        class _Metrics(RecordingMetrics):
             def observe(self, name: str, value: float, labels: Mapping[str, str]) -> None:
                 super().observe(name, value, labels)
                 if name == 'backend_latency_seconds':
-                    clock._advance(0.25)
+                    clock.advance(0.25)
 
         monkeypatch.setattr(common_module, 'decode_value', decode)
         payload = encode_value({'id': 7})
@@ -1516,7 +1709,7 @@ def _role(
 
     def factory() -> module._RawClient:
         pool = module._ConnectionPool(
-            valkey_connect_func=connections._initialize,
+            valkey_connect_func=connections.initialize,
             lib_name=lib_name,
             lib_version=None,
             retry=retry,
@@ -1533,13 +1726,13 @@ def test_async_helpers_never_invoke_sync_tracker_or_clients(
     def forbidden(*_args: object, **_kwargs: object) -> object:
         pytest.fail('async helper invoked synchronous Valkey I/O or tracker')
 
-    monkeypatch.setattr(sync_module._ConnectionGeneration, '_connected', forbidden)
+    monkeypatch.setattr(sync_module._ConnectionGeneration, 'connected', forbidden)
     monkeypatch.setattr(valkey.Valkey, 'execute_command', forbidden)
     monkeypatch.setattr(valkey.Sentinel, 'discover_master', forbidden)
 
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         role = _role()
         assert await role.get('key') == b'ok'
         assert role.epoch() == (0, 1, None)
@@ -1553,11 +1746,11 @@ def test_backend_lookup_debits_awaited_endpoint_settlement_from_server_ttl(
     elapsed: float, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def scenario() -> None:
-        clock = _FakeClock()
+        clock = FakeClock()
         monkeypatch.setattr(module, 'monotonic', clock)
         transport = _Transport(monkeypatch)
         payload = encode_value({'id': 7})
-        transport._replies.append(b'*3\r\n' + _bulk(b'hit') + _bulk(payload) + b':50\r\n')
+        transport.replies.append(b'*3\r\n' + _bulk(b'hit') + _bulk(payload) + b':50\r\n')
         role = _role()
         probes = 0
 
@@ -1565,7 +1758,7 @@ def test_backend_lookup_debits_awaited_endpoint_settlement_from_server_ttl(
             nonlocal probes
             probes += 1
             if probes == 2:
-                clock._advance(elapsed)
+                clock.advance(elapsed)
                 await asyncio.sleep(0)
             return 'primary'
 
@@ -1573,7 +1766,7 @@ def test_backend_lookup_debits_awaited_endpoint_settlement_from_server_ttl(
         backend = module.AsyncValkeyBackend(
             role,
             cast('module.AsyncValkeyMetadataStore', BackendClient([])),
-            CacheSettings(),
+            CacheSettings(limits=_FAKE_TRANSPORT_LIMITS),
             NullMetrics(),
         )
         hit = await backend.lookup('key')
@@ -1585,7 +1778,7 @@ def test_backend_lookup_debits_awaited_endpoint_settlement_from_server_ttl(
             assert hit.decoded is not None
             assert hit.decoded.value == {'id': 7}
         assert probes == 2
-        assert len(transport._wires[0]._sent) == 1
+        assert len(transport.wires[0].sent) == 1
         await backend.close()
 
     asyncio.run(scenario())
@@ -1596,7 +1789,7 @@ def test_cancelled_acquisition_disconnects_before_pool_reuse(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._connect_proceed.clear()
+        transport.connect_proceed.clear()
         role = _role()
 
         async def borrow() -> None:
@@ -1604,15 +1797,15 @@ def test_cancelled_acquisition_disconnects_before_pool_reuse(
                 pytest.fail('cancelled acquisition yielded a pin')
 
         acquisition = asyncio.create_task(borrow())
-        await transport._connect_entered.wait()
+        await transport.connect_entered.wait()
         acquisition.cancel()
         with pytest.raises(asyncio.CancelledError):
             await acquisition
-        assert transport._wires[0]._closed
-        transport._connect_proceed.set()
+        assert transport.wires[0].closed
+        transport.connect_proceed.set()
         async with role.pin() as pinned:
             assert pinned.connection_generation() == 1
-            assert len(transport._wires) == 2
+            assert len(transport.wires) == 2
         await role.close()
 
     asyncio.run(scenario())
@@ -1637,7 +1830,7 @@ def test_cancelled_settlement_propagates_after_pin_release(
             return 'primary'
 
         role._endpoint_probe = probe
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         task = asyncio.create_task(role.get('key'))
         await entered.wait()
         task.cancel('settlement')
@@ -1646,7 +1839,7 @@ def test_cancelled_settlement_propagates_after_pin_release(
         client = role._client
         assert client is not None
         assert not client.connection_pool._in_use_connections
-        assert not transport._wires[0]._closed
+        assert not transport.wires[0].closed
         await role.close()
 
     asyncio.run(scenario())
@@ -1682,7 +1875,7 @@ def test_close_detaches_before_await_and_joins_repeated_cancellation(
         proceed.set()
         with pytest.raises(asyncio.CancelledError, match='first'):
             await close
-        assert transport._wires[0]._closed
+        assert transport.wires[0].closed
         assert close.cancelling() == 2
 
     asyncio.run(scenario())
@@ -1708,7 +1901,7 @@ def test_close_settles_when_cleanup_task_is_cancelled_before_entry(
         monkeypatch.setattr(support, 'create_task', cancel_cleanup)
         with pytest.raises(BackendUnavailable):
             await role.close()
-        assert transport._wires[0]._closed
+        assert transport.wires[0].closed
         assert client.connection_pool._available_connections
         assert role._client is None
 
@@ -1724,9 +1917,9 @@ def test_command_write_failure_disconnects_without_retry(
         pool = module._ConnectionPool(socket_timeout=0.001, lib_name=None, lib_version=None)
         connection = pool.make_connection()
         await connection.connect()
-        wire = transport._wires[0]
+        wire = transport.wires[0]
         if failure == 'timeout':
-            wire._drain_proceed.clear()
+            wire.drain_proceed.clear()
         else:
 
             async def fail_write() -> None:
@@ -1736,8 +1929,8 @@ def test_command_write_failure_disconnects_without_retry(
         expected = ValkeyTimeoutError if failure == 'timeout' else ValkeyConnectionError
         with pytest.raises(expected):
             await connection.send_command('GET', 'key')
-        assert wire._closed
-        assert len(wire._sent) == 1
+        assert wire.closed
+        assert len(wire.sent) == 1
         await pool.disconnect()
 
     asyncio.run(scenario())
@@ -1751,25 +1944,25 @@ def test_command_cancellation_disconnects_only_its_connection(
         transport = _Transport(monkeypatch)
         role = _role()
         async with role.pin() as first, role.pin() as second:
-            first_wire, second_wire = transport._wires
+            first_wire, second_wire = transport.wires
             initial = first.connection_generation()
             epoch = role.epoch()[0]
             if phase == 'send':
-                first_wire._drain_proceed.clear()
+                first_wire.drain_proceed.clear()
             command = asyncio.create_task(first.get('key'))
-            await first_wire._drain_entered.wait()
+            await first_wire.drain_entered.wait()
             command.cancel('command interrupted')
             with pytest.raises(asyncio.CancelledError, match='command interrupted'):
                 await command
-            assert first_wire._closed
-            assert not second_wire._closed
+            assert first_wire.closed
+            assert not second_wire.closed
             assert role.epoch()[0] == epoch
-            second_wire._reader.feed_data(b'$2\r\nok\r\n')
+            second_wire.reader.feed_data(b'$2\r\nok\r\n')
             assert await second.get('key') == b'ok'
             reconnect = asyncio.create_task(first.get('key'))
-            transport._connect_entered.clear()
-            await transport._connect_entered.wait()
-            transport._wires[-1]._reader.feed_data(b'$3\r\nnew\r\n')
+            transport.connect_entered.clear()
+            await transport.connect_entered.wait()
+            transport.wires[-1].reader.feed_data(b'$3\r\nnew\r\n')
             assert await reconnect == b'new'
             assert first.connection_generation() != initial
         await role.close()
@@ -1800,21 +1993,21 @@ def test_cancelled_acquisition_during_setup_or_readiness_reconnects(
                 pytest.fail('cancelled acquisition yielded a pin')
 
         task = asyncio.create_task(borrow())
-        await transport._connect_entered.wait()
+        await transport.connect_entered.wait()
         if phase == 'setup':
-            await transport._wires[0]._drain_entered.wait()
+            await transport.wires[0].drain_entered.wait()
         else:
             await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert transport._wires[0]._closed
+        assert transport.wires[0].closed
         proceed.set()
         if phase == 'setup':
-            transport._replies.append(b'+OK\r\n')
+            transport.replies.append(b'+OK\r\n')
         async with role.pin() as pin:
             assert pin.connection_generation() == (1 if phase == 'setup' else 2)
-        assert len(transport._wires) == 2
+        assert len(transport.wires) == 2
         await role.close()
 
     asyncio.run(scenario())
@@ -1828,18 +2021,18 @@ def test_cancelled_pinned_reconnect_closes_before_successful_reuse(
         transport = _Transport(monkeypatch)
         role = _role(lib_name='transport-test' if phase == 'setup' else None)
         if phase == 'setup':
-            transport._replies.extend([b'+OK\r\n', b'+OK\r\n'])
+            transport.replies.extend([b'+OK\r\n', b'+OK\r\n'])
         async with role.pin() as first, role.pin() as other:
             connection = first._client.connection
             assert connection is not None
             initial = first.connection_generation()
             pool_epoch = role.epoch()[0]
             await connection.disconnect(nowait=True)
-            transport._connect_entered.clear()
+            transport.connect_entered.clear()
             setup_entered = asyncio.Event()
             setup_proceed = asyncio.Event()
             if phase == 'physical':
-                transport._connect_proceed.clear()
+                transport.connect_proceed.clear()
             else:
                 original_setup = connection.on_connect
 
@@ -1849,30 +2042,30 @@ def test_cancelled_pinned_reconnect_closes_before_successful_reuse(
                     await setup_proceed.wait()
 
                 monkeypatch.setattr(connection, 'on_connect', setup)
-                transport._replies.append(b'+OK\r\n')
+                transport.replies.append(b'+OK\r\n')
             command = asyncio.create_task(first.get('key'))
-            await transport._connect_entered.wait()
-            reconnect_wire = transport._wires[-1]
+            await transport.connect_entered.wait()
+            reconnect_wire = transport.wires[-1]
             if phase == 'setup':
                 await setup_entered.wait()
             command.cancel('incomplete reconnect')
             with pytest.raises(asyncio.CancelledError, match='incomplete reconnect'):
                 await command
-            assert reconnect_wire._closed
+            assert reconnect_wire.closed
             assert not connection.is_connected
             assert first.connection_generation() == initial
             assert role.epoch()[0] == pool_epoch
-            assert not transport._wires[1]._closed
-            transport._replies.append(b'$2\r\nok\r\n')
+            assert not transport.wires[1].closed
+            transport.replies.append(b'$2\r\nok\r\n')
             assert await other.get('key') == b'ok'
-            transport._connect_proceed.set()
+            transport.connect_proceed.set()
             setup_proceed.set()
             if phase == 'setup':
-                transport._replies.append(b'+OK\r\n')
-            transport._replies.append(b'$3\r\nnew\r\n')
+                transport.replies.append(b'+OK\r\n')
+            transport.replies.append(b'$3\r\nnew\r\n')
             assert await first.get('key') == b'new'
             assert first.connection_generation() == 3
-            assert len(transport._wires) == 4
+            assert len(transport.wires) == 4
         await role.close()
 
     asyncio.run(scenario())
@@ -1883,7 +2076,7 @@ def test_commit_cancelled_during_noscript_load_settles_pin_without_retry(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.append(b'-NOSCRIPT absent\r\n')
+        transport.replies.append(b'-NOSCRIPT absent\r\n')
         role = _role()
         load_entered = asyncio.Event()
         original_load = module._PinnedRoleClient.script_load
@@ -1904,9 +2097,9 @@ def test_commit_cancelled_during_noscript_load_settles_pin_without_retry(
         task.cancel('script loading')
         with pytest.raises(asyncio.CancelledError, match='script loading'):
             await task
-        assert len(transport._wires) == 1
-        assert len(transport._wires[0]._sent) == 2
-        assert transport._wires[0]._closed
+        assert len(transport.wires) == 1
+        assert len(transport.wires[0].sent) == 2
+        assert transport.wires[0].closed
         await backend.close()
 
     asyncio.run(scenario())
@@ -1941,9 +2134,9 @@ def test_discard_allows_new_borrow_before_old_cleanup_finishes(
                 proceed.set()
                 with pytest.raises(asyncio.CancelledError, match='discard'):
                     await refresh
-                assert transport._wires[0]._closed
-                assert not transport._wires[1]._closed
-                transport._replies.append(b'$2\r\nok\r\n')
+                assert transport.wires[0].closed
+                assert not transport.wires[1].closed
+                transport.replies.append(b'$2\r\nok\r\n')
                 assert await new_pin.get('key') == b'ok'
         await role.close()
 
@@ -1957,16 +2150,16 @@ def test_discard_detaches_overlapping_pins_and_close_attempts_every_connection(
         transport = _Transport(monkeypatch)
         role = _role()
         async with role.pin() as first, role.pin() as second:
-            transport._wires[0]._close_error = ValueError('close failed')
+            transport.wires[0].close_error = ValueError('close failed')
             with pytest.raises(BackendUnavailable):
                 await role.refresh()
-            assert all(wire._closed for wire in transport._wires)
+            assert all(wire.closed for wire in transport.wires)
             with pytest.raises(BackendUnavailable):
                 await first.get('key')
             with pytest.raises(BackendUnavailable):
                 await second.get('key')
             async with role.pin():
-                assert len(transport._wires) == 3
+                assert len(transport.wires) == 3
         await role.close()
 
     asyncio.run(scenario())
@@ -2002,13 +2195,13 @@ def test_discovery_preserves_backend_errors_and_discards_client_failures(
                 await role.refresh_endpoint()
             if client_failure:
                 assert client is not role._client
-                assert transport._wires[0]._closed
+                assert transport.wires[0].closed
                 assert 'private reply' not in str(caught.value)
                 assert caught.value.__suppress_context__
             else:
                 assert caught.value is failure
                 assert client is role._client
-                assert not transport._wires[0]._closed
+                assert not transport.wires[0].closed
         await role.close()
 
     asyncio.run(scenario())
@@ -2035,8 +2228,8 @@ def test_endpoint_discovery_cancellation_preserves_other_pins(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert not transport._wires[0]._closed
-            transport._replies.append(b'$2\r\nok\r\n')
+            assert not transport.wires[0].closed
+            transport.replies.append(b'$2\r\nok\r\n')
             assert await pinned.get('key') == b'ok'
         await role.close()
 
@@ -2055,7 +2248,7 @@ def test_epoch_sampling_is_pure_and_tracker_is_weak_and_loop_owned(
             assert pinned.connection_generation() == 1
             for _ in range(5):
                 assert role.epoch() == (0, 1, None)
-            assert not transport._wires[0]._sent
+            assert not transport.wires[0].sent
         await role.close()
         del pinned
         assert len(role._connections._by_connection) == 0
@@ -2081,7 +2274,9 @@ def test_metadata_acquisition_translates_connection_refusal(
 
     async def scenario() -> None:
         role = _role()
-        store = module.AsyncValkeyMetadataStore(role, CacheSettings(), NullMetrics())
+        store = module.AsyncValkeyMetadataStore(
+            role, CacheSettings(limits=_FAKE_TRANSPORT_LIMITS), NullMetrics()
+        )
         with pytest.raises(BackendUnavailable) as caught:
             await store.resolve((DependencyTag.site('production'),))
         assert caught.value.__cause__ is None
@@ -2092,24 +2287,49 @@ def test_metadata_acquisition_translates_connection_refusal(
     asyncio.run(scenario())
 
 
+def test_metadata_acquisition_translates_unexpected_client_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failed_initialize(_client: Valkey) -> None:
+        raise KeyError('private acquisition detail')
+
+    monkeypatch.setattr(Valkey, 'initialize', failed_initialize)
+
+    async def scenario() -> None:
+        role = _role()
+        store = module.AsyncValkeyMetadataStore(
+            role, CacheSettings(limits=_FAKE_TRANSPORT_LIMITS), NullMetrics()
+        )
+        try:
+            with pytest.raises(BackendUnavailable) as caught:
+                await store.resolve((DependencyTag.site('production'),))
+            assert str(caught.value) == 'Valkey operation failed (unknown)'
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
 def test_new_async_metadata_socket_receives_full_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        primary = b'role:master\r\nmaster_replid:primary\r\n'
-        replies = (_bulk(primary), _bulk(_RECORD_A), b':1\r\n') * 2
-        transport._replies.extend(replies)
+        primary = PRIMARY_INFO
+        replies = (_bulk(primary), _bulk(RECORD_A), b':1\r\n') * 2
+        transport.replies.extend(replies)
         role = _role()
         control = AsyncValkeyControl(role, key_prefix='sgqc', validation_seconds=30)
 
         await control._validate_incarnation()
-        transport._replies.extend(replies)
+        transport.replies.extend(replies)
         async with role.pin():
             await control._validate_incarnation()
 
-        assert len(transport._wires) == 2
-        assert transport._wires[1]._sent.count(b'*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n') == 2
+        assert len(transport.wires) == 2
+        assert transport.wires[1].sent.count(b'*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n') == 2
         await role.close()
 
     asyncio.run(scenario())
@@ -2121,7 +2341,7 @@ def test_pin_cannot_be_reused_after_scope_exit(monkeypatch: pytest.MonkeyPatch) 
         role = _role()
         async with role.pin() as pinned:
             pass
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         with pytest.raises(BackendUnavailable, match='pin'):
             await pinned.get('key')
         await role.close()
@@ -2129,12 +2349,71 @@ def test_pin_cannot_be_reused_after_scope_exit(monkeypatch: pytest.MonkeyPatch) 
     asyncio.run(scenario())
 
 
-def test_pin_release_never_frees_a_connection_reborrowed_during_cleanup(
+def test_pin_release_failure_exposes_no_active_command_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    command_canary = 'credential-canary-command'
+    release_canary = 'credential-canary-release'
+    command_error = ResponseError(command_canary)
+    release_error = ValkeyTimeoutError(release_canary)
+    for error, canary in ((command_error, command_canary), (release_error, release_canary)):
+        error.add_note(canary)
+        error.__dict__['client_detail'] = canary
+
     async def scenario() -> None:
         _Transport(monkeypatch)
+        original_close = Valkey.aclose
+
+        async def command(_client: Valkey, *_args: object, **_kwargs: object) -> object:
+            raise command_error
+
+        async def close(client: Valkey, close_connection_pool: bool | None = None) -> None:
+            await original_close(client, close_connection_pool=close_connection_pool)
+            if close_connection_pool is False:
+                raise release_error
+
+        monkeypatch.setattr(Valkey, 'execute_command', command)
+        monkeypatch.setattr(Valkey, 'aclose', close)
         role = _role()
+        settings = CacheSettings(limits=_FAKE_TRANSPORT_LIMITS)
+        metadata = module.AsyncValkeyMetadataStore(role, settings, NullMetrics())
+        backend = module.AsyncValkeyBackend(role, metadata, settings, NullMetrics())
+        with pytest.raises(BackendUnavailable) as caught:
+            await backend.lookup('key')
+        await backend.close()
+
+        failure = caught.value
+        assert failure.failure_class == 'timeout'
+        assert str(failure) == 'Valkey operation is unavailable (timeout)'
+        assert failure.__cause__ is None
+        assert failure.__context__ is None
+        assert not getattr(failure, '__notes__', ())
+        for canary in (command_canary, release_canary):
+            assert canary not in repr(vars(failure))
+            assert canary not in ''.join(format_exception(failure))
+        traceback = failure.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == 'translate_client_error':
+                assert all(
+                    value is not command_error and value is not release_error
+                    for value in traceback.tb_frame.f_locals.values()
+                )
+            traceback = traceback.tb_next
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('mode', ['standalone', 'sentinel'])
+@pytest.mark.parametrize('cleanup', ['success', 'error', 'cancelled'])
+def test_pin_release_never_frees_a_connection_reborrowed_during_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    cleanup: str,
+) -> None:
+    async def scenario() -> None:
+        transport = _Transport(monkeypatch)
+        transport.replies.extend([_bulk(PRIMARY_INFO)] * 2)
+        role = _proving_role(mode)
         released = asyncio.Event()
         finish = asyncio.Event()
         borrowed: asyncio.Future[AbstractConnection | None] = (
@@ -2146,7 +2425,13 @@ def test_pin_release_never_frees_a_connection_reborrowed_during_cleanup(
             pool: module._ConnectionPool, connection: AbstractConnection
         ) -> None:
             await original_release(pool, connection)
+            if released.is_set():
+                return
             released.set()
+            if cleanup == 'error':
+                raise RuntimeError('failure after release')
+            if cleanup == 'cancelled':
+                raise asyncio.CancelledError
 
         monkeypatch.setattr(module._ConnectionPool, 'release', signalling_release)
 
@@ -2156,9 +2441,15 @@ def test_pin_release_never_frees_a_connection_reborrowed_during_cleanup(
                 borrowed.set_result(pinned._client.connection)
                 await finish.wait()
 
-        async with role.pin() as first:
-            reused = first._client.connection
-            borrower = asyncio.create_task(borrow_after_release())
+        pin = role.pin()
+        first = await pin.__aenter__()
+        reused = first._client.connection
+        borrower = asyncio.create_task(borrow_after_release())
+        if cleanup == 'success':
+            await pin.__aexit__(None, None, None)
+        else:
+            with pytest.raises(BackendUnavailable):
+                await pin.__aexit__(None, None, None)
         # The borrower re-acquired the connection before the first owner settled.
         assert await borrowed is reused
         async with role.pin() as third:
@@ -2198,8 +2489,8 @@ def test_pin_release_preserves_first_cancellation_while_joining(
                 await pinned.get('key')
 
         task = asyncio.create_task(operation())
-        await transport._connect_entered.wait()
-        await transport._wires[0]._drain_entered.wait()
+        await transport.connect_entered.wait()
+        await transport.wires[0].drain_entered.wait()
         task.cancel('first')
         await release_entered.wait()
         task.cancel('second')
@@ -2215,13 +2506,13 @@ def test_pin_release_preserves_first_cancellation_while_joining(
 def test_pool_disables_automatic_mutation_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.extend([b'-READONLY demoted\r\n', b':1\r\n'])
+        transport.replies.extend([b'-READONLY demoted\r\n', b':1\r\n'])
         role = _role(retry=Retry(NoBackoff(), 3), retry_on_error=[ReadOnlyError])
         async with role.pin() as pinned:
             with pytest.raises(ReadOnlyError):
                 await pinned.evalsha('0' * 40, 1, 'key')
-        assert len(transport._replies) == 1
-        assert transport._wires[0]._closed
+        assert len(transport.replies) == 1
+        assert transport.wires[0].closed
         await role.close()
 
     asyncio.run(scenario())
@@ -2245,7 +2536,7 @@ def test_role_command_ignores_other_pins_reconnects(monkeypatch: pytest.MonkeyPa
             return 'primary'
 
         role._endpoint_probe = probe
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         assert await role.get('key') == b'ok'
         # Aggregate reconnects from another pin do not invalidate this span.
         assert role.epoch()[0] == 0
@@ -2259,7 +2550,7 @@ def test_script_load_retries_only_the_supported_noscript_case(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.extend(
+        transport.replies.extend(
             [b'-NOSCRIPT absent\r\n', f'${40}\r\n{RESOLVE_SCRIPT_SHA}\r\n'.encode(), b':7\r\n']
         )
         role = _role()
@@ -2270,7 +2561,7 @@ def test_script_load_retries_only_the_supported_noscript_case(
                 )
                 == 7
             )
-        assert len(transport._wires[0]._sent) == 3
+        assert len(transport.wires[0].sent) == 3
         await role.close()
 
     asyncio.run(scenario())
@@ -2291,7 +2582,7 @@ def test_sentinel_demotion_detaches_before_cleanup_with_overlapping_pins(
                 _PrimaryDiscovery(),
                 lib_name=None,
                 lib_version=None,
-                valkey_connect_func=tracker._initialize,
+                valkey_connect_func=tracker.initialize,
                 ssl=tls,
             )
             return cast('module._RawClient', cast('object', Valkey.from_pool(pool)))
@@ -2313,10 +2604,10 @@ def test_sentinel_demotion_detaches_before_cleanup_with_overlapping_pins(
                 await original_disconnect(inuse_connections)
 
             monkeypatch.setattr(pool, 'disconnect', cleanup)
-            transport._replies.append(b'-READONLY demoted\r\n')
+            transport.replies.append(b'-READONLY demoted\r\n')
             command = asyncio.create_task(first.evalsha('0' * 40, 1, 'key'))
             # The done callback also wakes the assertion if upstream takes its
-            # prohibited graceful-close path, so a RED never hangs on the gate.
+            # prohibited graceful-close path, so failure cannot leave the gate blocked.
             command.add_done_callback(lambda _task: entered.set())
             await entered.wait()
             if command.done():
@@ -2333,8 +2624,8 @@ def test_sentinel_demotion_detaches_before_cleanup_with_overlapping_pins(
             else:
                 with pytest.raises(ValkeyConnectionError, match='previous master'):
                     await command
-            assert all(wire._closed for wire in transport._wires)
-            assert len(transport._wires[0]._sent) == 1
+            assert all(wire.closed for wire in transport.wires)
+            assert len(transport.wires[0].sent) == 1
         await role.close()
 
     asyncio.run(scenario())
@@ -2361,10 +2652,10 @@ def test_role_delivery_span_drift_discards_pool(
             return 'old-primary'
 
         role._endpoint_probe = probe
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         with pytest.raises(BackendUnavailable, match='changed during'):
             await role.get('key')
-        assert all(wire._closed for wire in transport._wires)
+        assert all(wire.closed for wire in transport.wires)
         assert role.epoch()[0] >= 1
         await role.close()
 
@@ -2377,7 +2668,7 @@ def test_script_failure_never_redelivers_again(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.extend(
+        transport.replies.extend(
             [b'-NOSCRIPT absent\r\n', f'$40\r\n{RESOLVE_SCRIPT_SHA}\r\n'.encode(), reply]
         )
         role = _role()
@@ -2386,7 +2677,7 @@ def test_script_failure_never_redelivers_again(
                 await module.execute_script(
                     pinned, script=RESOLVE_SCRIPT, sha=RESOLVE_SCRIPT_SHA, keys=('key',), args=()
                 )
-        assert sum(len(wire._sent) for wire in transport._wires) == 3
+        assert sum(len(wire.sent) for wire in transport.wires) == 3
         await role.close()
 
     asyncio.run(scenario())
@@ -2435,10 +2726,10 @@ def test_commit_debits_prepared_role_delay(
     delay: float,
 ) -> None:
     async def scenario() -> None:
-        clock = _FakeClock()
+        clock = FakeClock()
         monkeypatch.setattr(module, 'monotonic', clock)
         transport = _Transport(monkeypatch)
-        transport._replies.append(b'*1\r\n' + _bulk(b'committed'))
+        transport.replies.append(b'*1\r\n' + _bulk(b'committed'))
         role = _role()
         backend = module.AsyncValkeyBackend(
             role,
@@ -2453,13 +2744,13 @@ def test_commit_debits_prepared_role_delay(
         @asynccontextmanager
         async def delayed_pin() -> AsyncGenerator[module._PinnedRoleClient]:
             async with original_pin() as pinned:
-                clock._advance(delay if phase == 'pin' else 0.0)
+                clock.advance(delay if phase == 'pin' else 0.0)
                 yield pinned
 
         async def delayed_refresh() -> None:
             await original_refresh()
             if phase == 'refresh':
-                clock._advance(delay)
+                clock.advance(delay)
 
         discoveries = 0
 
@@ -2468,7 +2759,7 @@ def test_commit_debits_prepared_role_delay(
             await original_discovery()
             discoveries += 1
             if phase == 'discovery' and discoveries == 1:
-                clock._advance(delay)
+                clock.advance(delay)
 
         monkeypatch.setattr(role, 'pin', delayed_pin)
         monkeypatch.setattr(role, 'refresh', delayed_refresh)
@@ -2482,7 +2773,7 @@ def test_commit_debits_prepared_role_delay(
         payload = encode_result(TimedResult(0.0, {'id': 7}), 0.0, remaining)
         lease = FillLease('result-key', 'original-token')
         assert await backend.commit(lease, payload, remaining) is (delay < remaining)
-        sent = [command for wire in transport._wires for command in wire._sent]
+        sent = [command for wire in transport.wires for command in wire.sent]
         if delay >= remaining:
             assert sent == []
             assert lease == FillLease('result-key', 'original-token')
@@ -2503,11 +2794,11 @@ def test_commit_noscript_recovery_spends_original_deadline(
     load_delay: float,
 ) -> None:
     async def scenario() -> None:
-        clock = _FakeClock()
+        clock = FakeClock()
         monkeypatch.setattr(module, 'monotonic', clock)
 
         def load(_call: tuple[object, ...]) -> object:
-            clock._advance(load_delay)
+            clock.advance(load_delay)
             return COMMIT_SCRIPT_SHA
 
         result = BackendClient(
@@ -2525,7 +2816,7 @@ def test_commit_noscript_recovery_spends_original_deadline(
         )
         admitted = await backend.commit(FillLease('key', 'token'), encode_value(7), 0.1)
         assert admitted is (load_delay < 0.099)
-        calls = [call for call in result._source._calls if call[0] == 'evalsha']
+        calls = [call for call in result.source.calls if call[0] == 'evalsha']
         assert len(calls) == (2 if load_delay < 0.099 else 1)
         if len(calls) == 2:
             assert calls[0][-1] == 100
@@ -2542,7 +2833,7 @@ def test_commit_noscript_uses_one_pin_and_rejects_reconnect(
 ) -> None:
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
-        transport._replies.extend(
+        transport.replies.extend(
             [
                 b'-NOSCRIPT absent\r\n',
                 _bulk(COMMIT_SCRIPT_SHA.encode()),
@@ -2567,7 +2858,7 @@ def test_commit_noscript_uses_one_pin_and_rejects_reconnect(
         backend = module.AsyncValkeyBackend(
             role,
             cast('module.AsyncValkeyMetadataStore', BackendClient([])),
-            CacheSettings(l2=L2Settings(enabled=True)),
+            CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS),
             NullMetrics(),
         )
         if reconnect:
@@ -2578,8 +2869,8 @@ def test_commit_noscript_uses_one_pin_and_rejects_reconnect(
             assert await backend.commit(FillLease('key', 'token'), b'payload', 1.0)
             assert role.epoch()[0] == 0
         assert len(pins) == 1
-        assert len(transport._wires) == (2 if reconnect else 1)
-        assert sum(len(wire._sent) for wire in transport._wires) == 3
+        assert len(transport.wires) == (2 if reconnect else 1)
+        assert sum(len(wire.sent) for wire in transport.wires) == 3
         await backend.close()
 
     asyncio.run(scenario())
@@ -2615,7 +2906,7 @@ def test_commit_redacts_client_exception_context(
         backend = module.AsyncValkeyBackend(
             result,
             cast('module.AsyncValkeyMetadataStore', BackendClient([])),
-            CacheSettings(l2=L2Settings(enabled=True)),
+            CacheSettings(l2=L2Settings(enabled=True), limits=_FAKE_TRANSPORT_LIMITS),
             NullMetrics(),
         )
         with pytest.raises(expected) as captured:
@@ -2639,7 +2930,9 @@ def test_configured_role_enables_primary_proof_only_for_ha(mode: _ValkeyMode) ->
             sentinels=('one:26379', 'two:26379', 'three:26379') if mode == 'sentinel' else (),
             service_name='service' if mode == 'sentinel' else None,
         )
-        role = await module._create_client(settings, CacheSettings(), 'password', NullMetrics())
+        role = await module._create_client(
+            settings, CacheSettings(limits=_FAKE_TRANSPORT_LIMITS), 'password', NullMetrics()
+        )
         assert role._connections._prove_primary == (mode != 'standalone')
         await role.close()
 
@@ -2654,24 +2947,24 @@ def test_ha_proof_runs_once_per_new_socket_and_not_per_operation(
     async def scenario() -> None:
         transport = _Transport(monkeypatch)
         role = _proving_role(mode)
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
-        transport._replies.extend((primary, _bulk(b'ok'), _bulk(b'ok')))
+        primary = _bulk(PRIMARY_INFO)
+        transport.replies.extend((primary, _bulk(b'ok'), _bulk(b'ok')))
         for _ in range(2):
             assert await role.run_operation(lambda pin: pin.get('key')) == b'ok'
-        assert len(transport._wires) == 1
+        assert len(transport.wires) == 1
         async with role.pin() as held:
-            transport._replies.extend((primary, _bulk(b'ok')))
+            transport.replies.extend((primary, _bulk(b'ok')))
             assert await role.run_operation(lambda pin: pin.get('key')) == b'ok'
             assert held._client.connection is not None
             connection = held._client.connection
         await connection.disconnect(nowait=True)
-        transport._replies.extend((primary, _bulk(b'ok')))
+        transport.replies.extend((primary, _bulk(b'ok')))
         assert await role.run_operation(lambda pin: pin.get('key')) == b'ok'
-        assert len(transport._wires) == 3
-        for wire in transport._wires:
-            assert b'INFO' in wire._sent[0]
-            assert not any(b'INFO' in command for command in wire._sent[1:])
-        assert not transport._replies
+        assert len(transport.wires) == 3
+        for wire in transport.wires:
+            assert b'INFO' in wire.sent[0]
+            assert not any(b'INFO' in command for command in wire.sent[1:])
+        assert not transport.replies
         await role.close()
 
     asyncio.run(scenario())
@@ -2695,7 +2988,7 @@ def test_ha_failed_proof_discards_pool_and_new_socket_is_proven(
         transport = _Transport(monkeypatch)
         role = _proving_role(mode)
         pool = role._active()
-        transport._replies.append(_bulk(reply))
+        transport.replies.append(_bulk(reply))
         with pytest.raises(failure) as caught:
             async with role.pin():
                 pytest.fail('rejected proof acquired a pin')
@@ -2703,14 +2996,12 @@ def test_ha_failed_proof_discards_pool_and_new_socket_is_proven(
         assert caught.value.__context__ is None
         assert 'private-value' not in str(caught.value)
         assert role.epoch()[0] == 1
-        assert transport._wires[0]._closed
-        transport._replies.extend(
-            (_bulk(b'role:master\r\nmaster_replid:primary\r\n'), _bulk(b'ok'))
-        )
+        assert transport.wires[0].closed
+        transport.replies.extend((_bulk(PRIMARY_INFO), _bulk(b'ok')))
         assert await role.run_operation(lambda pin: pin.get('key')) == b'ok'
         assert role._client is not pool
-        assert len(transport._wires) == 2
-        assert b'INFO' in transport._wires[1]._sent[0]
+        assert len(transport.wires) == 2
+        assert b'INFO' in transport.wires[1].sent[0]
         await role.close()
 
     asyncio.run(scenario())
@@ -2731,19 +3022,19 @@ def test_ha_proof_cancellation_closes_socket_and_next_pin_proves_again(
 
         task = asyncio.create_task(acquire())
         async with asyncio.timeout(1):
-            while not transport._wires or not transport._wires[0]._sent:
+            while not transport.wires or not transport.wires[0].sent:
                 if task.done():
                     await task
                 await asyncio.sleep(0)
-        assert b'INFO' in transport._wires[0]._sent[0]
+        assert b'INFO' in transport.wires[0].sent[0]
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert transport._wires[0]._closed
-        transport._replies.append(_bulk(b'role:master\r\nmaster_replid:primary\r\n'))
+        assert transport.wires[0].closed
+        transport.replies.append(_bulk(PRIMARY_INFO))
         async with role.pin():
-            assert len(transport._wires) == 2
-            assert b'INFO' in transport._wires[1]._sent[0]
+            assert len(transport.wires) == 2
+            assert b'INFO' in transport.wires[1].sent[0]
         await role.close()
 
     asyncio.run(scenario())
@@ -2758,12 +3049,12 @@ def test_ha_reconnect_before_fenced_command_is_proven_and_never_replayed(
         transport = _Transport(monkeypatch)
         role = _proving_role(mode)
         control = AsyncValkeyControl(role, key_prefix='sgqc', validation_seconds=30)
-        primary = _bulk(b'role:master\r\nmaster_replid:primary\r\n')
-        validation = (primary, _bulk(_RECORD_A), b':1\r\n') * 2
-        transport._replies.extend((primary, *validation))
+        primary = _bulk(PRIMARY_INFO)
+        validation = (primary, _bulk(RECORD_A), b':1\r\n') * 2
+        transport.replies.extend((primary, *validation))
         await control._validate_incarnation()
         before = role.epoch()[0]
-        transport._replies.extend((primary, b':1\r\n'))
+        transport.replies.extend((primary, b':1\r\n'))
 
         async def operation(
             pin: module.PinnedControlClient, _incarnation: common_module.Incarnation
@@ -2776,17 +3067,302 @@ def test_ha_reconnect_before_fenced_command_is_proven_and_never_replayed(
         with pytest.raises(BackendUnavailable, match='changed during operation'):
             await control.run(operation)
         assert role.epoch()[0] > before
-        assert b'INFO' in transport._wires[1]._sent[0]
-        assert b'EVALSHA' in transport._wires[1]._sent[1]
-        assert (
-            sum(b'EVALSHA' in command for wire in transport._wires for command in wire._sent) == 1
-        )
-        transport._replies.extend((primary, *validation))
+        assert b'INFO' in transport.wires[1].sent[0]
+        assert b'EVALSHA' in transport.wires[1].sent[1]
+        assert sum(b'EVALSHA' in command for wire in transport.wires for command in wire.sent) == 1
+        transport.replies.extend((primary, *validation))
         await control._validate_incarnation()
-        assert len(transport._wires) == 3
-        assert sum(b'INFO' in command for command in transport._wires[2]._sent) == 3
-        assert not transport._replies
+        assert len(transport.wires) == 3
+        assert sum(b'INFO' in command for command in transport.wires[2].sent) == 3
+        assert not transport.replies
         await role.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize('password', [None, '', 917])
+def test_password_errors_name_role_and_variable(
+    monkeypatch: pytest.MonkeyPatch, role: str, password: object
+) -> None:
+    settings = CacheSettings(l2=L2Settings(enabled=True))
+    environ: dict[str, object] = {
+        settings.l2.valkey.result.password_env: 'sensitive-result',
+        settings.l2.valkey.metadata.password_env: 'sensitive-metadata',
+    }
+    variable = getattr(settings.l2.valkey, role).password_env
+    if password is None:
+        del environ[variable]
+    else:
+        environ[variable] = password
+
+    def unexpected_client(*_args: object, **_kwargs: object) -> None:
+        pytest.fail('password validation must precede client allocation')
+
+    monkeypatch.setattr(module, '_create_client', unexpected_client)
+    message = f'cache.l2.valkey.{role}.password_env variable {variable} is unset or empty'
+
+    async def exercise() -> None:
+        with pytest.raises(ValueError, match='password_env') as captured:
+            await module.AsyncValkeyBackend.from_settings(settings, environ, NullMetrics())
+        assert str(captured.value) == message
+        if role == 'metadata':
+            with pytest.raises(ValueError, match='password_env') as captured:
+                await module.AsyncValkeyMetadataStore.from_settings(
+                    settings, environ, NullMetrics()
+                )
+            assert str(captured.value) == message
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('role_name', ['result', 'metadata'])
+def test_role_settlement_keeps_failure_class(
+    monkeypatch: pytest.MonkeyPatch, role_name: str
+) -> None:
+    async def scenario() -> None:
+        _Transport(monkeypatch)
+        raw_error = ValkeyTimeoutError('credential-canary-settlement')
+        calls: list[str] = []
+
+        async def command(_client: Valkey, name: str, *_args: object) -> object:
+            calls.append(name)
+            if name == 'INFO':
+                return {'role': 'master', 'master_replid': 'primary'}
+            if name == 'GET':
+                return RECORD_A
+            if name == 'EXISTS':
+                return 1
+            assert name == 'EVALSHA'
+            raise raw_error
+
+        monkeypatch.setattr(Valkey, 'execute_command', command)
+        role = _role()
+        settings = CacheSettings(limits=_FAKE_TRANSPORT_LIMITS)
+        metadata = module.AsyncValkeyMetadataStore(role, settings, NullMetrics())
+        backend = module.AsyncValkeyBackend(role, metadata, settings, NullMetrics())
+        operation = (
+            backend.lookup('key')
+            if role_name == 'result'
+            else metadata.resolve((DependencyTag.site('site'),))
+        )
+        with pytest.raises(BackendUnavailable, match='role changed during operation') as caught:
+            await operation
+        assert caught.value.failure_class == 'timeout'
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert calls.count('EVALSHA') == 1
+        traceback = caught.value.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name in {'run_operation', '_settle'}:
+                assert all(
+                    value is not raw_error for value in traceback.tb_frame.f_locals.values()
+                )
+            traceback = traceback.tb_next
+        await backend.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('boundary', ['connect', 'validation'])
+def test_replica_is_classified_at_connect_and_validation(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    async def scenario() -> None:
+        transport = _Transport(monkeypatch)
+        transport.replies.append(_bulk(b'role:slave\r\nmaster_replid:primary\r\n'))
+        role = _proving_role('managed') if boundary == 'connect' else _role()
+        metadata = module.AsyncValkeyMetadataStore(
+            role, CacheSettings(limits=_FAKE_TRANSPORT_LIMITS), NullMetrics()
+        )
+        with pytest.raises(BackendUnavailable) as caught:
+            await metadata.resolve((DependencyTag.site('site'),))
+        assert caught.value.failure_class == 'replica'
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        await metadata.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize('half_open', [False, True])
+@pytest.mark.parametrize('settlement', ['stalled', 'finite_cleanup', 'caller_cancel'])
+def test_published_deadline_owns_stalled_backend_and_cleanup(
+    monkeypatch: pytest.MonkeyPatch, role: str, half_open: bool, settlement: str
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(asyncio.get_running_loop(), 'time', clock)
+        tested = _DeadlineRole(role, clock, half_open=half_open)
+        stalled = _DeadlineStall(clock, settlement)
+        monkeypatch.setattr(tested.client, 'evalsha', stalled)
+        record = support.DeadlineRecord(clock() + 1)
+        with support.publish_deadline(record):
+            operation = asyncio.create_task(tested.operation())
+            if settlement != 'stalled':
+                await stalled.cleanup_entered.wait()
+                clock.advance(10)
+                await _deadline_turn()
+                assert not operation.done()
+                if settlement == 'caller_cancel':
+                    operation.cancel('caller after expiry')
+                else:
+                    stalled.cleanup_release.set()
+            if settlement == 'caller_cancel':
+                with pytest.raises(asyncio.CancelledError, match='caller after expiry'):
+                    await operation
+            else:
+                with pytest.raises(BackendUnavailable, match='deadline') as caught:
+                    await operation
+                assert caught.value.failure_class == 'timeout'
+        assert record.expired
+        assert stalled.expired_at == record.deadline
+        assert stalled.cancellations == (2 if settlement == 'caller_cancel' else 1)
+        transitions = tested.transitions('reopened' if half_open else 'open')
+        assert len(transitions) == 1
+        assert transitions[0]['failure_class'] == 'timeout'
+        with pytest.raises(BackendUnavailable, match='breaker'):
+            await tested.operation()
+        assert stalled.calls == 1
+        await tested.owner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize('half_open', [False, True])
+@pytest.mark.parametrize('record_expired', [False, True])
+def test_caller_cancellation_uses_own_timer_and_abandons_only_admitted_probe(
+    monkeypatch: pytest.MonkeyPatch, role: str, half_open: bool, record_expired: bool
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(asyncio.get_running_loop(), 'time', clock)
+        tested = _DeadlineRole(role, clock, half_open=half_open)
+        entered = asyncio.Event()
+
+        async def pending() -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        with support.publish_deadline(support.DeadlineRecord(clock() + 1, record_expired)):
+            operation = asyncio.create_task(tested.guard('test', pending))
+            await entered.wait()
+            if half_open:
+                with pytest.raises(BackendUnavailable, match='breaker'):
+                    await tested.guard('test', pending)
+                assert tested.breaker._state == 'half_open'
+                assert not tested.transitions('probe_abandoned')
+            operation.cancel('caller')
+            with pytest.raises(asyncio.CancelledError, match='caller'):
+                await operation
+        assert len(tested.transitions('probe_abandoned')) == int(half_open)
+        assert not tested.transitions('open')
+        assert not tested.transitions('reopened')
+        assert tested.breaker.admit() is half_open
+        tested.breaker.succeed()
+        await tested.owner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize('half_open', [False, True])
+@pytest.mark.parametrize('failure', [BackendCapacity, StaleIncarnation])
+def test_capacity_and_stale_preserve_breaker_settlement(
+    role: str, half_open: bool, failure: type[Exception]
+) -> None:
+    async def scenario() -> None:
+        tested = _DeadlineRole(role, FakeClock(), half_open=half_open)
+
+        async def rejected() -> None:
+            raise failure('rejected')
+
+        with pytest.raises(failure):
+            await tested.guard('test', rejected)
+        assert tested.breaker._state == 'closed'
+        assert tested.breaker._failures == 0
+        assert len(tested.transitions('closed')) == int(half_open)
+        rejection = ('cache_metadata_write_rejection', {'reason': 'noeviction'})
+        assert (rejection in tested.metrics.increments) is (
+            role == 'metadata' and failure is BackendCapacity
+        )
+        await tested.owner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize('half_open', [False, True])
+@pytest.mark.parametrize('failure', [BackendCapacity, StaleIncarnation, ValueError, None])
+def test_own_deadline_counts_when_cleanup_replaces_its_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    half_open: bool,
+    failure: type[Exception] | None,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(asyncio.get_running_loop(), 'time', clock)
+        tested = _DeadlineRole(role, clock, half_open=half_open)
+        record = support.DeadlineRecord(clock() + 1)
+
+        async def replaced() -> None:
+            clock.advance(1)
+            try:
+                await _deadline_turn()
+                # Advance the fallback timer so an ignored deadline fails without hanging.
+                clock.advance(5)
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if failure is not None:
+                    raise failure('replacement') from None
+
+        with support.publish_deadline(record):
+            if failure is None:
+                await tested.guard('test', replaced)
+            else:
+                with pytest.raises(failure, match='replacement'):
+                    await tested.guard('test', replaced)
+        assert record.expired
+        assert len(tested.transitions('reopened' if half_open else 'open')) == 1
+        assert not tested.transitions('closed')
+        assert not tested.transitions('probe_abandoned')
+        assert tested.breaker._state == 'open'
+        await tested.owner.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+def test_delayed_loop_decides_response_with_the_single_backend_timer(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, 'time', clock)
+        tested = _DeadlineRole(role, clock, half_open=False)
+        record = support.DeadlineRecord(clock() + 1)
+        response = loop.create_future()
+        loop.call_at(record.deadline - 0.1, response.set_result, 'ready')
+
+        async def delayed() -> object:
+            # Both callbacks become due in one delayed iteration. The response
+            # callback queues the task, then the owning timer cancels that task.
+            clock.advance(6)
+            return await response
+
+        with (
+            support.publish_deadline(record),
+            pytest.raises(BackendUnavailable, match='deadline'),
+        ):
+            await tested.guard('test', delayed)
+        assert record.expired
+        assert response.result() == 'ready'
+        assert len(tested.transitions('open')) == 1
+        await tested.owner.close()
 
     asyncio.run(scenario())
 
@@ -2816,7 +3392,7 @@ def test_span_drift_does_not_discard_a_replacement_pool(
             return 'primary' if probes == 1 else 'replacement'
 
         role._endpoint_probe = probe
-        transport._replies.append(b'$2\r\nok\r\n')
+        transport.replies.append(b'$2\r\nok\r\n')
         command = asyncio.create_task(role.get('key'))
         await entered.wait()
         async with role.pin() as replacement:
@@ -2825,7 +3401,135 @@ def test_span_drift_does_not_discard_a_replacement_pool(
                 await command
             assert role._client is not None
             assert role._client.connection_pool is replacement._client.connection_pool
-            assert not transport._wires[-1]._closed
+            assert not transport.wires[-1].closed
         await role.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('caller_cancel', [False, True])
+def test_terminal_close_keeps_first_error_and_records_later_resource_expiry(
+    monkeypatch: pytest.MonkeyPatch, caller_cancel: bool
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(asyncio.get_running_loop(), 'time', clock)
+        first, second = BackendClient([]), BackendClient([])
+        first.close_error = BackendProtocolError('first resource')
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def later_close() -> None:
+            second.closed += 1
+            clock.advance(1)
+            try:
+                await _deadline_turn()
+                # Advance the fallback timer so an ignored deadline fails without hanging.
+                clock.advance(5)
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                entered.set()
+                await release.wait()
+                raise
+
+        monkeypatch.setattr(second, 'close', later_close)
+        backend = module.AsyncValkeyBackend(
+            first,
+            cast('module.AsyncValkeyMetadataStore', second),
+            CacheSettings(limits=_FAKE_TRANSPORT_LIMITS),
+            NullMetrics(),
+        )
+        record = support.DeadlineRecord(clock() + 1)
+        with support.publish_deadline(record):
+            close = asyncio.create_task(backend.close())
+            await entered.wait()
+            assert clock() == record.deadline
+            if caller_cancel:
+                close.cancel('caller during close')
+            release.set()
+            if caller_cancel:
+                with pytest.raises(asyncio.CancelledError, match='caller during close'):
+                    await close
+            else:
+                with pytest.raises(BackendProtocolError, match='first resource'):
+                    await close
+        assert first.closed == second.closed == 1
+        assert record.expired
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    'backend_type', [module.AsyncValkeyBackend, module.AsyncValkeyMetadataStore]
+)
+def test_shipped_backends_declare_deadline_ownership(backend_type: type[object]) -> None:
+    assert getattr(backend_type, 'owns_published_deadline', False) is True
+
+
+def test_translated_failure_exposes_no_client_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    canary = 'credential-canary-construction'
+    raw_error = ValkeyTimeoutError(canary)
+    raw_error.add_note(canary)
+    raw_error.__dict__['client_detail'] = canary
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise raw_error
+
+    async def scenario() -> None:
+        monkeypatch.setattr(Valkey, 'from_pool', fail)
+        settings = CacheSettings(l2=L2Settings(enabled=True))
+        with pytest.raises(BackendUnavailable) as caught:
+            await module.AsyncValkeyBackend.from_settings(
+                settings,
+                {
+                    settings.l2.valkey.result.password_env: 'result',
+                    settings.l2.valkey.metadata.password_env: 'metadata',
+                },
+                NullMetrics(),
+            )
+        failure = caught.value
+        assert failure.failure_class == 'timeout'
+        assert canary not in str(failure)
+        assert canary not in repr(vars(failure))
+        assert not getattr(failure, '__notes__', ())
+        assert failure.__cause__ is None
+        assert failure.__context__ is None
+        assert canary not in ''.join(format_exception(failure))
+        traceback = failure.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_name == 'translate_client_error':
+                assert all(
+                    value is not raw_error for value in traceback.tb_frame.f_locals.values()
+                )
+            traceback = traceback.tb_next
+
+    asyncio.run(scenario())
+
+
+def test_valkey_async_module_names_missing_extra() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            """
+import sys
+
+sys.modules['valkey'] = None
+try:
+    import sg_query_cache.valkey_async
+except ImportError as error:
+    assert str(error) == (
+        "sg_query_cache.valkey_async requires the 'valkey' extra: "
+        "pip install 'sg-query-cache[valkey]'"
+    )
+    assert isinstance(error.__cause__, ModuleNotFoundError)
+    assert error.__cause__.name == 'valkey'
+else:
+    raise AssertionError('missing valkey import succeeded')
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

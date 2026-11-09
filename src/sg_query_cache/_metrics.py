@@ -2,14 +2,17 @@
 
 from collections.abc import Mapping
 from math import isfinite
-from typing import Protocol
+from typing import Protocol, get_args
 
+from sg_query_cache._backend import FailureClass
 from sg_query_cache._keys import METRICS_KEY_MIN_BYTES, KeyBuilder
 
+_ALLOWED_FAILURE_CLASSES = frozenset(get_args(FailureClass))
 _ALLOWED_LABELS = frozenset(
     {
         'backend_operation',
         'classification',
+        'failure_class',
         'layer',
         'method',
         'outcome',
@@ -145,6 +148,8 @@ class SafeMetrics:
                     raise ValueError(
                         'exact-call digest must be lowercase HMAC-SHA-256 hexadecimal'
                     )
+            elif name == 'failure_class' and value not in _ALLOWED_FAILURE_CLASSES:
+                raise ValueError('failure class is not in the safe vocabulary')
             elif not value or len(value) > _MAX_LABEL_VALUE_LENGTH or not value.isascii():
                 raise ValueError('metric label value must be short, nonempty ASCII')
             safe[name] = value
@@ -173,6 +178,7 @@ class SafeMetrics:
 
         Raises:
             ValueError: The name or any label is outside the safe vocabulary.
+            Exception: The destination sink fails while recording the event.
         """
         self._sink.increment(_validated_name(name), self._validated_labels(labels))
 
@@ -187,6 +193,8 @@ class SafeMetrics:
         Raises:
             ValueError: The name, value, or any label is outside the safe
                 vocabulary.
+            Exception: The destination sink fails while recording the
+                observation.
         """
         if not isfinite(value):
             raise ValueError('metric observation must be finite')

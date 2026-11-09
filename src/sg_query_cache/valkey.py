@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Provide the optional synchronous two-role Valkey cache backend.
 
 Importing this module requires the optional `valkey` dependency. Construct a
@@ -22,84 +19,98 @@ from time import monotonic
 from typing import Protocol, Self, TypeAlias, TypeVar, cast
 from weakref import WeakKeyDictionary, WeakSet
 
-from valkey import Sentinel, Valkey
-from valkey.backoff import NoBackoff
-from valkey.exceptions import ConnectionError as ValkeyConnectionError
-from valkey.exceptions import ReadOnlyError
-from valkey.exceptions import TimeoutError as ValkeyTimeoutError
-from valkey.retry import Retry
-
-from sg_query_cache._backend import (
-    BackendCapacity,
-    BackendProtocolError,
-    BackendUnavailable,
-    StaleIncarnation,
-)
-from sg_query_cache._backend_validation import (
-    encoded_payload,
-    fill_lease,
-    flush_reason,
-    generation_changes,
-    metric_flush_reason,
-    opaque_key,
-)
-from sg_query_cache._config import (
-    CacheSettings,
-    ValkeyRoleSettings,
-    parse_sentinel_address,
-)
-from sg_query_cache._keys import KeyBuilder
-from sg_query_cache._metrics import MetricsSink
-from sg_query_cache._model import (
-    CacheHit,
-    DependencyTag,
-    FillLease,
-    GenerationChange,
-    GenerationVector,
-)
-from sg_query_cache._valkey_common import (
-    CircuitBreaker,
-    Incarnation,
-    LookupOutcome,
-    ScriptArgument,
-    decode_change_reply,
-    decode_release_reply,
-    decode_reserve_reply,
-    decode_resolve_reply,
-    finalize_lookup,
-    interpret_lookup,
-    lookup_operands,
-    metadata_operands,
-    milliseconds,
-    release_operands,
-    require_enabled_l2,
-    reserve_operands,
-    role_password,
-    validated_resolve_tags,
-)
-from sg_query_cache._valkey_control import ControlClient, PinnedControlClient, ValkeyControl
-from sg_query_cache._valkey_proof import require_primary_reply
-from sg_query_cache._valkey_scripts import (
-    CHANGE_SCRIPT,
-    CHANGE_SCRIPT_SHA,
-    LOOKUP_SCRIPT,
-    LOOKUP_SCRIPT_SHA,
-    RELEASE_SCRIPT,
-    RELEASE_SCRIPT_SHA,
-    RESERVE_SCRIPT,
-    RESERVE_SCRIPT_SHA,
-    RESOLVE_SCRIPT,
-    RESOLVE_SCRIPT_SHA,
-    ResultClient,
-    ScriptClient,
-    execute_commit,
-    execute_script,
-    translate_client_error,
-)
+try:
+    import valkey
+    from valkey import Sentinel, Valkey
+    from valkey.backoff import NoBackoff
+    from valkey.exceptions import ConnectionError as ValkeyConnectionError
+    from valkey.exceptions import ReadOnlyError
+    from valkey.exceptions import TimeoutError as ValkeyTimeoutError
+    from valkey.retry import Retry
+except ModuleNotFoundError as error:
+    if error.name != 'valkey':
+        raise
+    raise ImportError(
+        "sg_query_cache.valkey requires the 'valkey' extra: pip install 'sg-query-cache[valkey]'"
+    ) from error
+else:
+    from sg_query_cache._backend import (
+        BackendCapacity,
+        BackendProtocolError,
+        BackendUnavailable,
+        FailureClass,
+        StaleIncarnation,
+    )
+    from sg_query_cache._backend_validation import (
+        encoded_payload,
+        fill_lease,
+        flush_reason,
+        generation_changes,
+        metric_flush_reason,
+        opaque_key,
+    )
+    from sg_query_cache._config import (
+        CacheSettings,
+        ValkeyRoleSettings,
+        parse_sentinel_address,
+    )
+    from sg_query_cache._keys import KeyBuilder
+    from sg_query_cache._metrics import MetricsSink
+    from sg_query_cache._model import (
+        CacheHit,
+        DependencyTag,
+        FillLease,
+        GenerationChange,
+        GenerationVector,
+    )
+    from sg_query_cache._valkey_common import (
+        CircuitBreaker,
+        Incarnation,
+        LookupOutcome,
+        ScriptArgument,
+        decode_change_reply,
+        decode_release_reply,
+        decode_reserve_reply,
+        decode_resolve_reply,
+        finalize_lookup,
+        interpret_lookup,
+        lookup_operands,
+        metadata_operands,
+        milliseconds,
+        release_operands,
+        require_enabled_l2,
+        reserve_operands,
+        role_password,
+        validated_resolve_tags,
+    )
+    from sg_query_cache._valkey_control import ControlClient, PinnedControlClient, ValkeyControl
+    from sg_query_cache._valkey_proof import require_primary_reply
+    from sg_query_cache._valkey_scripts import (
+        CHANGE_SCRIPT,
+        CHANGE_SCRIPT_SHA,
+        LOOKUP_SCRIPT,
+        LOOKUP_SCRIPT_SHA,
+        RELEASE_SCRIPT,
+        RELEASE_SCRIPT_SHA,
+        RESERVE_SCRIPT,
+        RESERVE_SCRIPT_SHA,
+        RESOLVE_SCRIPT,
+        RESOLVE_SCRIPT_SHA,
+        ResultClient,
+        ScriptClient,
+        client_failure_class,
+        execute_commit,
+        execute_script,
+        translate_client_error,
+    )
+del valkey
 
 _T = TypeVar('_T')
 
 _Clock: TypeAlias = Callable[[], float]
+
+
+__all__ = ['ValkeyBackend', 'ValkeyMetadataStore']
 
 
 class _CircuitBreaker(CircuitBreaker):
@@ -121,14 +132,22 @@ class _CircuitBreaker(CircuitBreaker):
         self._lock = Lock()
 
     def admit(self) -> bool:
-        """Admit one operation and report whether it needs a fresh pool."""
+        """Admit one operation and report whether it needs a fresh pool.
+
+        Returns:
+            Whether this operation owns the half-open recovery probe.
+
+        Raises:
+            BackendUnavailable: The circuit remains open or another recovery
+                probe is already active.
+        """
         with self._lock:
             return super().admit()
 
-    def fail(self) -> None:
+    def fail(self, failure_class: FailureClass | None = None) -> None:
         """Count one failure or reopen a failed probe."""
         with self._lock:
-            super().fail()
+            super().fail(failure_class)
 
     def succeed(self) -> None:
         """Close a successful probe and reset consecutive failures."""
@@ -184,16 +203,23 @@ class _RawValkeyClient(PinnedControlClient, Protocol):
     """Describe one concrete maintained-client connection pool."""
 
     def client(self) -> '_PinnedRawValkeyClient':
-        """Borrow the maintained client's single-connection child.
+        """Borrow a single-connection child for one backend operation.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.client`.
 
         Returns:
-            A child sharing this client's pool. Close the child when finished
-            to return its borrowed connection.
+            A child sharing the owning pool, retained only for the backend
+            operation and closed when that operation finishes.
         """
         ...
 
     def close(self) -> None:
-        """Release the concrete connection pool."""
+        """Release the owned backend role pool through the maintained client.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.close`.
+        """
         ...
 
 
@@ -201,7 +227,11 @@ class _PinnedRawValkeyClient(PinnedControlClient, Protocol):
     """Describe one maintained client pinned to a physical connection."""
 
     def close(self) -> None:
-        """Return the borrowed connection to its owning pool."""
+        """Return the backend operation's borrowed connection to its pool.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.close`.
+        """
         ...
 
 
@@ -209,20 +239,29 @@ class _ReconnectObservable(Protocol):
     """Publish maintained-client physical reconnect events."""
 
     def connect(self) -> None:
-        """Establish the physical connection before its first command."""
+        """Establish the socket observed by the role connection tracker.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.connect`.
+        """
         ...
 
     def disconnect(self) -> None:
-        """Close the current socket before observed reconnection."""
+        """Close the socket before installing observed connection state.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.disconnect`.
+        """
         ...
 
     def register_connect_callback(self, callback: Callable[[object], None]) -> None:
-        """Register a weakly held callback for successful connection establishment.
+        """Register the role tracker for successful physical connections.
 
-        Args:
-            callback: Bound method receiving the physical connection after an
-                initial connection or reconnect. Its owner must remain alive
-                for notifications to continue.
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.register_connect_callback`.
+
+        The role tracker must remain alive for the borrowed connection's
+        notifications.
         """
         ...
 
@@ -231,19 +270,35 @@ class _SetupConnection(Protocol):
     """Initialize one maintained-client connection after socket establishment."""
 
     def disconnect(self) -> None:
-        """Close the connection's socket."""
+        """Close a socket whose writable-primary proof failed.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.disconnect`.
+        """
         ...
 
     def on_connect(self) -> None:
-        """Authenticate, select the database, and finish protocol setup."""
+        """Complete maintained connection setup before writable-primary proof.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.on_connect`.
+        """
         ...
 
     def read_response(self) -> object:
-        """Read one raw protocol response from the connection."""
+        """Read the replication response used to prove a writable primary.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.read_response`.
+        """
         ...
 
     def send_command(self, *args: object) -> None:
-        """Send one command on the established connection."""
+        """Send the replication probe used to prove a writable primary.
+
+        Arguments, results and client errors are those of
+        `valkey.connection.AbstractConnection.send_command`.
+        """
         ...
 
 
@@ -259,15 +314,21 @@ class _ConnectionGeneration:
         self._lock = Lock()
         self._registered: WeakSet[object] = WeakSet()
 
-    def _connected(self, connection: object) -> None:
+    def connected(self, connection: object) -> None:
         """Record one successful physical connection under a new role-unique generation."""
         with self._lock:
             self._registered.add(connection)
             self._generation_count += 1
             self._by_connection[connection] = self._generation_count
 
-    def _borrowed(self, client: object) -> bool:
-        """Register a newly borrowed physical connection for reconnects."""
+    def borrowed(self, client: object) -> bool:
+        """Register a newly borrowed physical connection for reconnects.
+
+        Returns:
+            Whether the client's connection was newly registered; `False` if
+            the connection is absent, lacks callback support, or was already
+            registered.
+        """
         connection = getattr(client, 'connection', None)
         register = getattr(connection, 'register_connect_callback', None)
         if connection is None or not callable(register):
@@ -278,11 +339,11 @@ class _ConnectionGeneration:
             self._registered.add(connection)
             self._by_connection[connection] = 0
         observable = cast('_ReconnectObservable', connection)
-        observable.register_connect_callback(self._connected)
+        observable.register_connect_callback(self.connected)
         return True
 
-    def _for_client(self, client: object) -> int | None:
-        """Return one borrowed connection's latest role-unique generation."""
+    def for_client(self, client: object) -> int | None:
+        """Return a borrowed connection's latest generation, or `None` if untracked."""
         connection = getattr(client, 'connection', None)
         if connection is None:
             return None
@@ -290,7 +351,7 @@ class _ConnectionGeneration:
             return self._by_connection.get(connection)
 
     @property
-    def _generation(self) -> int:
+    def generation(self) -> int:
         """Return the successful-connection generation."""
         with self._lock:
             return self._generation_count
@@ -300,7 +361,11 @@ class _SentinelPool(Protocol):
     """Expose the currently discovered Sentinel primary address."""
 
     def get_master_address(self) -> tuple[str, int]:
-        """Discover and return the writable primary address."""
+        """Discover the primary endpoint used to validate the role epoch.
+
+        Arguments, results and client errors are those of
+        `valkey.sentinel.SentinelConnectionPool.get_master_address`.
+        """
         ...
 
 
@@ -330,28 +395,6 @@ class _RoleClient:
                 self._client = self._factory()
             return self._client
 
-    def __init__(
-        self,
-        factory: Callable[[], _RawValkeyClient],
-        connections: _ConnectionGeneration,
-        endpoint_probe: Callable[[_RawValkeyClient], object] | None = None,
-    ) -> None:
-        """Retain the role factory and track its initial connection pool."""
-        self._client: _RawValkeyClient | None = None
-        self._connections = connections
-        self._endpoint: object | None = None
-        self._endpoint_probe = endpoint_probe
-        self._factory = factory
-        self._lock = Lock()
-        self._pool_epoch = 0
-        self._active()
-        if endpoint_probe is not None:
-            self.refresh_endpoint()
-
-    def _connection_generation(self, client: _PinnedRawValkeyClient) -> int | None:
-        """Return one pin's latest role-unique connection generation."""
-        return self._connections._for_client(client)
-
     def _invalidate(self, expected: _RawValkeyClient | None = None) -> None:
         """Detach and close a pool after reconnect-class failure."""
         with self._lock:
@@ -365,17 +408,20 @@ class _RoleClient:
         with suppress(Exception):
             client.close()
 
-    def _invoke_on(
+    def __init__(
         self,
-        client: _RawValkeyClient,
-        operation: Callable[[], _T],
-    ) -> _T:
-        """Run one command against a known pool and invalidate its failures."""
-        try:
-            return operation()
-        except (ReadOnlyError, ValkeyConnectionError, ValkeyTimeoutError):
-            self._invalidate(client)
-            raise
+        factory: Callable[[], _RawValkeyClient],
+        connections: _ConnectionGeneration,
+        endpoint_probe: Callable[[_RawValkeyClient], object] | None = None,
+    ) -> None:
+        """Retain the role factory without allocating or connecting a pool."""
+        self._client: _RawValkeyClient | None = None
+        self._connections = connections
+        self._endpoint: object | None = None
+        self._endpoint_probe = endpoint_probe
+        self._factory = factory
+        self._lock = Lock()
+        self._pool_epoch = 0
 
     def _role_epoch(self) -> tuple[int, object | None]:
         """Return pool and endpoint state without the diagnostic aggregate."""
@@ -392,6 +438,10 @@ class _RoleClient:
         if client is not None:
             client.close()
 
+    def connection_generation(self, client: _PinnedRawValkeyClient) -> int | None:
+        """Return the pin's latest connection generation, or `None` if untracked."""
+        return self._connections.for_client(client)
+
     def epoch(self) -> tuple[int, int, object | None]:
         """Return recorded role state without performing network I/O.
 
@@ -401,7 +451,32 @@ class _RoleClient:
             when no endpoint has been recorded.
         """
         pool_epoch, endpoint = self._role_epoch()
-        return pool_epoch, self._connections._generation, endpoint
+        return pool_epoch, self._connections.generation, endpoint
+
+    def invoke_on(
+        self,
+        client: _RawValkeyClient,
+        operation: Callable[[], _T],
+    ) -> _T:
+        """Run one command against a known pool and invalidate its failures.
+
+        Args:
+            client: Pool to invalidate if the command fails during reconnect
+                handling.
+            operation: Command callback executed once against that pool.
+
+        Returns:
+            The callback's result.
+
+        Raises:
+            Exception: The command fails; reconnect-class failures also
+                invalidate the supplied pool.
+        """
+        try:
+            return operation()
+        except (ReadOnlyError, ValkeyConnectionError, ValkeyTimeoutError):
+            self._invalidate(client)
+            raise
 
     @contextmanager
     def pin(self) -> Generator['_PinnedRoleClient']:
@@ -423,7 +498,7 @@ class _RoleClient:
         pinned: _PinnedRawValkeyClient | None = None
         try:
             pinned = client.client()
-            newly_observed = self._connections._borrowed(pinned)
+            newly_observed = self._connections.borrowed(pinned)
             connection = getattr(pinned, 'connection', None)
             connect = getattr(connection, 'connect', None)
             disconnect = getattr(connection, 'disconnect', None)
@@ -519,7 +594,11 @@ class _RoleClient:
         """
         before_refresh = self._role_epoch()
         self.refresh_endpoint()
-        if self._role_epoch() != before_refresh:
+        after_refresh = self._role_epoch()
+        # Initial discovery admits an endpoint; later endpoint or pool changes fail.
+        if after_refresh != before_refresh and (
+            before_refresh[1] is not None or after_refresh[0] != before_refresh[0]
+        ):
             raise BackendUnavailable('Valkey role changed before operation')
         with self.pin() as client:
             initial_role_epoch = self._role_epoch()
@@ -539,8 +618,12 @@ class _RoleClient:
                 self._role_epoch() != initial_role_epoch
                 or client.connection_generation() != initial_connection_generation
             ):
+                failure_class = client_failure_class(settlement_failure or operation_failure)
+                del settlement_failure, operation_failure
                 self._invalidate()
-                raise BackendUnavailable('Valkey role changed during operation')
+                raise BackendUnavailable(
+                    'Valkey role changed during operation', failure_class=failure_class
+                ) from None
             if settlement_failure is not None:
                 raise settlement_failure
             if operation_failure is not None:
@@ -550,44 +633,101 @@ class _RoleClient:
             return outcome[0]
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: ScriptArgument) -> object:
-        """Execute a cached script and return its raw reply through the active pool.
+        """Execute a cached backend script within a verified role span.
 
-        Role validation and failures follow `run_operation`.
+        Arguments, results and command errors are those of
+        `valkey.Valkey.evalsha`.
 
-        Args:
-            sha: SHA-1 digest of the script to execute.
-            numkeys: Number of leading `keys_and_args` entries interpreted as
-                keys.
-            *keys_and_args: Keys followed by script arguments in caller order.
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
 
         Raises:
-            NoScriptError: The server does not have the requested script
-                cached.
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
         """
         return self.run_operation(lambda client: client.evalsha(sha, numkeys, *keys_and_args))
 
     def exists(self, key: str) -> object:
-        """Read key existence through the active pool."""
+        """Check control-key presence within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.Valkey.exists`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+        """
         return self.run_operation(lambda client: client.exists(key))
 
     def get(self, key: str) -> object:
-        """Read one raw string value through the active pool.
+        """Read the control record within a verified role span.
 
-        Role validation and failures follow `run_operation`.
+        Arguments, results and command errors are those of `valkey.Valkey.get`.
 
-        Returns:
-            The stored bytes, or `None` when the key is absent.
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
         """
         return self.run_operation(lambda client: client.get(key))
 
     def info(self, section: str) -> object:
-        """Read one information section through the active pool."""
+        """Read replication information within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.Valkey.info`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+        """
         return self.run_operation(lambda client: client.info(section))
 
     def script_load(self, script: bytes | str) -> object:
-        """Load one script and return its raw server digest through the active pool.
+        """Load a backend script within a verified role span.
 
-        Role validation and failures follow `run_operation`.
+        Arguments, results and command errors are those of
+        `valkey.Valkey.script_load`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
         """
         return self.run_operation(lambda client: client.script_load(script))
 
@@ -710,12 +850,16 @@ class ValkeyMetadataStore:
             if fresh:
                 self._breaker.succeed()
             raise
-        except (BackendProtocolError, BackendUnavailable):
+        except (BackendProtocolError, BackendUnavailable) as error:
+            labels = {'backend_operation': name, 'outcome': 'failure'}
+            failure_class = error.failure_class if isinstance(error, BackendUnavailable) else None
+            if failure_class is not None:
+                labels['failure_class'] = failure_class
             self._increment(
                 'backend_failure',
-                {'backend_operation': name, 'outcome': 'failure'},
+                labels,
             )
-            self._breaker.fail()
+            self._breaker.fail(failure_class)
             raise
         except BaseException:
             if fresh:
@@ -826,9 +970,8 @@ class ValkeyMetadataStore:
     ) -> Self:
         """Create a metadata-only store from validated role settings.
 
-        Sentinel and managed role preparation can perform I/O before returning.
-        If initial primary validation fails, cleanup of that client is
-        attempted before the failure propagates.
+        Construction performs no I/O. The first operation connects and proves
+        the writable primary; failures are handled by the role circuit breaker.
 
         Args:
             settings: Shared settings with enabled Valkey L2 configuration.
@@ -844,15 +987,10 @@ class ValkeyMetadataStore:
             TypeError: `settings` is not a `CacheSettings` instance.
             ValueError: Valkey L2 is disabled or its password is absent or
                 empty.
-            BackendCapacity: Valkey rejects client setup for capacity.
-            BackendProtocolError: Client setup or primary validation violates
-                the backend protocol.
-            BackendUnavailable: Client setup or primary discovery cannot
-                complete reliably.
         """
         require_enabled_l2(settings)
         role = settings.l2.valkey.metadata
-        client = _create_client(role, settings, role_password(role, environ))
+        client = _create_client(role, settings, role_password(role, environ, 'metadata'))
         return cls(client, settings, metrics)
 
     def resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
@@ -1045,12 +1183,16 @@ class ValkeyBackend:
             if fresh:
                 self._result_breaker.succeed()
             raise
-        except (BackendProtocolError, BackendUnavailable):
+        except (BackendProtocolError, BackendUnavailable) as error:
+            labels = {'backend_operation': name, 'outcome': 'failure'}
+            failure_class = error.failure_class if isinstance(error, BackendUnavailable) else None
+            if failure_class is not None:
+                labels['failure_class'] = failure_class
             self._increment(
                 'backend_failure',
-                {'backend_operation': name, 'outcome': 'failure'},
+                labels,
             )
-            self._result_breaker.fail()
+            self._result_breaker.fail(failure_class)
             raise
         except BaseException:
             if fresh:
@@ -1140,10 +1282,10 @@ class ValkeyBackend:
     ) -> Self:
         """Create both configured role clients from validated settings.
 
-        Sentinel and managed role preparation can perform I/O before returning.
-        If result-client construction raises a backend capacity, protocol, or
-        availability error, attempt cleanup of the already created metadata
-        client before propagating that error.
+        Construction performs no I/O. Connections are opened lazily. Metadata
+        operations validate their primary and control state; non-standalone
+        result roles prove their writable primary before use. The roles have
+        independent circuit breakers.
 
         Args:
             settings: Shared settings with enabled Valkey L2 configuration.
@@ -1158,17 +1300,12 @@ class ValkeyBackend:
             TypeError: `settings` is not a `CacheSettings` instance.
             ValueError: Valkey L2 is disabled or a role password is absent or
                 empty.
-            BackendCapacity: Valkey rejects client setup for capacity.
-            BackendProtocolError: Client setup or primary validation violates
-                the backend protocol.
-            BackendUnavailable: Client setup or primary discovery cannot
-                complete reliably.
         """
         require_enabled_l2(settings)
         metadata_role = settings.l2.valkey.metadata
         result_role = settings.l2.valkey.result
-        metadata_password = role_password(metadata_role, environ)
-        result_password = role_password(result_role, environ)
+        metadata_password = role_password(metadata_role, environ, 'metadata')
+        result_password = role_password(result_role, environ, 'result')
         metadata_client = _create_client(metadata_role, settings, metadata_password)
         construction_failure: RuntimeError | None = None
         result_client: _ResultRole | None = None
@@ -1198,6 +1335,8 @@ class ValkeyBackend:
             absence, expiry, oversized values, or malformed data.
 
         Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
             BackendProtocolError: The key or a backend reply is malformed.
             BackendUnavailable: The result role is unavailable or the lookup
                 cannot complete reliably.
@@ -1221,6 +1360,8 @@ class ValkeyBackend:
             belongs to another token.
 
         Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
             BackendProtocolError: The lease or a backend reply is malformed.
             BackendUnavailable: The result role is unavailable or release
                 cannot complete reliably.
@@ -1243,9 +1384,11 @@ class ValkeyBackend:
         Returns:
             Whether the result was admitted under the current lease. Return
             `False` for a lost lease, an exhausted lifetime, an oversized
-            payload, or result-capacity rejection.
+            payload, or capacity rejection during the commit operation.
 
         Raises:
+            BackendCapacity: Role preparation or oversized-payload lease
+                cleanup encounters a capacity failure.
             BackendProtocolError: An argument or a backend reply violates the
                 backend contract.
             BackendUnavailable: The result role is unavailable or commit or
@@ -1347,7 +1490,7 @@ class _PinnedRoleClient:
 
     def _invoke(self, operation: Callable[[], _T]) -> _T:
         """Run one pinned command with complete-pool invalidation on failure."""
-        return self._owner._invoke_on(self._pool, operation)
+        return self._owner.invoke_on(self._pool, operation)
 
     def connection_generation(self) -> int | None:
         """Return this pin's latest role-unique connection generation.
@@ -1356,41 +1499,55 @@ class _PinnedRoleClient:
             The role-wide generation recorded when this physical connection
             last connected, or `None` when it has no tracking record.
         """
-        return self._owner._connection_generation(self._client)
+        return self._owner.connection_generation(self._client)
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: ScriptArgument) -> object:
-        """Execute a cached script and return its raw reply on the pinned connection.
+        """Execute a cached backend script on the borrowed connection.
 
-        Args:
-            sha: SHA-1 digest of the script to execute.
-            numkeys: Number of leading `keys_and_args` entries interpreted as
-                keys.
-            *keys_and_args: Keys followed by script arguments in caller order.
+        Arguments, results and command errors are those of
+        `valkey.Valkey.evalsha`.
 
-        Raises:
-            NoScriptError: The server does not have the requested script
-                cached.
+        Reconnect-class command failures invalidate the owning role pool.
         """
         return self._invoke(lambda: self._client.evalsha(sha, numkeys, *keys_and_args))
 
     def exists(self, key: str) -> object:
-        """Read key existence on the pinned connection."""
+        """Check control-key presence on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.Valkey.exists`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+        """
         return self._invoke(lambda: self._client.exists(key))
 
     def get(self, key: str) -> object:
-        """Read one raw string value on the pinned connection.
+        """Read the control record on the borrowed connection.
 
-        Returns:
-            The stored bytes, or `None` when the key is absent.
+        Arguments, results and command errors are those of `valkey.Valkey.get`.
+
+        Reconnect-class command failures invalidate the owning role pool.
         """
         return self._invoke(lambda: self._client.get(key))
 
     def info(self, section: str) -> object:
-        """Read one information section on the pinned connection."""
+        """Read replication information on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.Valkey.info`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+        """
         return self._invoke(lambda: self._client.info(section))
 
     def script_load(self, script: bytes | str) -> object:
-        """Load one script and return its raw server digest on the pinned connection."""
+        """Load a backend script on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.Valkey.script_load`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+        """
         return self._invoke(lambda: self._client.script_load(script))
 
 
@@ -1424,8 +1581,6 @@ def _create_raw_client(
 ) -> _RawValkeyClient:
     """Construct one fresh direct or Sentinel-discovered maintained client."""
     service_name = role.service_name
-    if role.mode == 'sentinel' and service_name is None:
-        raise BackendProtocolError('Valkey Sentinel service name is absent')
     failure: Exception | None = None
     client: Valkey | None = None
 
@@ -1434,7 +1589,7 @@ def _create_raw_client(
         setup.on_connect()
         if role.mode != 'standalone':
             _prove_connection(setup)
-        connections._connected(connection)
+        connections.connected(connection)
 
     try:
         retry = Retry(NoBackoff(), 0)

@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-query-cache"
-version = "0.1.0"
+version = "0.2.0"
 description = "Query caching for Autodesk Flow Production Tracking"
 keywords = [ "cache", "flow-production-tracking", "queries", "shotgrid", "shotgun", "valkey" ]
 license = "MIT"
@@ -52,6 +52,7 @@ dev = [
   "pyproject-fmt",
   "pyright",
   "ruff",
+  "zizmor",
   { include-group = "test" },
 ]
 test = [
@@ -100,25 +101,13 @@ lint.ignore = [
   "Q003",   # Conflicts with the Ruff formatter
   "TRY003", # Avoid specifying long messages outside exception class
 ]
-# Same-file collaborators use private implementation members.
 lint.per-file-ignores."benchmarks/async_query_cache.py" = [
-  "SLF001",
-  "T201",   # print() found
+  "T201", # print() found
 ]
 lint.per-file-ignores."benchmarks/query_cache.py" = [
-  "SLF001",
-  "T201",   # print() found
+  "T201", # print() found
 ]
-lint.per-file-ignores."src/sg_query_cache/_async_cache.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/_async_client.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/_cache.py" = [ "SLF001" ]
 lint.per-file-ignores."src/sg_query_cache/_cli.py" = [ "T201" ]  # print() found
-lint.per-file-ignores."src/sg_query_cache/_dependencies.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/_event_mapping.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/_local_store.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/daemon_plugin.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/valkey.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sg_query_cache/valkey_async.py" = [ "SLF001" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
@@ -140,6 +129,8 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
 extraPaths = [ ".", "src" ]
 executionEnvironments = [

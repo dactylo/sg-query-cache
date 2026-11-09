@@ -1,49 +1,59 @@
+import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from threading import Event, Lock
 from typing import Literal
 
 from sg_query_cache._backend import BackendUnavailable, CacheBackend
+from sg_query_cache._config import CacheSettings, L2Settings, LimitSettings, _ValkeyMode
+from sg_query_cache._keys import KeyBuilder
 from sg_query_cache._model import (
     CacheHit,
+    DependencyPlan,
     DependencyTag,
+    ExactCall,
     FillLease,
     GenerationChange,
     GenerationVector,
+    Identity,
 )
 
+CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
+PRIMARY_INFO = b'role:master\r\nmaster_replid:primary\r\n'
 
-class _DelegatingBackend:
-    __slots__ = ('_backend',)
+
+class DelegatingBackend:
+    __slots__ = ('backend',)
 
     def __init__(self, backend: CacheBackend) -> None:
-        self._backend = backend
+        self.backend = backend
 
     def change(self, changes: tuple[GenerationChange, ...]) -> None:
-        self._backend.change(changes)
+        self.backend.change(changes)
 
     def close(self) -> None:
-        self._backend.close()
+        self.backend.close()
 
     def commit(self, lease: FillLease, payload: bytes, remaining_seconds: float) -> bool:
-        return self._backend.commit(lease, payload, remaining_seconds)
+        return self.backend.commit(lease, payload, remaining_seconds)
 
     def flush_site(self, site_namespace: str, reason: str) -> None:
-        self._backend.flush_site(site_namespace, reason)
+        self.backend.flush_site(site_namespace, reason)
 
     def lookup(self, key: str) -> CacheHit | None:
-        return self._backend.lookup(key)
+        return self.backend.lookup(key)
 
     def release(self, lease: FillLease) -> bool:
-        return self._backend.release(lease)
+        return self.backend.release(lease)
 
     def reserve(self, key: str, lease_seconds: float) -> FillLease | None:
-        return self._backend.reserve(key, lease_seconds)
+        return self.backend.reserve(key, lease_seconds)
 
     def resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
-        return self._backend.resolve(tags)
+        return self.backend.resolve(tags)
 
 
-class _FakeClock:  # pyright: ignore[reportUnusedClass]
+class FakeClock:
     __slots__ = ('_lock', '_value')
 
     def __init__(self, start: float = 1_000.0) -> None:
@@ -54,19 +64,19 @@ class _FakeClock:  # pyright: ignore[reportUnusedClass]
         with self._lock:
             return self._value
 
-    def _advance(self, seconds: float) -> None:
+    def advance(self, seconds: float) -> None:
         with self._lock:
             self._value += seconds
 
 
-class _ObservedBackend(_DelegatingBackend):
+class ObservedBackend(DelegatingBackend):
     __slots__ = (
         '_commit_outcome',
-        '_lookup_count',
         '_on_commit',
-        '_on_lookup',
         '_replacement_payload',
-        '_resolved',
+        'lookup_count',
+        'on_lookup',
+        'resolved',
     )
 
     def __init__(
@@ -79,22 +89,22 @@ class _ObservedBackend(_DelegatingBackend):
     ) -> None:
         super().__init__(backend)
         self._commit_outcome = commit_outcome
-        self._lookup_count = 0
+        self.lookup_count = 0
         self._on_commit = on_commit
-        self._on_lookup = on_lookup
+        self.on_lookup = on_lookup
         self._replacement_payload = replacement_payload
-        self._resolved: list[tuple[DependencyTag, ...]] = []
+        self.resolved: list[tuple[DependencyTag, ...]] = []
 
     def commit(self, lease: FillLease, payload: bytes, remaining_seconds: float) -> bool:
         if self._commit_outcome == 'delegate':
-            committed = self._backend.commit(lease, payload, remaining_seconds)
+            committed = self.backend.commit(lease, payload, remaining_seconds)
         else:
             replacement_payload = self._replacement_payload
             assert replacement_payload is not None
-            assert self._backend.release(lease)
-            replacement = self._backend.reserve(lease.key, 30)
+            assert self.backend.release(lease)
+            replacement = self.backend.reserve(lease.key, 30)
             assert replacement is not None
-            assert self._backend.commit(replacement, replacement_payload, remaining_seconds)
+            assert self.backend.commit(replacement, replacement_payload, remaining_seconds)
             if self._commit_outcome == 'fail':
                 raise BackendUnavailable('shared commit failed')
             committed = False
@@ -105,35 +115,49 @@ class _ObservedBackend(_DelegatingBackend):
         return committed
 
     def lookup(self, key: str) -> CacheHit | None:
-        self._lookup_count += 1
-        if self._on_lookup is not None:
-            callback = self._on_lookup
-            self._on_lookup = None
+        self.lookup_count += 1
+        if self.on_lookup is not None:
+            callback = self.on_lookup
+            self.on_lookup = None
             callback()
-        return self._backend.lookup(key)
+        return self.backend.lookup(key)
 
     def resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
-        self._resolved.append(tags)
-        return self._backend.resolve(tags)
+        self.resolved.append(tags)
+        return self.backend.resolve(tags)
 
 
-class _FencedBackend(_ObservedBackend):
-    __slots__ = ('_failures', '_seen')
+class FencedBackend(ObservedBackend):
+    __slots__ = ('_failures', 'seen')
 
     def __init__(self, backend: CacheBackend, failures: int) -> None:
         super().__init__(backend)
         self._failures = failures
-        self._seen: list[tuple[GenerationChange, ...]] = []
+        self.seen: list[tuple[GenerationChange, ...]] = []
 
     def change(self, changes: tuple[GenerationChange, ...]) -> None:
-        self._seen.append(changes)
+        self.seen.append(changes)
         if self._failures:
             self._failures -= 1
             raise BackendUnavailable('fence failed')
-        self._backend.change(changes)
+        self.backend.change(changes)
 
 
-class ResolveFailureBackend(_DelegatingBackend):
+class RecordingMetrics:
+    __slots__ = ('increments', 'observations')
+
+    def __init__(self) -> None:
+        self.increments: list[tuple[str, dict[str, str]]] = []
+        self.observations: list[tuple[str, float, dict[str, str]]] = []
+
+    def increment(self, name: str, labels: Mapping[str, str]) -> None:
+        self.increments.append((name, dict(labels)))
+
+    def observe(self, name: str, value: float, labels: Mapping[str, str]) -> None:
+        self.observations.append((name, value, dict(labels)))
+
+
+class ResolveFailureBackend(DelegatingBackend):
     __slots__ = ('_failures',)
 
     def __init__(self, backend: CacheBackend, failures: int) -> None:
@@ -147,26 +171,26 @@ class ResolveFailureBackend(_DelegatingBackend):
         return super().resolve(tags)
 
 
-class _BlockingBackend(_FencedBackend):  # pyright: ignore[reportUnusedClass]
-    __slots__ = ('_block_operation', '_entered', '_release_block')
+class BlockingBackend(FencedBackend):
+    __slots__ = ('_block_operation', 'entered', 'release_block')
 
     def __init__(self, backend: CacheBackend, failures: int = 0) -> None:
         super().__init__(backend, failures)
         self._block_operation: Literal['lookup', 'resolve'] | None = None
-        self._entered = Event()
-        self._release_block = Event()
-
-    def _arm(self, operation: Literal['lookup', 'resolve']) -> None:
-        self._block_operation = operation
-        self._entered.clear()
-        self._release_block.clear()
+        self.entered = Event()
+        self.release_block = Event()
 
     def _block(self, operation: Literal['lookup', 'resolve']) -> None:
         if self._block_operation != operation:
             return
         self._block_operation = None
-        self._entered.set()
-        assert self._release_block.wait(timeout=2)
+        self.entered.set()
+        assert self.release_block.wait(timeout=2)
+
+    def arm(self, operation: Literal['lookup', 'resolve']) -> None:
+        self._block_operation = operation
+        self.entered.clear()
+        self.release_block.clear()
 
     def lookup(self, key: str) -> CacheHit | None:
         hit = super().lookup(key)
@@ -179,15 +203,80 @@ class _BlockingBackend(_FencedBackend):  # pyright: ignore[reportUnusedClass]
         return vector
 
 
-class _RecordingMetrics:  # pyright: ignore[reportUnusedClass]
-    __slots__ = ('_increments', '_observations')
-
-    def __init__(self) -> None:
-        self._increments: list[tuple[str, dict[str, str]]] = []
-        self._observations: list[tuple[str, float, dict[str, str]]] = []
-
+class ThrowingMetrics:
     def increment(self, name: str, labels: Mapping[str, str]) -> None:
-        self._increments.append((name, dict(labels)))
+        _ = name, labels
+        raise RuntimeError('metrics unavailable')
 
     def observe(self, name: str, value: float, labels: Mapping[str, str]) -> None:
-        self._observations.append((name, value, dict(labels)))
+        _ = name, value, labels
+        raise RuntimeError('metrics unavailable')
+
+
+def asset_call(entity_type: str = 'Asset') -> ExactCall:
+    return ExactCall('find', (('entity_type', entity_type), ('filters', ())))
+
+
+def asset_plan(classification: str = 'event_aware', *, broadening: bool = False) -> DependencyPlan:
+    tags = (
+        DependencyTag.site('production'),
+        DependencyTag.authorization('production'),
+        DependencyTag.type_membership('production', 'Asset'),
+    )
+    if classification == 'bypass':
+        tags = ()
+    return DependencyPlan(
+        classification, tags, classification, ('field_to_type',) if broadening else ()
+    )
+
+
+def store_payload(
+    backend: CacheBackend,
+    call: ExactCall,
+    plan: DependencyPlan,
+    payload: bytes,
+    *,
+    age: float = 30,
+) -> str:
+    base_key = KeyBuilder.base_key(
+        'production',
+        Identity('script', 'studio', 'render'),
+        CLIENT_OPTIONS,
+        call,
+    )
+    vector = backend.resolve(plan.tags)
+    key = KeyBuilder.qualified_key(base_key, vector, 'result')
+    lease = backend.reserve(key, 30)
+    assert lease is not None
+    assert backend.commit(lease, payload, age)
+    return key
+
+
+async def turn() -> None:
+    ready = asyncio.Event()
+    asyncio.get_running_loop().call_soon(ready.set)
+    await ready.wait()
+
+
+def valkey_passwords(settings: CacheSettings) -> dict[str, str]:
+    return {
+        settings.l2.valkey.metadata.password_env: 'metadata',
+        settings.l2.valkey.result.password_env: 'result',
+    }
+
+
+def valkey_test_settings(
+    *, limits: LimitSettings, mode: _ValkeyMode = 'standalone'
+) -> CacheSettings:
+    base = CacheSettings(limits=limits)
+    return replace(
+        base,
+        l2=L2Settings(
+            enabled=True,
+            valkey=replace(
+                base.l2.valkey,
+                metadata=replace(base.l2.valkey.metadata, mode=mode, tls=False),
+                result=replace(base.l2.valkey.result, mode=mode, tls=False),
+            ),
+        ),
+    )

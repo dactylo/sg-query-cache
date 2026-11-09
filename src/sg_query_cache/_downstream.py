@@ -30,7 +30,7 @@ class _ClosableTextOutput:
         return getattr(self._stream, name)
 
     @property
-    def _closed_by_downstream(self) -> bool:
+    def closed_by_downstream(self) -> bool:
         """Whether the downstream reader has closed the stream."""
         return self._closed_downstream
 
@@ -124,6 +124,10 @@ def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
 
     Yields:
         The installed wrapper.
+
+    Raises:
+        OSError: Flushing fails for a reason other than reader closure, or
+            null-device redirection cannot be completed.
     """
     original = sys.stdout
     output = _ClosableTextOutput(original)
@@ -135,7 +139,7 @@ def closable_stdout() -> Generator[_ClosableTextOutput, None, None]:
             output.flush()
         finally:
             sys.stdout = original
-            if output._closed_by_downstream and not _silence_descriptor(original):  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            if output.closed_by_downstream and not _silence_descriptor(original):
                 # The interpreter still flushes a stream without a descriptor
                 # at shutdown, so replace it with one that cannot fail.
                 sys.stdout = _null_text_stream()

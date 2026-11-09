@@ -1,16 +1,25 @@
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, date, datetime
+from inspect import signature
+from pathlib import Path
+from runpy import run_path
+from sys import modules
 from threading import Lock
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import pytest
 
+import sg_query_cache._client as client_module
+from sg_query_cache._async_client import AsyncCachedShotgun
 from sg_query_cache._cache import QueryCache
 from sg_query_cache._client import CachedShotgun, ClientContext
 from sg_query_cache._config import CacheSettings, L1Settings, L2Settings, LimitSettings
 from sg_query_cache._keys import KeyBuilder
 from sg_query_cache._local import LocalBackend
+from sg_query_cache._metrics import MetricsSink
 from sg_query_cache._model import (
     DependencyPlan,
     DependencyTag,
@@ -18,7 +27,8 @@ from sg_query_cache._model import (
     GenerationChange,
     Identity,
 )
-from tests._fakes import _FakeClock, _RecordingMetrics
+from sg_query_cache.valkey import ValkeyBackend
+from tests._fakes import FakeClock, RecordingMetrics
 
 _SCHEMA: dict[str, dict[str, dict[str, object]]] = {
     'Asset': {
@@ -40,10 +50,10 @@ _SCHEMA: dict[str, dict[str, dict[str, object]]] = {
 
 
 class _FakeShotgun:
-    __slots__ = ('_calls', '_lock', '_schema')
+    __slots__ = ('_lock', '_schema', 'calls')
 
     def __init__(self, schema: object = _SCHEMA) -> None:
-        self._calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
         self._schema = schema
         self._lock = Lock()
 
@@ -61,8 +71,8 @@ class _FakeShotgun:
         additional_filter_presets: object = None,
     ) -> list[dict[str, object]]:
         with self._lock:
-            call_number = sum(name == 'find' for name, _args, _kwargs in self._calls) + 1
-            self._calls.append(
+            call_number = sum(name == 'find' for name, _args, _kwargs in self.calls) + 1
+            self.calls.append(
                 (
                     'find',
                     (entity_type, filters),
@@ -91,7 +101,7 @@ class _FakeShotgun:
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
     ) -> dict[str, object] | None:
-        self._calls.append(
+        self.calls.append(
             (
                 'find_one',
                 (entity_type, filters),
@@ -110,7 +120,7 @@ class _FakeShotgun:
     def schema_entity_read(
         self, project_entity: Mapping[str, object] | None = None
     ) -> dict[str, object]:
-        self._calls.append(('schema_entity_read', (project_entity,), {}))
+        self.calls.append(('schema_entity_read', (project_entity,), {}))
         return {'Asset': {'name': {'value': 'Asset'}}}
 
     def schema_field_read(
@@ -119,7 +129,7 @@ class _FakeShotgun:
         field_name: str | None = None,
         project_entity: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        self._calls.append(('schema_field_read', (entity_type, field_name, project_entity), {}))
+        self.calls.append(('schema_field_read', (entity_type, field_name, project_entity), {}))
         schema = self._schema
         if not isinstance(schema, dict):
             return {}
@@ -127,7 +137,7 @@ class _FakeShotgun:
         return cast('dict[str, object]', value) if isinstance(value, dict) else {}
 
     def schema_read(self, project_entity: Mapping[str, object] | None = None) -> object:
-        self._calls.append(('schema_read', (project_entity,), {}))
+        self.calls.append(('schema_read', (project_entity,), {}))
         return self._schema
 
     def summarize(  # noqa: PLR0913, PLR0917 - official-compatible fake
@@ -139,7 +149,7 @@ class _FakeShotgun:
         grouping: list[dict[str, str]] | None = None,
         include_archived_projects: bool = True,
     ) -> dict[str, object]:
-        self._calls.append(
+        self.calls.append(
             (
                 'summarize',
                 (entity_type, filters, summary_fields),
@@ -150,7 +160,7 @@ class _FakeShotgun:
                 },
             )
         )
-        return {'summaries': len(self._calls)}
+        return {'summaries': len(self.calls)}
 
 
 class _CreateClient(_FakeShotgun):
@@ -161,7 +171,7 @@ class _CreateClient(_FakeShotgun):
         self._created = False
 
     def batch(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
-        self._calls.append(('batch', (requests,), {}))
+        self.calls.append(('batch', (requests,), {}))
         self._created = True
         return [{'id': 17, 'type': 'Asset', 'code': 'oak'}]
 
@@ -171,46 +181,32 @@ class _CreateClient(_FakeShotgun):
         data: dict[str, object],
         return_fields: list[str] | None = None,
     ) -> dict[str, object]:
-        self._calls.append(('create', (entity_type, data, return_fields), {}))
+        self.calls.append(('create', (entity_type, data, return_fields), {}))
         self._created = True
         return {'id': 17, 'type': entity_type, **data}
 
-    def find(  # noqa: PLR0913, PLR0917 - official-compatible fake
+    def find(
         self,
         entity_type: str,
         filters: object,
         fields: list[str] | None = None,
-        order: list[dict[str, str]] | None = None,
-        filter_operator: str | None = None,
-        limit: int = 0,
-        retired_only: bool = False,
-        page: int = 0,
-        include_archived_projects: bool = True,
-        additional_filter_presets: object = None,
+        *_args: object,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
-        self._calls.append(('find', (entity_type, filters), {'fields': fields}))
-        _ = (
-            order,
-            filter_operator,
-            limit,
-            retired_only,
-            page,
-            include_archived_projects,
-            additional_filter_presets,
-        )
+        self.calls.append(('find', (entity_type, filters), {'fields': fields}))
         return [{'id': 17, 'type': entity_type}] if self._created else []
 
 
 class _MutatingClient:
-    __slots__ = ('_calls', '_failure')
+    __slots__ = ('_failure', 'calls')
 
     def __init__(self, failure: Exception | None = None) -> None:
-        self._calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
         self._failure = failure
 
     def __getattr__(self, name: str) -> object:
         def invoke(*args: object, **kwargs: object) -> object:
-            self._calls.append((name, args, kwargs))
+            self.calls.append((name, args, kwargs))
             if self._failure is not None:
                 raise self._failure
             if name == 'create':
@@ -235,16 +231,16 @@ class _MutatingClient:
 
 
 class _RecordingCache:
-    __slots__ = ('_identity', '_invalidations', '_reads', '_settings')
+    __slots__ = ('identity', 'invalidations', 'reads', 'settings')
 
     def __init__(self) -> None:
-        self._identity = Identity('script', 'studio', 'render')
-        self._settings = CacheSettings(site_namespace='studio')
-        self._invalidations: list[tuple[GenerationChange, ...]] = []
-        self._reads: list[tuple[ExactCall, DependencyPlan, dict[str, object]]] = []
+        self.identity = Identity('script', 'studio', 'render')
+        self.settings = CacheSettings(site_namespace='studio')
+        self.invalidations: list[tuple[GenerationChange, ...]] = []
+        self.reads: list[tuple[ExactCall, DependencyPlan, dict[str, object]]] = []
 
     def invalidate(self, changes: tuple[GenerationChange, ...]) -> bool:
-        self._invalidations.append(changes)
+        self.invalidations.append(changes)
         return True
 
     def read(
@@ -258,20 +254,20 @@ class _RecordingCache:
         _population_decision: object = None,
     ) -> object:
         _ = (per_call_age, _population_decision)
-        self._reads.append((call, plan, dict(client_options)))
+        self.reads.append((call, plan, dict(client_options)))
         return fetch()
 
 
 class _SecurityWriteClient(_FakeShotgun):
-    __slots__ = ('_during_write',)
+    __slots__ = ('during_write',)
 
     def __init__(self) -> None:
         super().__init__()
-        self._during_write: Callable[[], None] = lambda: None
+        self.during_write: Callable[[], None] = lambda: None
 
     def batch(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
-        self._calls.append(('batch', (requests,), {}))
-        self._during_write()
+        self.calls.append(('batch', (requests,), {}))
+        self.during_write()
         return [
             {'id': 17 + index, 'type': request['entity_type']}
             if request.get('request_type') == 'create'
@@ -285,13 +281,13 @@ class _SecurityWriteClient(_FakeShotgun):
         data: dict[str, object],
         return_fields: list[str] | None = None,
     ) -> dict[str, object]:
-        self._calls.append(('create', (entity_type, data, return_fields), {}))
-        self._during_write()
+        self.calls.append(('create', (entity_type, data, return_fields), {}))
+        self.during_write()
         return {'id': 17, 'type': entity_type, **data}
 
     def delete(self, entity_type: str, entity_id: int) -> bool:
-        self._calls.append(('delete', (entity_type, entity_id), {}))
-        self._during_write()
+        self.calls.append(('delete', (entity_type, entity_id), {}))
+        self.during_write()
         return True
 
     def update(
@@ -301,23 +297,23 @@ class _SecurityWriteClient(_FakeShotgun):
         data: dict[str, object],
         multi_entity_update_modes: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        self._calls.append(
+        self.calls.append(
             (
                 'update',
                 (entity_type, entity_id, data, multi_entity_update_modes),
                 {},
             )
         )
-        self._during_write()
+        self.during_write()
         return {'id': entity_id, 'type': entity_type, **data}
 
 
 class _OfficialCompositeClient(_MutatingClient):
-    __slots__ = ('_entity_rpc_committed',)
+    __slots__ = ('entity_rpc_committed',)
 
     def __init__(self, failure: Exception | None = None) -> None:
         super().__init__(failure)
-        self._entity_rpc_committed = False
+        self.entity_rpc_committed = False
 
     def create(
         self,
@@ -328,8 +324,8 @@ class _OfficialCompositeClient(_MutatingClient):
         owned_data = data.copy()
         upload_image = owned_data.pop('image', None)
         upload_filmstrip = owned_data.pop('filmstrip_image', None)
-        self._calls.append(('create_rpc', (entity_type, owned_data, return_fields), {}))
-        self._entity_rpc_committed = True
+        self.calls.append(('create_rpc', (entity_type, owned_data, return_fields), {}))
+        self.entity_rpc_committed = True
         if (upload_image or upload_filmstrip) and self._failure is not None:
             raise self._failure
         return {'id': 17, 'type': entity_type, **owned_data}
@@ -344,17 +340,27 @@ class _OfficialCompositeClient(_MutatingClient):
         owned_data = data.copy()
         upload_image = owned_data.pop('image', None)
         upload_filmstrip = owned_data.pop('filmstrip_image', None)
-        self._calls.append(
+        self.calls.append(
             (
                 'update_rpc',
                 (entity_type, entity_id, owned_data, multi_entity_update_modes),
                 {},
             )
         )
-        self._entity_rpc_committed = True
+        self.entity_rpc_committed = True
         if (upload_image or upload_filmstrip) and self._failure is not None:
             raise self._failure
         return {'id': entity_id, 'type': entity_type, **owned_data}
+
+
+def _factory_context() -> ClientContext:
+    return ClientContext(
+        site_url='https://example.shotgrid.autodesk.com',
+        site_namespace='studio',
+        localized=False,
+        convert_datetimes_to_utc=True,
+        records_per_page=500,
+    )
 
 
 def _large_schema(
@@ -385,8 +391,8 @@ def _paged_wrapper(
         client,
         cache,
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            'studio',
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=records_per_page,
@@ -397,26 +403,83 @@ def _paged_wrapper(
 def _wrapper(
     client: _FakeShotgun | None = None,
     *,
+    clock: FakeClock | None = None,
     identity: Identity | None = None,
     settings: CacheSettings | None = None,
 ) -> tuple[CachedShotgun, _FakeShotgun, LocalBackend]:
     selected_client = client or _FakeShotgun()
     selected_settings = settings or CacheSettings(site_namespace='studio')
-    backend = LocalBackend(selected_settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(selected_settings, clock or FakeClock(), RecordingMetrics())
     cache = QueryCache(
         selected_settings,
         identity or Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
     )
     context = ClientContext(
-        'HTTPS://EXAMPLE.SHOTGRID.AUTODESK.COM/',
-        'studio',
+        site_url='HTTPS://EXAMPLE.SHOTGRID.AUTODESK.COM/',
+        site_namespace='studio',
         localized=False,
         convert_datetimes_to_utc=True,
         records_per_page=500,
     )
     return CachedShotgun(selected_client, cache, context), selected_client, backend
+
+
+def test_bypass_scope_performs_no_schema_acquisition() -> None:
+    wrapper, client, _backend = _wrapper()
+
+    with wrapper.bypass():
+        for _ in range(3):
+            wrapper.find('Asset', [], ['id'])
+
+    names = [name for name, _args, _kwargs in client.calls]
+    assert names.count('schema_read') == 0
+    assert names.count('find') == 3
+
+
+@pytest.mark.parametrize('explicit_none_alias', [False, True])
+def test_cache_policy_accepts_maximum_age_seconds(explicit_none_alias: bool) -> None:
+    clock = FakeClock()
+    wrapper, client, _backend = _wrapper(clock=clock)
+
+    policy = (
+        wrapper.cache_policy(maximum_age=None, maximum_age_seconds=5)
+        if explicit_none_alias
+        else wrapper.cache_policy(maximum_age_seconds=5)
+    )
+    with policy:
+        wrapper.schema_read()
+        wrapper.schema_read()
+        clock.advance(6)
+        wrapper.schema_read()
+
+    assert [name for name, _args, _kwargs in client.calls].count('schema_read') == 2
+
+
+@pytest.mark.parametrize('as_keyword', [False, True])
+def test_cache_policy_preserves_positional_maximum_age(as_keyword: bool) -> None:
+    clock = FakeClock()
+    wrapper, client, _backend = _wrapper(clock=clock)
+    policy = wrapper.cache_policy(maximum_age=5) if as_keyword else wrapper.cache_policy(None, 5)
+
+    with policy:
+        wrapper.schema_read()
+        wrapper.schema_read()
+        clock.advance(6)
+        wrapper.schema_read()
+
+    assert [name for name, _args, _kwargs in client.calls].count('schema_read') == 2
+
+
+@pytest.mark.parametrize('wrapper_type', [CachedShotgun, AsyncCachedShotgun])
+def test_cache_policy_exposes_none_defaults(
+    wrapper_type: type[CachedShotgun] | type[AsyncCachedShotgun],
+) -> None:
+    parameters = signature(wrapper_type.cache_policy).parameters
+
+    assert parameters['maximum_age'].default is None
+    assert parameters['maximum_age_seconds'].default is None
 
 
 class _DefiniteWriteError(Exception):
@@ -438,8 +501,8 @@ def _write_wrapper(
         selected_client,
         cast('QueryCache', cache),
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            'studio',
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -470,12 +533,26 @@ def test_batch_unions_known_changes_and_passes_the_original_ordered_list() -> No
         True,
     ]
 
-    assert client._calls == [('batch', (requests,), {})]
-    assert cache._invalidations[1][:-1] == cache._invalidations[0]
-    assert cache._invalidations[1][-1] == GenerationChange(
-        DependencyTag.entity('studio', 'Shot', 17)
+    assert client.calls == [('batch', (requests,), {})]
+    expected = tuple(
+        GenerationChange(tag)
+        for tag in (
+            DependencyTag.type_membership('studio', 'Shot'),
+            DependencyTag.type_value('studio', 'Shot'),
+            DependencyTag.type_field('studio', 'Shot', 'code'),
+            DependencyTag.entity('studio', 'Asset', 7),
+            DependencyTag.type_value('studio', 'Asset'),
+            DependencyTag.type_field('studio', 'Asset', 'status'),
+            DependencyTag.type_membership('studio', 'Asset'),
+            DependencyTag.entity('studio', 'Task', 9),
+            DependencyTag.type_membership('studio', 'Task'),
+            DependencyTag.type_value('studio', 'Task'),
+        )
     )
-    assert DependencyTag.site('studio') not in {change.tag for change in cache._invalidations[0]}
+    assert cache.invalidations == [
+        expected,
+        (*expected, GenerationChange(DependencyTag.entity('studio', 'Shot', 17))),
+    ]
 
 
 def test_batch_with_implicit_upload_fields_uses_and_repeats_the_site_fence() -> None:
@@ -491,24 +568,54 @@ def test_batch_with_implicit_upload_fields_uses_and_repeats_the_site_fence() -> 
         wrapper.batch([request])
 
     site = (GenerationChange(DependencyTag.site('studio')),)
-    assert cache._invalidations == [site, site]
+    assert cache.invalidations == [site, site]
 
 
-def test_bypass_scope_performs_no_schema_acquisition() -> None:
-    wrapper, client, _backend = _wrapper()
+def test_cache_policy_rejects_both_age_spellings() -> None:
+    wrapper, _client, _backend = _wrapper()
 
-    with wrapper.bypass():
-        for _ in range(3):
-            wrapper.find('Asset', [], ['id'])
+    with pytest.raises(TypeError, match=r'maximum_age.*maximum_age_seconds'):
+        wrapper.cache_policy(maximum_age=4, maximum_age_seconds=5)
 
-    names = [name for name, _args, _kwargs in client._calls]
-    assert names.count('schema_read') == 0
-    assert names.count('find') == 3
+
+def test_cached_shotgun_over_closed_cache_raises() -> None:
+    settings = CacheSettings(site_namespace='studio')
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
+    cache = QueryCache(
+        settings,
+        Identity('script', 'studio', 'render'),
+        key_builder=KeyBuilder(),
+        l1=backend,
+    )
+    client = _CreateClient()
+    context = ClientContext(
+        site_url='https://example.shotgrid.autodesk.com',
+        site_namespace='studio',
+        localized=False,
+        convert_datetimes_to_utc=True,
+        records_per_page=500,
+    )
+    wrapper = CachedShotgun(client, cache, context)
+    cache.close()
+
+    for operation in (
+        lambda: wrapper.find('Asset', [], ['id']),
+        wrapper.schema_read,
+        lambda: wrapper.create('Asset', {'code': 'oak'}),
+        lambda: wrapper.replace_context(context),
+    ):
+        with pytest.raises(RuntimeError, match='closed'):
+            operation()
+
+    assert client.calls == []
+    assert wrapper.raw_client is client
+    with wrapper.cache_policy(mode='event_aware'), wrapper.bypass():
+        assert wrapper.raw_client is client
 
 
 def test_cold_identity_namespaces_do_not_reserve_per_user_capacity() -> None:
     settings = CacheSettings(site_namespace='studio', identity_policy='scripts_and_humans')
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     before = backend.storage_usage()
 
     wrappers = [
@@ -517,12 +624,12 @@ def test_cold_identity_namespaces_do_not_reserve_per_user_capacity() -> None:
             QueryCache(
                 settings,
                 Identity('human', 'studio', f'user-{entity_id}', entity_id=entity_id),
-                KeyBuilder(),
+                key_builder=KeyBuilder(),
                 l1=backend,
             ),
             ClientContext(
-                'https://example.shotgrid.autodesk.com',
-                'studio',
+                site_url='https://example.shotgrid.autodesk.com',
+                site_namespace='studio',
                 localized=False,
                 convert_datetimes_to_utc=True,
                 records_per_page=500,
@@ -555,15 +662,15 @@ def test_concurrent_calls_keep_exact_keys_and_results_isolated() -> None:
     }
     assert all(len(entity_ids) == 1 for entity_ids in by_type.values())
     assert by_type['Asset'] != by_type['Shot']
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 2
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 2
 
 
 def test_context_normalizes_site_and_find_uses_identity_scoped_schema_once() -> None:
     wrapper, client, _backend = _wrapper()
 
     assert wrapper.context == ClientContext(
-        'https://example.shotgrid.autodesk.com',
-        'studio',
+        site_url='https://example.shotgrid.autodesk.com',
+        site_namespace='studio',
         localized=False,
         convert_datetimes_to_utc=True,
         records_per_page=500,
@@ -574,23 +681,23 @@ def test_context_normalizes_site_and_find_uses_identity_scoped_schema_once() -> 
     assert wrapper.find('Asset', [['code', 'is', 'tree']], ['code']) == [
         {'id': 1, 'type': 'Asset'}
     ]
-    assert [name for name, _args, _kwargs in client._calls].count('schema_read') == 1
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('schema_read') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 1
 
 
 def test_context_replacement_invalidates_old_namespace_before_new_context_read() -> None:
     settings = CacheSettings(site_namespace='studio')
     client = _FakeShotgun()
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
     )
     old_context = ClientContext(
-        'https://example.shotgrid.autodesk.com',
-        'studio',
+        site_url='https://example.shotgrid.autodesk.com',
+        site_namespace='studio',
         localized=False,
         convert_datetimes_to_utc=True,
         records_per_page=500,
@@ -602,8 +709,8 @@ def test_context_replacement_invalidates_old_namespace_before_new_context_read()
     assert old_reader.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
     wrapper.replace_context(
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            'studio',
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
             localized=True,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -612,7 +719,7 @@ def test_context_replacement_invalidates_old_namespace_before_new_context_read()
     assert old_reader.find('Asset', [], ['id']) == [{'id': 2, 'type': 'Asset'}]
     assert old_reader.find('Asset', [], ['id']) == [{'id': 2, 'type': 'Asset'}]
     assert wrapper.find('Asset', [], ['id']) == [{'id': 3, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 3
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 3
 
 
 @pytest.mark.parametrize('method_name', ['create', 'batch'])
@@ -651,12 +758,12 @@ def test_authorization_writes_fence_unrelated_cached_reads(
     def read_during_write() -> None:
         wrapper.find('Asset', [], ['id'])
 
-    client._during_write = read_during_write
+    client.during_write = read_during_write
 
     getattr(wrapper, method_name)(*args)
 
     assert wrapper.find('Asset', [], ['id']) == [{'id': 3, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 3
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 3
 
 
 class _ScheduleClient(_FakeShotgun):
@@ -669,7 +776,7 @@ class _ScheduleClient(_FakeShotgun):
         project: dict[str, object] | None = None,
         user: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        self._calls.append(
+        self.calls.append(
             ('work_schedule_read', (start_date, end_date), {'project': project, 'user': user})
         )
         return {'2026-09-03': {'working': True, 'description': None, 'reason': None}}
@@ -681,7 +788,7 @@ def test_documented_temporal_filter_values_reach_the_client() -> None:
     assert wrapper.find('Asset', [['created_at', 'is', date(2026, 8, 30)]], ['id']) == [
         {'id': 1, 'type': 'Asset'}
     ]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 1
 
 
 def test_enabled_work_schedule_read_uses_exact_cache() -> None:
@@ -694,7 +801,7 @@ def test_enabled_work_schedule_read_uses_exact_cache() -> None:
     second = wrapper.work_schedule_read('2026-09-01', '2026-09-07')
 
     assert first == second
-    assert [name for name, _args, _kwargs in client._calls].count('work_schedule_read') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('work_schedule_read') == 1
 
 
 def test_entity_reference_filters_have_cacheable_exact_keys() -> None:
@@ -703,7 +810,7 @@ def test_entity_reference_filters_have_cacheable_exact_keys() -> None:
 
     assert wrapper.find('Asset', filters, ['id']) == [{'id': 1, 'type': 'Asset'}]
     assert wrapper.find('Asset', filters, ['id']) == [{'id': 1, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 1
 
 
 def test_event_log_entity_reads_always_bypass() -> None:
@@ -713,7 +820,7 @@ def test_event_log_entity_reads_always_bypass() -> None:
     second = wrapper.find('EventLogEntry', [], ['id'])
 
     assert first != second
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 2
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 2
 
 
 def test_find_and_find_one_use_distinct_exact_call_keys() -> None:
@@ -723,7 +830,7 @@ def test_find_and_find_one_use_distinct_exact_call_keys() -> None:
     assert wrapper.find_one('Asset', [], ['id']) == {'id': 99, 'type': 'Asset'}
     assert wrapper.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
     assert wrapper.find_one('Asset', [], ['id']) == {'id': 99, 'type': 'Asset'}
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('find') == 1
     assert names.count('find_one') == 1
 
@@ -740,7 +847,7 @@ def test_find_positional_and_keyword_forms_share_one_exact_call_key() -> None:
     )
 
     assert positional == keyword == [{'id': 1, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 1
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 1
 
 
 def test_find_variants_forward_and_plan_independent_exact_operands() -> None:
@@ -780,7 +887,7 @@ def test_find_variants_forward_and_plan_independent_exact_operands() -> None:
         ('order', ((('field_name', 'code'), ('direction', 'desc')),)),
         ('filter_operator', 'all'),
     )
-    assert cache._reads == [
+    assert cache.reads == [
         (
             ExactCall(
                 'find',
@@ -826,7 +933,7 @@ def test_find_variants_forward_and_plan_independent_exact_operands() -> None:
             {'localized': False, 'convert_datetimes_to_utc': True},
         ),
     ]
-    assert client._calls == [
+    assert client.calls == [
         (
             'find',
             ('EventLogEntry', filters, fields, order, 'all', 25, True, 2, False, presets),
@@ -857,7 +964,7 @@ def test_human_user_lifecycle_fences_the_matching_cached_identity() -> None:
     def read_during_write() -> None:
         wrapper.find('Asset', [], ['id'])
 
-    client._during_write = read_during_write
+    client.during_write = read_during_write
 
     wrapper.delete('HumanUser', 7)
 
@@ -868,25 +975,25 @@ def test_human_user_security_fences_use_exact_and_global_visibility_tags() -> No
     wrapper, _client, cache = _write_wrapper()
 
     wrapper.update('HumanUser', 7, {'permission_role_id': 3})
-    update = cache._invalidations[0]
+    update = cache.invalidations[0]
     wrapper.delete('HumanUser', 7)
-    lifecycle = cache._invalidations[2]
+    lifecycle = cache.invalidations[2]
     wrapper.create('HumanUser', {'permission_group': {'id': 5}})
-    create = cache._invalidations[4]
+    create = cache.invalidations[4]
 
     assert tuple(change.tag for change in update[:2]) == (
         DependencyTag.authorization('studio'),
         DependencyTag.identity_visibility('studio', 7),
     )
-    assert update == cache._invalidations[1]
+    assert update == cache.invalidations[1]
     assert lifecycle[0].tag == DependencyTag.identity_visibility('studio', 7)
     assert DependencyTag.authorization('studio') not in {change.tag for change in lifecycle}
-    assert lifecycle == cache._invalidations[3]
+    assert lifecycle == cache.invalidations[3]
     assert tuple(change.tag for change in create[:2]) == (
         DependencyTag.authorization('studio'),
         DependencyTag.human_visibility('studio'),
     )
-    assert create == cache._invalidations[5][:-1]
+    assert create == cache.invalidations[5][:-1]
 
 
 @pytest.mark.parametrize(
@@ -938,12 +1045,12 @@ def test_human_visibility_writes_fence_unrelated_cached_reads(
     def read_during_write() -> None:
         wrapper.find('Asset', [], ['id'])
 
-    client._during_write = read_during_write
+    client.during_write = read_during_write
 
     getattr(wrapper, method_name)(*args)
 
     assert wrapper.find('Asset', [], ['id']) == [{'id': 3, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 3
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 3
 
 
 def test_known_update_uses_conservative_pre_and_post_fences() -> None:
@@ -961,7 +1068,7 @@ def test_known_update_uses_conservative_pre_and_post_fences() -> None:
             DependencyTag.type_membership('studio', 'Asset'),
         )
     )
-    assert cache._invalidations == [expected, expected]
+    assert cache.invalidations == [expected, expected]
 
 
 def test_malformed_schema_falls_back_without_guessing_dependencies() -> None:
@@ -973,7 +1080,7 @@ def test_malformed_schema_falls_back_without_guessing_dependencies() -> None:
     assert wrapper.find('Asset', [['code', 'is', 'tree']], ['code']) == [
         {'id': 2, 'type': 'Asset'}
     ]
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 2
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 2
 
 
 def test_mapping_key_failures_bypass_and_reach_the_client() -> None:
@@ -982,7 +1089,7 @@ def test_mapping_key_failures_bypass_and_reach_the_client() -> None:
     wrapper.schema_field_read('Asset', None, cast('dict[str, object]', {'': 1}))
     wrapper.find('Asset', [['id', 'is', {7: 'not-a-string-key'}]], ['id'])
 
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_field_read') == 1
     assert names.count('find') == 1
 
@@ -992,16 +1099,16 @@ def test_non_string_returned_field_bypasses_instead_of_raising() -> None:
 
     wrapper.find('Asset', [['id', 'is', 7]], cast('list[str]', [123]))
 
-    assert client._calls[-1][2]['fields'] == [123]
+    assert client.calls[-1][2]['fields'] == [123]
 
 
 def test_normalized_site_url_is_part_of_every_exact_key() -> None:
     settings = CacheSettings(site_namespace='studio')
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
     )
     first_client = _FakeShotgun()
@@ -1010,8 +1117,8 @@ def test_normalized_site_url_is_part_of_every_exact_key() -> None:
         first_client,
         cache,
         ClientContext(
-            'https://first.example',
-            'studio',
+            site_url='https://first.example',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -1021,8 +1128,8 @@ def test_normalized_site_url_is_part_of_every_exact_key() -> None:
         second_client,
         cache,
         ClientContext(
-            'https://second.example',
-            'studio',
+            site_url='https://second.example',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -1031,8 +1138,8 @@ def test_normalized_site_url_is_part_of_every_exact_key() -> None:
 
     assert first.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
     assert second.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
-    assert [name for name, _args, _kwargs in first_client._calls].count('find') == 1
-    assert [name for name, _args, _kwargs in second_client._calls].count('find') == 1
+    assert [name for name, _args, _kwargs in first_client.calls].count('find') == 1
+    assert [name for name, _args, _kwargs in second_client.calls].count('find') == 1
 
 
 @pytest.mark.parametrize('method_name', ['create', 'update'])
@@ -1050,8 +1157,8 @@ def test_official_style_composite_image_write_uses_site_fences(
         wrapper.update('Asset', 7, data)
 
     expected = (GenerationChange(DependencyTag.site('studio')),)
-    assert cache._invalidations == [expected, expected]
-    assert client._entity_rpc_committed is True
+    assert cache.invalidations == [expected, expected]
+    assert client.entity_rpc_committed is True
 
 
 @pytest.mark.parametrize('method_name', ['create', 'update'])
@@ -1074,15 +1181,15 @@ def test_official_style_partial_image_write_repeats_site_fence_and_exception(
 
     expected = (GenerationChange(DependencyTag.site('studio')),)
     assert captured.value is failure
-    assert client._entity_rpc_committed is True
-    assert cache._invalidations == [expected, expected]
+    assert client.entity_rpc_committed is True
+    assert cache.invalidations == [expected, expected]
 
 
 @pytest.mark.parametrize('method_name', ['create', 'batch'])
 def test_malformed_create_success_uses_site_post_fence(method_name: str) -> None:
     class _MalformedCreateClient(_MutatingClient):
         def batch(self, requests: list[dict[str, object]]) -> list[dict[str, object]]:
-            self._calls.append(('batch', (requests,), {}))
+            self.calls.append(('batch', (requests,), {}))
             return [{'id': 'unknown'}]
 
         def create(
@@ -1091,7 +1198,7 @@ def test_malformed_create_success_uses_site_post_fence(method_name: str) -> None
             data: dict[str, object],
             return_fields: list[str] | None = None,
         ) -> dict[str, object]:
-            self._calls.append(('create', (entity_type, data, return_fields), {}))
+            self.calls.append(('create', (entity_type, data, return_fields), {}))
             return {'id': 'unknown'}
 
     wrapper, _client, cache = _write_wrapper(_MalformedCreateClient())
@@ -1103,7 +1210,7 @@ def test_malformed_create_success_uses_site_post_fence(method_name: str) -> None
             [{'request_type': 'create', 'entity_type': 'Asset', 'data': {'code': 'oak'}}]
         )
 
-    assert cache._invalidations[1] == (GenerationChange(DependencyTag.site('studio')),)
+    assert cache.invalidations[1] == (GenerationChange(DependencyTag.site('studio')),)
 
 
 @pytest.mark.parametrize('method_name', ['create', 'batch'])
@@ -1130,7 +1237,15 @@ def test_indeterminate_create_uses_site_post_fence(method_name: str) -> None:
     with pytest.raises(_IndeterminateWriteError):
         write()
 
-    assert cache._invalidations[1] == (GenerationChange(DependencyTag.site('studio')),)
+    assert cache.invalidations[1] == (GenerationChange(DependencyTag.site('studio')),)
+
+
+def test_open_signature_mirrors_async_open() -> None:
+    sync_parameters = signature(CachedShotgun.open).parameters.values()
+    async_parameters = signature(AsyncCachedShotgun.open).parameters.values()
+    assert [(p.name, p.kind, p.default) for p in sync_parameters] == [
+        (p.name, p.kind, p.default) for p in async_parameters
+    ]
 
 
 def test_paged_finds_split_keys_by_effective_page_size() -> None:
@@ -1139,8 +1254,8 @@ def test_paged_finds_split_keys_by_effective_page_size() -> None:
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
-        l1=LocalBackend(settings, _FakeClock(), _RecordingMetrics()),
+        key_builder=KeyBuilder(),
+        l1=LocalBackend(settings, FakeClock(), RecordingMetrics()),
     )
     wide = _paged_wrapper(500, cache, client)
     narrow = _paged_wrapper(100, cache, client)
@@ -1150,12 +1265,12 @@ def test_paged_finds_split_keys_by_effective_page_size() -> None:
     wide.find('Asset', [], ['id'])
     narrow.find('Asset', [], ['id'])
 
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 3
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 3
 
     wide.find('Asset', [], ['id'], page=True)
     narrow.find('Asset', [], ['id'], page=True)
 
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 5
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 5
 
 
 def test_production_shaped_schema_is_acquired_once_per_generation() -> None:
@@ -1163,12 +1278,12 @@ def test_production_shaped_schema_is_acquired_once_per_generation() -> None:
 
     for _ in range(5):
         wrapper.find('CustomEntity07', [['sg_field_001', 'is', 'x']], ['sg_field_002'])
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_read') == 1
 
     backend.change((GenerationChange(DependencyTag.schema('studio')),))
     wrapper.find('CustomEntity07', [['sg_field_001', 'is', 'x']], ['sg_field_002'])
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_read') == 2
 
 
@@ -1185,7 +1300,7 @@ def test_project_scoped_schema_and_user_scoped_schedule_are_cached() -> None:
         wrapper.work_schedule_read('2026-09-01', '2026-09-07', project, user)
     )
 
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_read') == 1
     assert names.count('work_schedule_read') == 1
 
@@ -1196,7 +1311,7 @@ def test_python_argument_binding_fails_before_any_cache_or_client_call() -> None
     with pytest.raises(TypeError):
         wrapper.find('Asset')  # type: ignore[call-arg]
 
-    assert client._calls == []
+    assert client.calls == []
     assert backend.resolve(()) is not None
 
 
@@ -1206,34 +1321,14 @@ def test_requested_entity_exception_survives_schema_acquisition_failure() -> Non
 
     class _DoublyFailingClient(_FakeShotgun):
         def schema_read(self, project_entity: Mapping[str, object] | None = None) -> object:
-            self._calls.append(('schema_read', (project_entity,), {}))
+            self.calls.append(('schema_read', (project_entity,), {}))
             raise schema_error
 
-        def find(  # noqa: PLR0913, PLR0917 - official-compatible fake
+        def find(
             self,
-            entity_type: str,
-            filters: object,
-            fields: list[str] | None = None,
-            order: list[dict[str, str]] | None = None,
-            filter_operator: str | None = None,
-            limit: int = 0,
-            retired_only: bool = False,
-            page: int = 0,
-            include_archived_projects: bool = True,
-            additional_filter_presets: object = None,
+            *_args: object,
+            **_kwargs: object,
         ) -> list[dict[str, object]]:
-            _ = (
-                entity_type,
-                filters,
-                fields,
-                order,
-                filter_operator,
-                limit,
-                retired_only,
-                page,
-                include_archived_projects,
-                additional_filter_presets,
-            )
             raise requested_error
 
     wrapper, _client, _backend = _wrapper(_DoublyFailingClient())
@@ -1250,13 +1345,13 @@ def test_schema_failure_never_prevents_the_requested_entity_read(entity_type: st
 
     class _FailingSchemaClient(_FakeShotgun):
         def schema_read(self, project_entity: Mapping[str, object] | None = None) -> object:
-            self._calls.append(('schema_read', (project_entity,), {}))
+            self.calls.append(('schema_read', (project_entity,), {}))
             raise expected
 
     wrapper, client, _backend = _wrapper(_FailingSchemaClient())
 
     assert wrapper.find(entity_type, [], ['id']) == [{'id': 1, 'type': entity_type}]
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('find') == 1
     assert names.count('schema_read') == (0 if entity_type == 'EventLogEntry' else 1)
 
@@ -1270,7 +1365,7 @@ def test_schema_methods_use_distinct_cached_calls() -> None:
     assert wrapper.schema_field_read('Asset') == _SCHEMA['Asset']
     assert wrapper.schema_entity_read() == {'Asset': {'name': {'value': 'Asset'}}}
     assert wrapper.schema_entity_read() == {'Asset': {'name': {'value': 'Asset'}}}
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_read') == 1
     assert names.count('schema_field_read') == 1
     assert names.count('schema_entity_read') == 1
@@ -1283,26 +1378,9 @@ def test_scripts_only_bypasses_every_human_read() -> None:
 
     assert wrapper.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
     assert wrapper.find('Asset', [], ['id']) == [{'id': 2, 'type': 'Asset'}]
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('schema_read') == 0
     assert names.count('find') == 2
-
-
-def test_scripts_only_human_bypass_does_not_acquire_schema() -> None:
-    class _FailingSchemaClient(_FakeShotgun):
-        def schema_read(self, project_entity: Mapping[str, object] | None = None) -> object:
-            self._calls.append(('schema_read', (project_entity,), {}))
-            raise LookupError('schema unavailable')
-
-    wrapper, client, _backend = _wrapper(
-        _FailingSchemaClient(),
-        identity=Identity('human', 'studio', 'user-7', entity_id=7),
-    )
-
-    assert wrapper.find('Asset', [], ['id']) == [{'id': 1, 'type': 'Asset'}]
-    names = [name for name, _args, _kwargs in client._calls]
-    assert names.count('schema_read') == 0
-    assert names.count('find') == 1
 
 
 def test_shared_context_requires_the_configured_site_namespace() -> None:
@@ -1311,11 +1389,11 @@ def test_shared_context_requires_the_configured_site_namespace() -> None:
         l1=L1Settings(enabled=False),
         l2=L2Settings(enabled=True),
     )
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l2=backend,
     )
 
@@ -1324,8 +1402,8 @@ def test_shared_context_requires_the_configured_site_namespace() -> None:
             _FakeShotgun(),
             cache,
             ClientContext(
-                'https://example.shotgrid.autodesk.com',
-                'wrong-site',
+                site_url='https://example.shotgrid.autodesk.com',
+                site_namespace='wrong-site',
                 localized=False,
                 convert_datetimes_to_utc=True,
                 records_per_page=500,
@@ -1348,7 +1426,7 @@ def test_transient_image_age_is_applied_at_the_wrapper_boundary() -> None:
             include_archived_projects: bool = True,
             additional_filter_presets: object = None,
         ) -> list[dict[str, object]]:
-            self._calls.append(
+            self.calls.append(
                 (
                     'find',
                     (entity_type, filters),
@@ -1379,16 +1457,6 @@ def test_transient_image_age_is_applied_at_the_wrapper_boundary() -> None:
     assert any(1_000 < deadline <= 1_005 for deadline in deadlines)
 
 
-def test_ttl_only_methods_are_direct_until_explicitly_enabled() -> None:
-    wrapper, client, _backend = _wrapper()
-
-    first = wrapper.summarize('Asset', [], [{'field': 'id', 'type': 'count'}])
-    second = wrapper.summarize('Asset', [], [{'field': 'id', 'type': 'count'}])
-
-    assert first != second
-    assert [name for name, _args, _kwargs in client._calls].count('summarize') == 2
-
-
 @pytest.mark.parametrize('bad_argument', [{'a'}, 1 + 2j, object()])
 def test_unfreezable_arguments_bypass_and_reach_the_client(bad_argument: object) -> None:
     wrapper, client, _backend = _wrapper()
@@ -1400,121 +1468,53 @@ def test_unfreezable_arguments_bypass_and_reach_the_client(bad_argument: object)
     wrapper.schema_field_read('Asset', None, {'type': 'Project', 'id': bad_argument})
     wrapper.summarize('Asset', [['id', 'in', bad_argument]], [{'field': 'id', 'type': 'count'}])
 
-    names = [name for name, _args, _kwargs in client._calls]
+    names = [name for name, _args, _kwargs in client.calls]
     assert names.count('find') == 2
     assert names.count('find_one') == 1
     assert names.count('schema_field_read') == 2
     assert names.count('summarize') == 1
 
 
-def test_unknown_batch_member_uses_one_site_fence_for_the_whole_batch() -> None:
-    wrapper, client, cache = _write_wrapper()
-    requests: list[dict[str, object]] = [
-        {'request_type': 'revive', 'entity_type': 'Asset', 'entity_id': 7}
-    ]
-
-    assert wrapper.batch(requests) == [{'ok': True}]
-
-    expected = (GenerationChange(DependencyTag.site('studio')),)
-    assert cache._invalidations == [expected, expected]
-    assert client._calls == [('batch', (requests,), {})]
-
-
-def test_unknown_returned_field_type_with_signed_value_bypasses_population() -> None:
-    schema = {
-        'Asset': {
-            'future_link': {
-                'data_type': {'value': 'future_url'},
-                'properties': {},
-            }
-        }
-    }
-    expires = int(datetime.now(tz=UTC).timestamp()) + 31
-    signed_url = f'https://cdn.example/file?Expires={expires}'
-
-    class _FutureUrlClient(_FakeShotgun):
-        def find(  # noqa: PLR0913, PLR0917 - official-compatible fake
-            self,
-            entity_type: str,
-            filters: object,
-            fields: list[str] | None = None,
-            order: list[dict[str, str]] | None = None,
-            filter_operator: str | None = None,
-            limit: int = 0,
-            retired_only: bool = False,
-            page: int = 0,
-            include_archived_projects: bool = True,
-            additional_filter_presets: object = None,
-        ) -> list[dict[str, object]]:
-            _ = (
-                order,
-                filter_operator,
-                limit,
-                retired_only,
-                page,
-                include_archived_projects,
-                additional_filter_presets,
-            )
-            call_number = sum(name == 'find' for name, _args, _kwargs in self._calls) + 1
-            self._calls.append(('find', (entity_type, filters), {'fields': fields}))
-            return [{'id': call_number, 'future_link': signed_url}]
-
-    settings = CacheSettings(
-        site_namespace='studio',
-        limits=LimitSettings(clock_error_bound_seconds=0),
-    )
-    wrapper, client, _backend = _wrapper(_FutureUrlClient(schema), settings=settings)
-
-    first = wrapper.find('Asset', [], ['future_link'])
-    second = wrapper.find('Asset', [], ['future_link'])
-
-    assert first != second
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 2
-
-
-def test_unproven_composite_methods_bypass_with_their_own_reason() -> None:
+@pytest.mark.parametrize(
+    ('method_name', 'arguments'),
+    [
+        ('activity_stream_read', ('Asset', 7, {'Asset': {'unfreezable'}})),
+        ('note_thread_read', (7, {'Note': {'unfreezable'}})),
+        ('preferences_read', ([{'unfreezable'}],)),
+        ('summarize', ('Asset', [['id', 'in', {7}]], [{'field': 'id', 'type': 'count'}])),
+        ('text_search', ('hero', {'Asset': {7}})),
+    ],
+)
+def test_composite_reads_report_their_reason_for_unfreezable_arguments(
+    method_name: str, arguments: tuple[object, ...]
+) -> None:
     settings = CacheSettings(site_namespace='studio')
-    client = _FakeShotgun()
-    metrics = _RecordingMetrics()
+    client = _MutatingClient()
+    metrics = RecordingMetrics()
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
-        l1=LocalBackend(settings, _FakeClock(), metrics),
+        key_builder=KeyBuilder(),
+        l1=LocalBackend(settings, FakeClock(), metrics),
         metrics=metrics,
     )
     wrapper = CachedShotgun(
         client,
         cache,
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            'studio',
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
         ),
     )
 
-    wrapper.summarize(
-        'EventLogEntry', [['id', 'greater_than', 5000]], [{'field': 'id', 'type': 'maximum'}]
-    )
-    wrapper.summarize(
-        'EventLogEntry', [['id', 'greater_than', 5000]], [{'field': 'id', 'type': 'maximum'}]
-    )
+    getattr(wrapper, method_name)(*arguments)
 
-    assert [name for name, _args, _kwargs in client._calls].count('summarize') == 2
-    assert ('cache_bypass', {'reason': 'composite_url_unproven'}) in metrics._increments
-    assert ('cache_bypass', {'reason': 'ttl_only_method_disabled'}) not in metrics._increments
-
-
-@pytest.mark.parametrize('field_name', ['thumbnail', 'sg_url', 'hidden_field'])
-def test_unproven_returned_field_schema_declines_population(field_name: str) -> None:
-    wrapper, client, _backend = _wrapper(_FakeShotgun(schema={}))
-
-    wrapper.find('Asset', [], [field_name])
-    wrapper.find('Asset', [], [field_name])
-
-    assert [name for name, _args, _kwargs in client._calls].count('find') == 2
+    assert [name for name, _args, _kwargs in client.calls] == [method_name]
+    bypasses = [labels['reason'] for name, labels in metrics.increments if name == 'cache_bypass']
+    assert bypasses == ['composite_url_unproven']
 
 
 @pytest.mark.parametrize(
@@ -1532,14 +1532,100 @@ def test_indeterminate_write_exception_configuration_is_validated(
             client,
             cast('QueryCache', cache),
             ClientContext(
-                'https://example.shotgrid.autodesk.com',
-                'studio',
+                site_url='https://example.shotgrid.autodesk.com',
+                site_namespace='studio',
                 localized=False,
                 convert_datetimes_to_utc=True,
                 records_per_page=500,
             ),
             indeterminate_write_exceptions=exception_types,  # type: ignore[arg-type]
         )
+
+
+def test_unknown_batch_member_uses_one_site_fence_for_the_whole_batch() -> None:
+    wrapper, client, cache = _write_wrapper()
+    requests: list[dict[str, object]] = [
+        {'request_type': 'revive', 'entity_type': 'Asset', 'entity_id': 7}
+    ]
+
+    assert wrapper.batch(requests) == [{'ok': True}]
+
+    expected = (GenerationChange(DependencyTag.site('studio')),)
+    assert cache.invalidations == [expected, expected]
+    assert client.calls == [('batch', (requests,), {})]
+
+
+def test_unknown_returned_field_type_with_signed_value_bypasses_population() -> None:
+    schema = {
+        'Asset': {
+            'future_link': {
+                'data_type': {'value': 'future_url'},
+                'properties': {},
+            }
+        }
+    }
+    expires = int(datetime.now(tz=UTC).timestamp()) + 31
+    signed_url = f'https://cdn.example/file?Expires={expires}'
+
+    class _FutureUrlClient(_FakeShotgun):
+        def find(
+            self,
+            entity_type: str,
+            filters: object,
+            fields: list[str] | None = None,
+            *_args: object,
+            **_kwargs: object,
+        ) -> list[dict[str, object]]:
+            call_number = sum(name == 'find' for name, _args, _kwargs in self.calls) + 1
+            self.calls.append(('find', (entity_type, filters), {'fields': fields}))
+            return [{'id': call_number, 'future_link': signed_url}]
+
+    settings = CacheSettings(
+        site_namespace='studio',
+        limits=LimitSettings(clock_error_bound_seconds=0),
+    )
+    wrapper, client, _backend = _wrapper(_FutureUrlClient(schema), settings=settings)
+
+    first = wrapper.find('Asset', [], ['future_link'])
+    second = wrapper.find('Asset', [], ['future_link'])
+
+    assert first != second
+    assert [name for name, _args, _kwargs in client.calls].count('find') == 2
+
+
+def test_unproven_composite_methods_bypass_with_their_own_reason() -> None:
+    settings = CacheSettings(site_namespace='studio')
+    client = _FakeShotgun()
+    metrics = RecordingMetrics()
+    cache = QueryCache(
+        settings,
+        Identity('script', 'studio', 'render'),
+        key_builder=KeyBuilder(),
+        l1=LocalBackend(settings, FakeClock(), metrics),
+        metrics=metrics,
+    )
+    wrapper = CachedShotgun(
+        client,
+        cache,
+        ClientContext(
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
+            localized=False,
+            convert_datetimes_to_utc=True,
+            records_per_page=500,
+        ),
+    )
+
+    wrapper.summarize(
+        'EventLogEntry', [['id', 'greater_than', 5000]], [{'field': 'id', 'type': 'maximum'}]
+    )
+    wrapper.summarize(
+        'EventLogEntry', [['id', 'greater_than', 5000]], [{'field': 'id', 'type': 'maximum'}]
+    )
+
+    assert [name for name, _args, _kwargs in client.calls].count('summarize') == 2
+    assert ('cache_bypass', {'reason': 'composite_url_unproven'}) in metrics.increments
+    assert ('cache_bypass', {'reason': 'ttl_only_method_disabled'}) not in metrics.increments
 
 
 @pytest.mark.parametrize(
@@ -1552,7 +1638,7 @@ def test_upload_methods_use_site_wide_attachment_fences(method_name: str) -> Non
     getattr(wrapper, method_name)('Asset', 7, 'upload.bin')
 
     expected = (GenerationChange(DependencyTag.site('studio')),)
-    assert cache._invalidations == [expected, expected]
+    assert cache.invalidations == [expected, expected]
 
 
 def test_visibility_sensitive_types_and_fields_use_one_global_visibility_tag() -> None:
@@ -1560,10 +1646,10 @@ def test_visibility_sensitive_types_and_fields_use_one_global_visibility_tag() -
 
     wrapper.update('Group', 7, {'users': [], 'owner': {'id': 42}})
 
-    tags = tuple(change.tag for change in cache._invalidations[0])
+    tags = tuple(change.tag for change in cache.invalidations[0])
     assert tags.count(DependencyTag.human_visibility('studio')) == 1
     assert tags[0] == DependencyTag.human_visibility('studio')
-    assert cache._invalidations[0] == cache._invalidations[1]
+    assert cache.invalidations[0] == cache.invalidations[1]
 
 
 @pytest.mark.parametrize(
@@ -1624,7 +1710,7 @@ def test_write_failures_preserve_exception_and_apply_only_required_fences(
         operation(*arguments)
 
     assert captured.value is failure
-    assert len(cache._invalidations) == expected_fences
+    assert len(cache.invalidations) == expected_fences
 
 
 @pytest.mark.parametrize(
@@ -1701,12 +1787,12 @@ def test_every_planned_mutator_has_pre_and_post_fences(
 
     getattr(wrapper, method_name)(*args, **kwargs)
 
-    assert len(cache._invalidations) == 2
+    assert len(cache.invalidations) == 2
     if method_name == 'create':
-        assert cache._invalidations[1][:-1] == cache._invalidations[0]
+        assert cache.invalidations[1][:-1] == cache.invalidations[0]
     else:
-        assert cache._invalidations[0] == cache._invalidations[1]
-    assert client._calls == [(method_name, args, kwargs)]
+        assert cache.invalidations[0] == cache.invalidations[1]
+    assert client.calls == [(method_name, args, kwargs)]
 
 
 @pytest.mark.parametrize(
@@ -1715,9 +1801,182 @@ def test_every_planned_mutator_has_pre_and_post_fences(
 def test_context_rejects_invalid_namespace_before_any_read(namespace: str) -> None:
     with pytest.raises(ValueError, match='ASCII without outer whitespace'):
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            namespace,
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace=namespace,
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
         )
+
+
+class _FactoryClient(_FakeShotgun):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+        self.config = SimpleNamespace(
+            localized=False,
+            convert_datetimes_to_utc=True,
+            records_per_page=500,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_open_applies_metrics_correlation(monkeypatch: pytest.MonkeyPatch) -> None:
+    environment_name = 'TEST_METRICS_KEY'
+    settings = CacheSettings(site_namespace='studio', metrics_digest_secret_env=environment_name)
+    metrics = RecordingMetrics()
+    monkeypatch.setenv('TEST_METRICS_KEY', 'x' * 32)
+    with CachedShotgun.open(
+        _FactoryClient(),
+        settings,
+        Identity('script', 'studio', 'render'),
+        _factory_context(),
+        metrics=metrics,
+    ) as wrapper:
+        wrapper.find('Asset', [], ['code'])
+        wrapper.find('Asset', [], ['code'])
+    digests = [
+        labels['exact_call_digest']
+        for _name, labels in metrics.increments
+        if 'exact_call_digest' in labels
+    ]
+    assert digests
+    assert all(len(digest) == 64 for digest in digests)
+    with (
+        pytest.raises(ValueError, match='metrics'),
+        CachedShotgun.open(
+            _FactoryClient(),
+            settings,
+            Identity('script', 'studio', 'render'),
+            _factory_context(),
+            metrics=metrics,
+            environ={},
+        ),
+    ):
+        pytest.fail('explicit environment must override the process environment')
+    with CachedShotgun.open(
+        _FactoryClient(),
+        settings,
+        Identity('script', 'studio', 'render'),
+        _factory_context(),
+        environ={},
+    ):
+        pass
+
+
+@pytest.mark.parametrize(('local', 'shared'), [(True, False), (True, True), (False, True)])
+@pytest.mark.parametrize('body_fails', [False, True])
+def test_open_builds_and_closes_configured_layers(
+    monkeypatch: pytest.MonkeyPatch, *, local: bool, shared: bool, body_fails: bool
+) -> None:
+    settings = CacheSettings(
+        site_namespace='studio', l1=L1Settings(enabled=local), l2=L2Settings(enabled=shared)
+    )
+    environment = {'SYNTHETIC_PASSWORD': 'unused'}
+    constructed: list[object] = []
+    shared_backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
+
+    def create(
+        supplied: CacheSettings, environ: Mapping[str, object], metrics: MetricsSink
+    ) -> LocalBackend:
+        constructed.extend((supplied, environ, metrics))
+        return shared_backend
+
+    monkeypatch.setattr(ValkeyBackend, 'from_settings', create)
+    raw = _FactoryClient()
+    manager = CachedShotgun.open(
+        raw,
+        settings,
+        Identity('script', 'studio', 'render'),
+        _factory_context(),
+        environ=environment,
+        indeterminate_write_exceptions=(TimeoutError,),
+    )
+    assert not constructed
+    expected = pytest.raises(RuntimeError, match='body failed') if body_fails else nullcontext()
+    with expected, manager as wrapper:
+        cache = wrapper._cache
+        assert cache.settings is settings
+        assert (cache._l1 is not None) is local
+        assert (cache._l2 is not None) is shared
+        assert wrapper.raw_client is raw
+        assert wrapper._indeterminate_write_exceptions == (TimeoutError,)
+        if shared:
+            assert cache._l2 is shared_backend
+            assert constructed[:2] == [settings, environment]
+            assert constructed[2] is cache._metrics
+        if body_fails:
+            raise RuntimeError('body failed')
+    with pytest.raises(RuntimeError, match='closed'):
+        cache.ensure_open()
+    for backend in (cache._l1, cache._l2):
+        if backend is not None:
+            with pytest.raises(RuntimeError, match='closed'):
+                backend.lookup('key')
+    assert not raw.closed
+
+
+def test_open_closes_built_layers_when_l2_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = CacheSettings(site_namespace='studio', l2=L2Settings(enabled=True))
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
+
+    def create_local(*_args: object, **_kwargs: object) -> LocalBackend:
+        return backend
+
+    def fail_shared(*_args: object, **_kwargs: object) -> LocalBackend:
+        raise ValueError('shared construction failed')
+
+    monkeypatch.setattr(client_module, 'LocalBackend', create_local, raising=False)
+    monkeypatch.setattr(ValkeyBackend, 'from_settings', fail_shared)
+    raw = _FactoryClient()
+    with (
+        pytest.raises(ValueError, match='shared construction failed'),
+        CachedShotgun.open(
+            raw, settings, Identity('script', 'studio', 'render'), _factory_context()
+        ),
+    ):
+        pytest.fail('factory must fail before entry')
+    with pytest.raises(RuntimeError, match='closed'):
+        backend.lookup('key')
+    assert not raw.closed
+
+
+def test_readme_quick_start_runs_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    raw = _FactoryClient()
+    events: list[str] = []
+    original_close = QueryCache.close
+
+    def close_cache(cache: QueryCache) -> None:
+        assert not raw.closed
+        original_close(cache)
+        with pytest.raises(RuntimeError, match='closed'):
+            cache.ensure_open()
+        events.append('cache closed')
+
+    def create_client(site_url: str, *, script_name: str, api_key: str) -> _FactoryClient:
+        assert site_url == 'https://synthetic.example'
+        assert script_name == 'synthetic-script'
+        assert api_key == 'synthetic-key'
+        return raw
+
+    module = ModuleType('shotgun_api3')
+    monkeypatch.setattr(module, 'Shotgun', create_client, raising=False)
+    monkeypatch.setitem(modules, 'shotgun_api3', module)
+    monkeypatch.setenv('SHOTGUN_URL', 'https://synthetic.example')
+    monkeypatch.setenv('SHOTGUN_SCRIPT_NAME', 'synthetic-script')
+    monkeypatch.setenv('SHOTGUN_API_KEY', 'synthetic-key')
+    monkeypatch.setattr(QueryCache, 'close', close_cache)
+    readme = Path(__file__).parents[2].joinpath('README.md').read_text()
+    section = readme.split('### Cache a synchronous client', 1)[1]
+    code = section.split('```python\n', 1)[1].split('```', 1)[0]
+    script = tmp_path / 'quick_start.py'
+    script.write_text(code)
+    run_path(str(script), run_name='__main__')
+    assert sum(name == 'find' for name, _args, _kwargs in raw.calls) == 2
+    assert sum(name == 'schema_read' for name, _args, _kwargs in raw.calls) == 1
+    assert events == ['cache closed']
+    assert raw.closed  # The example explicitly closes the caller-owned client afterward.

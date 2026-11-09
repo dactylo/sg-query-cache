@@ -3,17 +3,26 @@ from contextlib import contextmanager
 from threading import Barrier, Event, Lock
 from typing import TypeVar, cast
 
+import pytest
+
 import sg_query_cache._config as config
-from sg_query_cache._config import CacheSettings, L1Settings, L2Settings, ValkeySettings
+import sg_query_cache.valkey as valkey_module
+from sg_query_cache._config import (
+    CacheSettings,
+    L1Settings,
+    L2Settings,
+    ValkeySettings,
+    _ValkeyMode,
+)
 from sg_query_cache._valkey_scripts import (
     CONTROL_CREATE_SCRIPT_SHA,
     CONTROL_ROTATE_SCRIPT_SHA,
     ScriptClient,
 )
 from tests._valkey_control_cases import (
-    _COUNTER_A,
-    _COUNTER_B,
-    _ControlTrace,
+    COUNTER_A,
+    COUNTER_B,
+    ControlTrace,
     control_reply,
 )
 
@@ -30,49 +39,49 @@ class AtomicControlClient:
         *,
         replication_id: str = _REPLICATION_A,
     ) -> None:
-        self._connection_generation = 0
-        self._control: bytes | None = None
-        self._counters: set[str] = set()
-        self._info_calls = 0
-        self._lock = Lock()
-        self._metadata_replies: list[object] = []
-        self._pre_rotation_control: bytes | None = None
-        self._replication_id = replication_id
+        self.connection_generation = 0
+        self.control: bytes | None = None
+        self.counters: set[str] = set()
+        self.info_calls = 0
+        self.lock = Lock()
+        self.metadata_replies: list[object] = []
+        self.pre_rotation_control: bytes | None = None
+        self.replication_id = replication_id
 
-    def client(self) -> 'BorrowedAtomicControlClient':
-        return BorrowedAtomicControlClient(self)
+    def client(self) -> '_BorrowedAtomicControlClient':
+        return _BorrowedAtomicControlClient(self)
 
     def close(self) -> None:
         return None
 
     def epoch(self) -> tuple[int, int, None]:
-        return 0, self._connection_generation, None
+        return 0, self.connection_generation, None
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         if sha not in (CONTROL_CREATE_SCRIPT_SHA, CONTROL_ROTATE_SCRIPT_SHA):
-            if self._metadata_replies:
-                self._pre_rotation_control = self._control
-                return self._metadata_replies.pop(0)
+            if self.metadata_replies:
+                self.pre_rotation_control = self.control
+                return self.metadata_replies.pop(0)
             return [b'ok', 1, 0]
-        with self._lock:
-            self._control, reply = control_reply(
-                sha, numkeys, keys_and_args, self._control, self._counters
+        with self.lock:
+            self.control, reply = control_reply(
+                sha, numkeys, keys_and_args, self.control, self.counters
             )
             return reply
 
     def exists(self, key: str) -> object:
-        with self._lock:
-            return int(key in self._counters)
+        with self.lock:
+            return int(key in self.counters)
 
     def get(self, key: str) -> object:
         _ = key
-        with self._lock:
-            return self._control
+        with self.lock:
+            return self.control
 
     def info(self, section: str) -> object:
         assert section == 'replication'
-        self._info_calls += 1
-        return {'role': 'master', 'master_replid': self._replication_id}
+        self.info_calls += 1
+        return {'role': 'master', 'master_replid': self.replication_id}
 
     @contextmanager
     def pin(self) -> Generator['AtomicControlClient']:
@@ -91,29 +100,6 @@ class AtomicControlClient:
         raise AssertionError(script)
 
 
-class BorrowedAtomicControlClient:
-    def __init__(self, owner: AtomicControlClient) -> None:
-        self._owner = owner
-
-    def close(self) -> None:
-        return None
-
-    def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
-        return self._owner.evalsha(sha, numkeys, *keys_and_args)
-
-    def exists(self, key: str) -> object:
-        return self._owner.exists(key)
-
-    def get(self, key: str) -> object:
-        return self._owner.get(key)
-
-    def info(self, section: str) -> object:
-        return self._owner.info(section)
-
-    def script_load(self, script: bytes | str) -> object:
-        return self._owner.script_load(script)
-
-
 class EndpointControlClient:
     def __init__(
         self,
@@ -122,7 +108,7 @@ class EndpointControlClient:
         endpoint: list[str],
         fenced_script_endpoints: list[str],
     ) -> None:
-        self._close_calls = 0
+        self.close_calls = 0
         self._endpoint = endpoint
         self._fenced_script_endpoints = fenced_script_endpoints
         self._name = name
@@ -132,7 +118,7 @@ class EndpointControlClient:
         return self
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         if sha in (CONTROL_CREATE_SCRIPT_SHA, CONTROL_ROTATE_SCRIPT_SHA):
@@ -156,103 +142,11 @@ class EndpointControlClient:
         raise AssertionError(script)
 
 
-class FixedPrimaryPool:
-    def get_master_address(self) -> tuple[str, int]:
-        return 'primary.example', 6379
-
-
-class PinnedConnectionView(BorrowedAtomicControlClient):
-    def __init__(self, owner: AtomicControlClient, connection: int) -> None:
-        super().__init__(owner)
-        self._connection = connection
-
-    def connection_generation(self) -> int:
-        return self._connection
-
-
-class PinnedConnectionClient(BorrowedAtomicControlClient):
-    def __init__(self, *, replication_id: str = _REPLICATION_A) -> None:
-        super().__init__(AtomicControlClient(replication_id=replication_id))
-        self._pin_connection = 1
-
-    def epoch(self) -> tuple[int, int, None]:
-        return self._owner.epoch()
-
-    @contextmanager
-    def pin(self) -> Generator[PinnedConnectionView]:
-        yield PinnedConnectionView(self._owner, self._pin_connection)
-
-    def refresh(self) -> None:
-        self._owner.refresh()
-
-    def refresh_endpoint(self) -> None:
-        self._owner.refresh_endpoint()
-
-
-class PreObservedConnection:
-    def __init__(self, callback: Callable[[object], None]) -> None:
-        self._callback = callback
-        self._connect_calls = 0
-        self._connected = False
-        self._disconnect_calls = 0
-        self._setup_complete = False
-
-    def __hash__(self) -> int:
-        assert self._setup_complete
-        return object.__hash__(self)
-
-    def connect(self) -> None:
-        if self._connected:
-            return
-        self._connect_calls += 1
-        self._connected = True
-        self._callback(self)
-
-    def disconnect(self) -> None:
-        self._disconnect_calls += 1
-        self._connected = False
-
-    def on_connect(self) -> None:
-        self._setup_complete = True
-
-    def register_connect_callback(self, _callback: Callable[[object], None]) -> None:
-        raise AssertionError('pre-observed production connection used fallback callback')
-
-
-class ProvingConnection:
-    def __init__(self, owner: AtomicControlClient, hook: Callable[[object], None]) -> None:
-        self._connected = False
-        self._disconnect_calls = 0
-        self._hook = hook
-        self._owner = owner
-        self._sent: list[tuple[object, ...]] = []
-
-    def connect(self) -> None:
-        if self._connected:
-            return
-        self._connected = True
-        self._hook(self)
-
-    def disconnect(self) -> None:
-        self._disconnect_calls += 1
-        self._connected = False
-
-    def on_connect(self) -> None:
-        return None
-
-    def read_response(self) -> object:
-        raw = self._owner.info('replication')
-        return raw if isinstance(raw, bytes) else info_reply(cast('Mapping[str, object]', raw))
-
-    def send_command(self, *args: object) -> None:
-        self._sent.append(args)
-
-
 class ReconnectObservable:
     def __init__(self) -> None:
         self._callbacks: list[Callable[[object], None]] = []
 
-    def _reconnect(self) -> None:
+    def reconnect(self) -> None:
         for callback in self._callbacks:
             callback(self)
 
@@ -261,18 +155,74 @@ class ReconnectObservable:
             self._callbacks.append(callback)
 
 
+class _BorrowedAtomicControlClient:
+    def __init__(self, owner: AtomicControlClient) -> None:
+        self.owner = owner
+
+    def close(self) -> None:
+        return None
+
+    def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
+        return self.owner.evalsha(sha, numkeys, *keys_and_args)
+
+    def exists(self, key: str) -> object:
+        return self.owner.exists(key)
+
+    def get(self, key: str) -> object:
+        return self.owner.get(key)
+
+    def info(self, section: str) -> object:
+        return self.owner.info(section)
+
+    def script_load(self, script: bytes | str) -> object:
+        return self.owner.script_load(script)
+
+
+class _FixedPrimaryPool:
+    def get_master_address(self) -> tuple[str, int]:
+        return 'primary.example', 6379
+
+
+class _PinnedConnectionView(_BorrowedAtomicControlClient):
+    def __init__(self, owner: AtomicControlClient, connection: int) -> None:
+        super().__init__(owner)
+        self._connection = connection
+
+    def connection_generation(self) -> int:
+        return self._connection
+
+
+class PinnedConnectionClient(_BorrowedAtomicControlClient):
+    def __init__(self, *, replication_id: str = _REPLICATION_A) -> None:
+        super().__init__(AtomicControlClient(replication_id=replication_id))
+        self.pin_connection = 1
+
+    def epoch(self) -> tuple[int, int, None]:
+        return self.owner.epoch()
+
+    @contextmanager
+    def pin(self) -> Generator[_PinnedConnectionView]:
+        yield _PinnedConnectionView(self.owner, self.pin_connection)
+
+    def refresh(self) -> None:
+        self.owner.refresh()
+
+    def refresh_endpoint(self) -> None:
+        self.owner.refresh_endpoint()
+
+
 class TraceControlClient:
-    def __init__(self, trace: _ControlTrace) -> None:
-        self._effects = list(trace._effects)
-        self._proposal_nonce = trace._proposal_nonce
+    def __init__(self, trace: ControlTrace) -> None:
+        self.effects = list(trace.effects)
+        self._proposal_nonce = trace.proposal_nonce
         self._role_epoch: tuple[int, int, object | None] = (0, 0, None)
 
-    def _effect(self, name: str) -> object:
-        effect = self._effects.pop(0)
-        assert effect._name == name
-        if effect._epoch_after is not None:
-            self._role_epoch = effect._epoch_after
-        return effect._reply
+    def effect(self, name: str) -> object:
+        effect = self.effects.pop(0)
+        assert effect.name == name
+        if effect.epoch_after is not None:
+            self._role_epoch = effect.epoch_after
+        return effect.reply
 
     def epoch(self) -> tuple[int, int, object | None]:
         return self._role_epoch
@@ -288,33 +238,33 @@ class TraceControlClient:
                 b'primary|00000000000000000000000000000001|sgqc:v1:counter:00000000000000000000000000000001',
             )
         assert keys_and_args == (*expected, proposal)
-        return self._effect('create' if sha == CONTROL_CREATE_SCRIPT_SHA else 'rotate')
+        return self.effect('create' if sha == CONTROL_CREATE_SCRIPT_SHA else 'rotate')
 
     def exists(self, key: str) -> object:
-        assert key in (_COUNTER_A, _COUNTER_B)
-        return self._effect('exists')
+        assert key in (COUNTER_A, COUNTER_B)
+        return self.effect('exists')
 
     def get(self, key: str) -> object:
         assert key == 'sgqc:v1:control'
-        return self._effect('get')
+        return self.effect('get')
 
     def info(self, section: str) -> object:
         assert section == 'replication'
-        return self._effect('info')
+        return self.effect('info')
 
     @contextmanager
     def pin(self) -> Generator['TraceControlClient']:
-        self._effect('pin')
+        self.effect('pin')
         try:
             yield self
         finally:
-            self._effect('unpin')
+            self.effect('unpin')
 
     def refresh(self) -> None:
-        self._effect('refresh')
+        self.effect('refresh')
 
     def refresh_endpoint(self) -> None:
-        self._effect('refresh_endpoint')
+        self.effect('refresh_endpoint')
 
     def script_load(self, script: bytes | str) -> object:
         raise AssertionError(script)
@@ -323,26 +273,26 @@ class TraceControlClient:
 class AlreadyConnectedObservable(ReconnectObservable):
     def __init__(self) -> None:
         super().__init__()
-        self._callback_observations = 0
+        self.callback_observations = 0
         self._connected = False
-        self._disconnect_calls = 0
-        self._successful_connections = 0
+        self.disconnect_calls = 0
+        self.successful_connections = 0
 
     def connect(self) -> None:
         if self._connected:
             return
         self._connected = True
-        self._successful_connections += 1
+        self.successful_connections += 1
         for callback in self._callbacks:
-            self._callback_observations += 1
+            self.callback_observations += 1
             callback(self)
 
     def disconnect(self) -> None:
-        self._disconnect_calls += 1
+        self.disconnect_calls += 1
         self._connected = False
 
 
-class ReconnectingBorrowedClient(BorrowedAtomicControlClient):
+class ReconnectingBorrowedClient(_BorrowedAtomicControlClient):
     def __init__(self, owner: AtomicControlClient, connection: object) -> None:
         super().__init__(owner)
         self.connection = connection
@@ -351,7 +301,7 @@ class ReconnectingBorrowedClient(BorrowedAtomicControlClient):
 class PreObservedClient(AtomicControlClient):
     def __init__(self, callback: Callable[[object], None]) -> None:
         super().__init__()
-        self.connection = PreObservedConnection(callback)
+        self.connection = _PreObservedConnection(callback)
 
     def client(self) -> ReconnectingBorrowedClient:
         self.connection.connect()
@@ -361,15 +311,15 @@ class PreObservedClient(AtomicControlClient):
 class ConnectedAtomicControlClient(AtomicControlClient):
     def __init__(self) -> None:
         super().__init__()
-        self._close_calls = 0
+        self.close_calls = 0
         self.connection = ReconnectObservable()
-        self._metadata_script_calls = 0
+        self.metadata_script_calls = 0
 
     def client(self) -> ReconnectingBorrowedClient:
         return ReconnectingBorrowedClient(self, self.connection)
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
 
 class AlreadyConnectedAtomicClient(ConnectedAtomicControlClient):
@@ -382,7 +332,7 @@ class AlreadyConnectedAtomicClient(ConnectedAtomicControlClient):
         return ReconnectingBorrowedClient(self, self.connection)
 
 
-class PooledResultChild(BorrowedAtomicControlClient):
+class PooledResultChild(_BorrowedAtomicControlClient):
     def __init__(self, owner: 'PooledResultClient', index: int) -> None:
         super().__init__(owner)
         self.connection = AlreadyConnectedObservable()
@@ -390,10 +340,10 @@ class PooledResultChild(BorrowedAtomicControlClient):
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         _ = sha, numkeys, keys_and_args
-        owner = cast('PooledResultClient', self._owner)
-        if owner._barrier is not None:
-            owner._barrier.wait()
-        if self._index in owner._reconnect_indexes:
+        owner = cast('PooledResultClient', self.owner)
+        if owner.barrier is not None:
+            owner.barrier.wait()
+        if self._index in owner.reconnect_indexes:
             self.connection.disconnect()
             self.connection.connect()
         return [b'child', self._index]
@@ -407,57 +357,57 @@ class PooledResultClient(AtomicControlClient):
         reconnect_indexes: set[int] | None = None,
     ) -> None:
         super().__init__()
-        self._barrier = barrier
-        self._children: list[PooledResultChild] = []
-        self._close_calls = 0
-        self._reconnect_indexes: set[int] = (
+        self.barrier = barrier
+        self.children: list[PooledResultChild] = []
+        self.close_calls = 0
+        self.reconnect_indexes: set[int] = (
             set() if reconnect_indexes is None else reconnect_indexes
         )
 
     def client(self) -> PooledResultChild:
-        with self._lock:
-            child = PooledResultChild(self, len(self._children))
-            self._children.append(child)
+        with self.lock:
+            child = PooledResultChild(self, len(self.children))
+            self.children.append(child)
         child.connection.connect()
         return child
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
 
-class PooledMetadataChild(BorrowedAtomicControlClient):
+class PooledMetadataChild(_BorrowedAtomicControlClient):
     def __init__(self, owner: 'PooledMetadataClient', index: int) -> None:
         super().__init__(owner)
         self.connection = AlreadyConnectedObservable()
         self._index = index
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
-        owner = cast('PooledMetadataClient', self._owner)
+        owner = cast('PooledMetadataClient', self.owner)
         if sha in (CONTROL_CREATE_SCRIPT_SHA, CONTROL_ROTATE_SCRIPT_SHA):
             return owner.evalsha(sha, numkeys, *keys_and_args)
         if self._index == 0:
-            owner._first_operation_entered.set()
-            assert owner._release_first_operation.wait(timeout=5)
+            owner.first_operation_entered.set()
+            assert owner.release_first_operation.wait(timeout=5)
         return [b'ok', 1]
 
 
 class PooledMetadataClient(AtomicControlClient):
     def __init__(self) -> None:
         super().__init__()
-        self._children: list[PooledMetadataChild] = []
-        self._close_calls = 0
-        self._first_operation_entered = Event()
-        self._release_first_operation = Event()
+        self.children: list[PooledMetadataChild] = []
+        self.close_calls = 0
+        self.first_operation_entered = Event()
+        self.release_first_operation = Event()
 
     def client(self) -> PooledMetadataChild:
-        with self._lock:
-            child = PooledMetadataChild(self, len(self._children))
-            self._children.append(child)
+        with self.lock:
+            child = PooledMetadataChild(self, len(self.children))
+            self.children.append(child)
         child.connection.connect()
         return child
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
 
 class ReconnectingClient(AtomicControlClient):
@@ -470,13 +420,9 @@ class ReconnectingClient(AtomicControlClient):
         if not self._connect_pending:
             return
         self._connect_pending = False
-        self.connection._reconnect()
+        self.connection.reconnect()
 
-    def _reconnect_to(self, replication_id: str) -> None:
-        self._replication_id = replication_id
-        self._connect_pending = True
-
-    def client(self) -> BorrowedAtomicControlClient:
+    def client(self) -> _BorrowedAtomicControlClient:
         self._connect()
         return ReconnectingBorrowedClient(self, self.connection)
 
@@ -487,6 +433,73 @@ class ReconnectingClient(AtomicControlClient):
     def info(self, section: str) -> object:
         self._connect()
         return super().info(section)
+
+    def reconnect_to(self, replication_id: str) -> None:
+        self.replication_id = replication_id
+        self._connect_pending = True
+
+
+class _PreObservedConnection:
+    def __init__(self, callback: Callable[[object], None]) -> None:
+        self._callback = callback
+        self.connect_calls = 0
+        self._connected = False
+        self.disconnect_calls = 0
+        self._setup_complete = False
+
+    def __hash__(self) -> int:
+        assert self._setup_complete
+        return object.__hash__(self)
+
+    def connect(self) -> None:
+        if self._connected:
+            return
+        self.connect_calls += 1
+        self._connected = True
+        self._callback(self)
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self._connected = False
+
+    def on_connect(self) -> None:
+        self._setup_complete = True
+
+    def register_connect_callback(self, _callback: Callable[[object], None]) -> None:
+        raise AssertionError('pre-observed production connection used fallback callback')
+
+
+class _ProvingConnection:
+    def __init__(self, owner: AtomicControlClient, hook: Callable[[object], None]) -> None:
+        self.connected = False
+        self.disconnect_calls = 0
+        self._hook = hook
+        self._owner = owner
+        self.sent: list[tuple[object, ...]] = []
+
+    def connect(self) -> None:
+        if self.connected:
+            return
+        self.connected = True
+        self._hook(self)
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        self.connected = False
+
+    def on_connect(self) -> None:
+        return None
+
+    def read_response(self) -> object:
+        raw = self._owner.info('replication')
+        return raw if isinstance(raw, bytes) else _info_reply(cast('Mapping[str, object]', raw))
+
+    def send_command(self, *args: object) -> None:
+        self.sent.append(args)
+
+
+def _info_reply(fields: Mapping[str, object]) -> bytes:
+    return b''.join(f'{name}:{value}\r\n'.encode() for name, value in fields.items())
 
 
 def enabled_settings(mode: config._ValkeyMode = 'standalone') -> CacheSettings:
@@ -519,20 +532,44 @@ class ProvingClient(AtomicControlClient):
         self, hook: Callable[[object], None], *, replication_id: str = _REPLICATION_A
     ) -> None:
         super().__init__(replication_id=replication_id)
-        self._close_calls = 0
-        self.connection = ProvingConnection(self, hook)
-        self.connection_pool = FixedPrimaryPool()
+        self.close_calls = 0
+        self.connection = _ProvingConnection(self, hook)
+        self.connection_pool = _FixedPrimaryPool()
 
     def client(self) -> ReconnectingBorrowedClient:
         self.connection.connect()
         return ReconnectingBorrowedClient(self, self.connection)
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
 
-def info_reply(fields: Mapping[str, object]) -> bytes:
-    return b''.join(f'{name}:{value}\r\n'.encode() for name, value in fields.items())
+def install_proving_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: _ValkeyMode,
+    factories: list[type[ProvingClient]],
+) -> list[ProvingClient]:
+    clients: list[ProvingClient] = []
+    pending = iter(factories)
+
+    def create_client(**kwargs: object) -> ProvingClient:
+        client = next(pending)(cast('Callable[[object], None]', kwargs['valkey_connect_func']))
+        clients.append(client)
+        return client
+
+    class _Sentinel:
+        def __init__(self, _sentinels: object, **kwargs: object) -> None:
+            self._kwargs = kwargs
+
+        def master_for(self, _name: str) -> ProvingClient:
+            return create_client(**self._kwargs)
+
+    monkeypatch.setattr(
+        valkey_module,
+        'Sentinel' if mode == 'sentinel' else 'Valkey',
+        _Sentinel if mode == 'sentinel' else create_client,
+    )
+    return clients
 
 
 def nonce(index: int) -> str:

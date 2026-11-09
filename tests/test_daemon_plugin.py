@@ -69,38 +69,38 @@ class _DaemonTesting(Protocol):
 
 class _RecordingRegistrar:
     def __init__(self, config_path: str) -> None:
-        self._calls: list[tuple[str, object]] = []
+        self.calls: list[tuple[str, object]] = []
         self.config = _TrackingConfig(config_path)
 
     def add_callback(self, **values: object) -> None:
-        self._calls.append(('callback', values))
+        self.calls.append(('callback', values))
 
     def set_setup(self, setup: object) -> None:
-        self._calls.append(('setup', setup))
+        self.calls.append(('setup', setup))
 
 
 class _RecordingStore:
-    _instances: ClassVar[list['_RecordingStore']] = []
-    _next_failure: ClassVar[BaseException | None] = None
-    _timeline: ClassVar[list[tuple[int, str, int | None]]] = []
+    instances: ClassVar[list['_RecordingStore']] = []
+    next_failure: ClassVar[BaseException | None] = None
+    timeline: ClassVar[list[tuple[int, str, int | None]]] = []
 
     def __init__(self) -> None:
-        self._identifier = len(type(self)._instances)
-        self._operations: list[tuple[str, object]] = []
-        self._failure = type(self)._next_failure
-        type(self)._next_failure = None
-        type(self)._instances.append(self)
+        self._identifier = len(type(self).instances)
+        self.operations: list[tuple[str, object]] = []
+        self.failure = type(self).next_failure
+        type(self).next_failure = None
+        type(self).instances.append(self)
 
     def _record(self, operation: str, payload: object) -> None:
-        self._operations.append((operation, payload))
-        active = daemon_plugin._State._backend
+        self.operations.append((operation, payload))
+        active = daemon_plugin._State.backend
         active_identifier = active._identifier if isinstance(active, _RecordingStore) else None
-        type(self)._timeline.append((self._identifier, operation, active_identifier))
+        type(self).timeline.append((self._identifier, operation, active_identifier))
 
     def change(self, changes: tuple[GenerationChange, ...]) -> None:
         self._record('change', changes)
-        if self._failure is not None:
-            raise self._failure
+        if self.failure is not None:
+            raise self.failure
 
     def close(self) -> None:
         self._record('close', None)
@@ -137,11 +137,11 @@ class _RevealedSecret:
 
 class _TrackingConfig(Mapping[str, object]):
     def __init__(self, config_path: str) -> None:
-        self._accessed: list[str] = []
+        self.accessed: list[str] = []
         self._values = {'config_path': config_path, 'unused': 'must-not-be-read'}
 
     def __getitem__(self, key: str) -> object:
-        self._accessed.append(key)
+        self.accessed.append(key)
         return self._values[key]
 
     def __iter__(self) -> Iterator[str]:
@@ -154,7 +154,7 @@ class _TrackingConfig(Mapping[str, object]):
 @dataclass
 class _PluginContext:
     event: Mapping[str, object]
-    _reveals: list[str]
+    reveals: list[str]
     secrets: Mapping[str, _RevealedSecret]
     site: str
 
@@ -231,12 +231,12 @@ def _testing_module(origin: Path, *, compatible: bool = True) -> ModuleType:
 
 @pytest.fixture(autouse=True)
 def reset_plugin_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    _RecordingStore._instances.clear()
-    _RecordingStore._next_failure = None
-    _RecordingStore._timeline.clear()
-    monkeypatch.setattr(daemon_plugin._State, '_backend', None)
-    monkeypatch.setattr(daemon_plugin._State, '_config_path', None)
-    monkeypatch.setattr(daemon_plugin._State, '_site_namespace', None)
+    _RecordingStore.instances.clear()
+    _RecordingStore.next_failure = None
+    _RecordingStore.timeline.clear()
+    monkeypatch.setattr(daemon_plugin._State, 'backend', None)
+    monkeypatch.setattr(daemon_plugin._State, 'config_path', None)
+    monkeypatch.setattr(daemon_plugin._State, 'site_namespace', None)
 
 
 @pytest.fixture
@@ -308,12 +308,12 @@ def test_callback_propagates_backend_failure_for_daemon_retry(
     event: Mapping[str, object], failure: BaseException, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _RecordingStore()
-    store._failure = failure
-    monkeypatch.setattr(daemon_plugin._State, '_backend', store)
-    daemon_plugin._State._site_namespace = _SITE
+    store.failure = failure
+    monkeypatch.setattr(daemon_plugin._State, 'backend', store)
+    daemon_plugin._State.site_namespace = _SITE
 
     with pytest.raises(type(failure)):
-        daemon_plugin.callback(_context(event))
+        daemon_plugin._callback(_context(event))
 
 
 def test_callback_returns_after_successful_change(
@@ -321,13 +321,13 @@ def test_callback_returns_after_successful_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _RecordingStore()
-    monkeypatch.setattr(daemon_plugin._State, '_backend', store)
-    daemon_plugin._State._site_namespace = _SITE
+    monkeypatch.setattr(daemon_plugin._State, 'backend', store)
+    daemon_plugin._State.site_namespace = _SITE
 
-    result = daemon_plugin.callback(_context(event))
+    result = daemon_plugin._callback(_context(event))
 
     assert result is None
-    assert store._operations[0][0] == 'change'
+    assert store.operations[0][0] == 'change'
 
 
 def test_daemon_testing_accepts_any_explicit_compatible_source_root(
@@ -454,7 +454,7 @@ def test_public_harness_loads_path_and_drives_setup_before_callback(
 
     assert result.ok
     assert loaded.callbacks == ('invalidate-cache',)
-    operations = _RecordingStore._instances[0]._operations
+    operations = _RecordingStore.instances[0].operations
     assert operations[0:2] == [
         ('resolve', (DependencyTag.site(_SITE),)),
         ('flush_site', (_SITE, 'daemon_setup')),
@@ -486,7 +486,7 @@ def test_public_harness_keeps_uncertain_mutation_failed_until_retry_succeeds(
     _install_recording_valkey(monkeypatch)
     monkeypatch.setenv(_METADATA_SECRET_ENV, 'metadata-secret')
     testing, loaded = _load_with_harness(cache_config)
-    _RecordingStore._next_failure = failure
+    _RecordingStore.next_failure = failure
 
     failed = testing.drive_sync_plugin(loaded, (event,), delivery_attempt=1)
     retried = testing.drive_sync_plugin(loaded, (event,), delivery_attempt=2)
@@ -528,6 +528,37 @@ def test_duplicate_and_operator_replayed_callbacks_are_safe_and_log_no_payload(
     assert 'metadata-secret' not in caplog.text
 
 
+@pytest.mark.parametrize('operation', ['resolve', 'flush_site'])
+def test_failed_setup_closes_candidate_and_preserves_active_store(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_config: Path,
+    operation: str,
+) -> None:
+    _install_recording_valkey(monkeypatch)
+    daemon_plugin.register(_RecordingRegistrar(str(cache_config)))
+    context = _context()
+    daemon_plugin._setup(context)
+    previous = _RecordingStore.instances[0]
+    failure = BackendUnavailable('candidate unavailable')
+
+    def fail_setup(store: _RecordingStore, *_args: object) -> None:
+        store._record(operation, None)
+        raise failure
+
+    monkeypatch.setattr(_RecordingStore, operation, fail_setup)
+    with pytest.raises(BackendUnavailable) as caught:
+        daemon_plugin._setup(context)
+
+    candidate = _RecordingStore.instances[1]
+    assert caught.value is failure
+    assert candidate.operations[-1] == ('close', None)
+    assert daemon_plugin._State.backend is previous
+    assert all(name != 'close' for name, _payload in previous.operations)
+    assert all(
+        active == 0 for identifier, _name, active in _RecordingStore.timeline if identifier == 1
+    )
+
+
 def test_register_reads_only_config_path_and_declares_setup_before_callback(
     cache_config: Path,
 ) -> None:
@@ -535,12 +566,12 @@ def test_register_reads_only_config_path_and_declares_setup_before_callback(
 
     daemon_plugin.register(registrar)
 
-    assert registrar.config._accessed == ['config_path']
-    assert registrar._calls == [
-        ('setup', daemon_plugin.setup),
+    assert registrar.config.accessed == ['config_path']
+    assert registrar.calls == [
+        ('setup', daemon_plugin._setup),
         (
             'callback',
-            {'id': 'invalidate-cache', 'callback': daemon_plugin.callback},
+            {'id': 'invalidate-cache', 'callback': daemon_plugin._callback},
         ),
     ]
 
@@ -553,23 +584,39 @@ def test_second_setup_publishes_fresh_flushed_store_before_closing_previous(
     daemon_plugin.register(_RecordingRegistrar(str(cache_config)))
     context = _context()
 
-    daemon_plugin.setup(context)
-    daemon_plugin.setup(context)
+    daemon_plugin._setup(context)
+    daemon_plugin._setup(context)
 
-    first, second = _RecordingStore._instances
-    assert _RecordingStore._timeline == [
+    first, second = _RecordingStore.instances
+    assert _RecordingStore.timeline == [
         (0, 'resolve', None),
         (0, 'flush_site', None),
         (1, 'resolve', 0),
         (1, 'flush_site', 0),
         (0, 'close', 1),
     ]
-    assert daemon_plugin._State._backend is second
-    assert first._operations[-1] == ('close', None)
-    assert second._operations == [
+    assert daemon_plugin._State.backend is second
+    assert first.operations[-1] == ('close', None)
+    assert second.operations == [
         ('resolve', (DependencyTag.site(_SITE),)),
         ('flush_site', (_SITE, 'daemon_setup')),
     ]
+
+
+def test_setup_names_missing_secret_declaration(cache_config: Path) -> None:
+    daemon_plugin.register(_RecordingRegistrar(str(cache_config)))
+    context = _context(extra_secret=True)
+    context.secrets = {'UNUSED_SECRET': context.secrets['UNUSED_SECRET']}
+
+    with pytest.raises(RuntimeError) as error:
+        daemon_plugin._setup(context)
+
+    assert str(error.value) == (
+        f'daemon plugin settings need secrets.{_METADATA_SECRET_ENV}; '
+        "declare it in the plugin's secrets"
+    )
+    assert 'unused-secret' not in str(error.value)
+    assert context.reveals == []
 
 
 def test_setup_rejects_site_mismatch_before_backend_creation(
@@ -582,10 +629,10 @@ def test_setup_rejects_site_mismatch_before_backend_creation(
     context.site = 'other-site'
 
     with pytest.raises(RuntimeError, match='site namespace'):
-        daemon_plugin.setup(context)
+        daemon_plugin._setup(context)
 
-    assert _RecordingStore._instances == []
-    assert context._reveals == []
+    assert _RecordingStore.instances == []
+    assert context.reveals == []
 
 
 def test_setup_reveals_only_metadata_secret_validates_and_flushes(
@@ -596,10 +643,10 @@ def test_setup_reveals_only_metadata_secret_validates_and_flushes(
     daemon_plugin.register(_RecordingRegistrar(str(cache_config)))
     context = _context(extra_secret=True)
 
-    daemon_plugin.setup(context)
+    daemon_plugin._setup(context)
 
-    assert context._reveals == [_METADATA_SECRET_ENV]
-    assert _RecordingStore._instances[0]._operations == [
+    assert context.reveals == [_METADATA_SECRET_ENV]
+    assert _RecordingStore.instances[0].operations == [
         ('resolve', (DependencyTag.site(_SITE),)),
         ('flush_site', (_SITE, 'daemon_setup')),
     ]

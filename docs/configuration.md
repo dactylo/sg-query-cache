@@ -5,17 +5,17 @@ and connect the cache in Python. If you have not run the cache yet, start with t
 [README quick start](../README.md#quick-start), which uses the local layout and needs no settings
 file.
 
-| If you want to...                               | Start here                                                |
-| ----------------------------------------------- | --------------------------------------------------------- |
-| Choose local, shared, or hierarchical           | [Choose a layout](#choose-a-layout)                       |
-| Copy a starting settings file                   | [Layout examples](#layout-examples)                       |
-| Connect to Sentinel or a managed Valkey service | [Valkey connection modes](#valkey-connection-modes)       |
-| Build the cache from a settings file in Python  | [Build the cache in Python](#build-the-cache-in-python)   |
-| Cache reads for human users                     | [Identities and trust](#identities-and-trust)             |
-| Change how long results are kept                | [Maximum age rules](#maximum-age-rules)                   |
-| Cache results that contain signed URLs          | [Signed URLs](#signed-urls)                               |
-| Look up a setting and its default               | [Settings reference](#settings-reference)                 |
-| Correlate metrics for one exact call            | [Metrics correlation secret](#metrics-correlation-secret) |
+| If you want to...                        | Start here                                                |
+| ---------------------------------------- | --------------------------------------------------------- |
+| Choose local, shared, or hierarchical    | [Choose a layout](#choose-a-layout)                       |
+| Copy a starting settings file            | [Layout examples](#layout-examples)                       |
+| Build the cache in Python                | [Build the cache in Python](#build-the-cache-in-python)   |
+| Cache reads for human users              | [Identities and trust](#identities-and-trust)             |
+| Change how long results are kept         | [Maximum age rules](#maximum-age-rules)                   |
+| Cache results that contain signed URLs   | [Signed URLs](#signed-urls)                               |
+| Connect to Sentinel or a managed service | [Valkey connection modes](#valkey-connection-modes)       |
+| Correlate metrics for one exact call     | [Metrics correlation secret](#metrics-correlation-secret) |
+| Look up a setting and its default        | [Settings reference](#settings-reference)                 |
 
 ## Choose a layout
 
@@ -131,49 +131,51 @@ password_env = "SG_QUERY_CACHE_METADATA_PASSWORD"
 key_prefix = "sgqc-production"
 ```
 
-## Valkey connection modes
-
-Both roles must use the same `mode`:
-
-- `standalone` connects directly to `host`.
-- `managed` also connects directly to `host`, such as a provider's primary endpoint, and checks
-  that the endpoint is a writable primary whenever it connects.
-- `sentinel` finds the current primary through Valkey Sentinel. It requires `service_name` and at
-  least three distinct `host:port` addresses in `sentinels`, because the client accepts a
-  Sentinel's answer only when that Sentinel sees at least two others.
-
-Standalone and managed roles require `host`. The role defaults are `port = 6379`, `database = 0`,
-`tls = true`, and `key_prefix = "sgqc"`; `username` is optional. A Sentinel role looks like this:
-
-```toml
-[cache.l2.valkey.result]
-mode = "sentinel"
-sentinels = ["result-s1:26379", "result-s2:26379", "result-s3:26379"]
-service_name = "sgqc-results"
-password_env = "SG_QUERY_CACHE_RESULT_PASSWORD"
-
-[cache.l2.valkey.metadata]
-mode = "sentinel"
-sentinels = ["metadata-s1:26379", "metadata-s2:26379", "metadata-s3:26379"]
-service_name = "sgqc-metadata"
-password_env = "SG_QUERY_CACHE_METADATA_PASSWORD"
-```
-
-Loading rejects result and metadata roles that point at the same endpoint: the same host, port, and
-database, or for Sentinel, the same service name and database. Keep the roles' credentials, service
-names, databases, and memory policies independent; in particular, the metadata role must never
-evict keys, while the result role should. Supported providers and ACLs are covered in
-[operations](operations.md#supported-deployments).
-
 ## Build the cache in Python
 
-The `valkey` extra provides the synchronous `ValkeyBackend` in `sg_query_cache.valkey`. This
-snippet builds a synchronous cache for whichever layers the settings file enables, then wraps a
-client as in the [README quick start](../README.md#cache-a-synchronous-client):
+Load the settings, then use the owning factory to build and close the enabled layers. Starting with
+the `raw_sg`, `identity`, and `context` from the
+[README quick start](../README.md#cache-a-synchronous-client):
+
+```python
+from sg_query_cache import CacheSettings, CachedShotgun
+
+settings = CacheSettings.from_toml('/etc/sg-query-cache.toml')
+with CachedShotgun.open(raw_sg, settings, identity, context) as sg:
+    assets = sg.find('Asset', [['sg_status_list', 'is', 'ip']], ['code'])
+```
+
+For a native async client, use the same settings with `AsyncCachedShotgun.open()`:
+
+```python
+from sg_query_cache import AsyncCachedShotgun
+
+async with AsyncCachedShotgun.open(raw_sg, settings, identity, context) as sg:
+    assets = await sg.find('Asset', [['sg_status_list', 'is', 'ip']], ['code'])
+```
+
+Both factories close the cache on context exit; you still own and close the raw SG client. They
+read role passwords from the process environment unless you pass `environ=`, and build a safe
+metrics boundary when you pass a sink as `metrics=`. If construction fails, they close any layers
+already built. The shared layouts require the `valkey` extra.
+
+### Keep client options in sync
+
+When L2 is enabled, the `ClientContext` site namespace must equal `cache.site_namespace`; the
+wrapper raises `ValueError` otherwise. If you change the raw client's `localized`,
+`convert_datetimes_to_utc`, or page size, call the wrapper's `replace_context()` with a matching
+context, awaiting it in async code. This prevents reuse of results fetched under the old options.
+
+With L2 enabled, a changed context also invalidates results for that site across all connected
+processes by bumping the shared site generation. Passing an equal context leaves it unchanged.
+
+### Construct layers manually
+
+Use manual construction when you need to supply the backends or clock yourself. Supply exactly the
+layers the settings enable; any other combination raises `ValueError`.
 
 ```python
 import os
-from time import monotonic
 
 from sg_query_cache import CacheSettings, Identity, LocalBackend, NullMetrics, QueryCache
 from sg_query_cache.valkey import ValkeyBackend
@@ -181,28 +183,22 @@ from sg_query_cache.valkey import ValkeyBackend
 settings = CacheSettings.from_toml('/etc/sg-query-cache.toml')
 identity = Identity(kind='script', issuer='render-farm', namespace='publish-reader')
 metrics = NullMetrics()
-l1 = LocalBackend(settings, monotonic, metrics) if settings.l1.enabled else None
+l1 = LocalBackend(settings, metrics=metrics) if settings.l1.enabled else None
 l2 = ValkeyBackend.from_settings(settings, os.environ, metrics) if settings.l2.enabled else None
 cache = QueryCache(settings, identity, l1=l1, l2=l2, metrics=metrics)
 ```
 
-See [identities and trust](#identities-and-trust) for choosing `Identity` values. Supply exactly
-the backends the settings enable; any other combination raises `ValueError`.
-`ValkeyBackend.from_settings` reads the role passwords from the mapping you pass, here the process
-environment. `cache.close()` closes L1 and then L2. To collect metrics, replace `NullMetrics()`
-with the boundary described in [metrics](operations.md#metrics-and-alerts).
+`LocalBackend(settings)` defaults to `time.monotonic` and discarded metrics; you can supply an
+explicit clock and metrics sink. Replace `NullMetrics()` with the boundary described in
+[metrics and alerts](operations.md#metrics-and-alerts) to collect metrics.
 
-For native async code, `AsyncCachedShotgun.open(raw_sg, settings, identity, context)` builds the
-layers the settings enable, reading role passwords from the process environment unless you pass
-`environ=`. Pass your sink as `metrics=`, and it builds the metrics boundary for you.
+`ValkeyBackend.from_settings()` reads passwords from the supplied mapping and validates the
+configuration without connecting. `ValkeyMetadataStore.from_settings()` also connects only on first
+use. An unavailable Valkey does not prevent construction; reads fall back to SG while the role's
+circuit breaker retries. See [connection recovery](operations.md#connection-recovery).
 
-When L2 is enabled, the `ClientContext` site namespace must equal `cache.site_namespace`; the
-wrapper raises `ValueError` otherwise. If you later change the raw client's `localized`,
-`convert_datetimes_to_utc`, or page size, call the wrapper's `replace_context()` with a matching
-context, awaiting it in async code, so results fetched under the old options are not reused. With
-L2 enabled, a changed context also bumps the site's shared generation and invalidates cached
-results for that site across all connected processes. Passing an equal context leaves the
-generation unchanged.
+Direct wrapper construction is non-owning: close the cache yourself. `cache.close()` closes L1 and
+then L2. The raw SG client remains yours to close.
 
 ## Identities and trust
 
@@ -294,9 +290,9 @@ identity_kind = "human"
 maximum_age_seconds = 5
 ```
 
-An explicit age from a [policy scope](consistency.md#bypass-and-policy-scopes) replaces the rule or
-default, and can lengthen it as well as shorten it. Whatever the source, the selected age is then
-capped by:
+An explicit age from `cache_policy(maximum_age_seconds=5)` replaces the rule or default, and can
+lengthen it as well as shorten it. See [policy scopes](consistency.md#bypass-and-policy-scopes) for
+scoped reads. Whatever the source, the selected age is then capped by:
 
 - `global_safety_max_seconds` (3,600 seconds by default, and never more);
 - for hierarchical L1, `hierarchical_max_age_seconds`;
@@ -320,6 +316,72 @@ clock error bound.
 
 Results that contain SG's temporary placeholder thumbnail, shown while SG processes a thumbnail,
 are kept for at most `transient_image_max_age_seconds`, 5 seconds by default.
+
+## Valkey connection modes
+
+Both roles must use the same `mode`:
+
+| Mode         | How it finds the primary                                                                 | Required connection settings                                                    |
+| ------------ | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `standalone` | Connects directly to the configured host                                                 | `host`                                                                          |
+| `managed`    | Connects to the configured endpoint and checks for a writable primary on each connection | `host`, normally the provider's primary endpoint                                |
+| `sentinel`   | Discovers the primary through Valkey Sentinel                                            | `service_name` and at least three distinct `host:port` addresses in `sentinels` |
+
+A Sentinel's answer is accepted only when that Sentinel sees at least two others.
+
+Standalone and managed roles require `host`. The role defaults are `port = 6379`, `database = 0`,
+`tls = true`, and `key_prefix = "sgqc"`; `username` is optional. A Sentinel role looks like this:
+
+```toml
+[cache.l2.valkey.result]
+mode = "sentinel"
+sentinels = ["result-s1:26379", "result-s2:26379", "result-s3:26379"]
+service_name = "sgqc-results"
+password_env = "SG_QUERY_CACHE_RESULT_PASSWORD"
+
+[cache.l2.valkey.metadata]
+mode = "sentinel"
+sentinels = ["metadata-s1:26379", "metadata-s2:26379", "metadata-s3:26379"]
+service_name = "sgqc-metadata"
+password_env = "SG_QUERY_CACHE_METADATA_PASSWORD"
+```
+
+Loading rejects result and metadata roles that point at the same endpoint: the same host, port, and
+database, or for Sentinel, the same service name and database. Keep the roles' credentials, service
+names, databases, and memory policies independent; in particular, the metadata role must never
+evict keys, while the result role should. Supported providers and ACLs are covered in
+[operations](operations.md#supported-deployments).
+
+## Metrics correlation secret
+
+By default, metrics carry no per-call identifier. To correlate the metrics emitted during one exact
+read, set `metrics_digest_secret_env` to the name of an environment variable that holds a secret of
+at least 32 bytes. Loading the settings records only the variable name; the secret is read when you
+build the metrics boundary from the settings, the environment, and your sink:
+
+```python
+import os
+
+from sg_query_cache import CacheSettings, MetricsSink, QueryCache
+
+
+def cache_metrics(settings: CacheSettings, sink: MetricsSink) -> MetricsSink:
+    return QueryCache.build_metrics(settings, os.environ, sink)
+```
+
+The secret must be valid UTF-8 and at least 32 bytes when encoded. If it is missing, not a string,
+or too short, construction fails with one error that does not reveal the value. The returned
+boundary adds an `exact_call_digest` label, a keyed HMAC-SHA-256 digest, to the metrics that
+`QueryCache` and `AsyncQueryCache` emit after a read derives its cache key, such as hits, fills,
+waits, and cache-path bypasses. Metrics emitted before that point carry no digest: query
+classification, dependency broadening, and bypasses decided from the plan or a normalization
+failure. Schema-view metrics carry none either. Backend metrics never carry this label, including
+those emitted during a read. The boundary keeps neither the environment nor the variable name, and
+never emits the secret or the raw query. The secret does not affect cache keys or cached results.
+
+Without `metrics_digest_secret_env`, `QueryCache.build_metrics` still validates and forwards your
+sink's metrics, without `exact_call_digest`. Passing `NullMetrics()` as the sink discards all
+metrics.
 
 ## Settings reference
 
@@ -402,52 +464,24 @@ dependency limits in `[cache.limits]`.
 
 ### `[cache.limits]`
 
-| Setting                               | Default           | Meaning                                                                                                                                                               |
-| ------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fill_lease_seconds`                  | `30`              | How long one reader's reservation to fetch a missing result lasts. If that reader fails, another can fetch once the lease expires.                                    |
-| `lease_wait_seconds`                  | `2`               | How long other readers of the same missing result wait for that fetch before reading SG themselves without storing the result.                                        |
-| `max_dependency_tags`                 | `32`              | Most dependency tags one result can record. At most 32 when L2 is enabled. Larger lists are broadened, cached as TTL-only, or read directly.                          |
-| `max_dependency_vector_bytes`         | `2048`            | Most encoded bytes for one result's dependency list.                                                                                                                  |
-| `max_serialized_result_bytes`         | `1048576` (1 MiB) | Largest result the cache stores; larger results are returned but not cached. At most 1,048,576.                                                                       |
-| `scoped_generation_retention_seconds` | `7200`            | How long an unused generation record for a specific entity, entity type, field, or project stays in metadata. Site-wide, schema, and permission records never expire. |
-| `connect_timeout_seconds`             | `0.1`             | Valkey connection timeout.                                                                                                                                            |
-| `operation_timeout_seconds`           | `0.25`            | Valkey operation timeout. Synchronous and async clients apply it differently; see [async deadlines](operations.md#async-deadlines-and-shutdown).                      |
-| `circuit_failure_threshold`           | `5`               | Consecutive failures that open a role's circuit, after which reads bypass to SG.                                                                                      |
-| `circuit_probe_seconds`               | `10`              | Wait before one probe tries an open circuit again.                                                                                                                    |
-| `incarnation_validation_seconds`      | `30`              | Approximate interval, with jitter, at which a client rechecks the metadata incarnation.                                                                               |
-| `signed_url_safety_margin_seconds`    | `30`              | Time subtracted from a signed URL's remaining lifetime. See [signed URLs](#signed-urls).                                                                              |
-| `transient_image_max_age_seconds`     | `5`               | Maximum age of results containing SG's temporary placeholder thumbnail.                                                                                               |
-| `clock_error_bound_seconds`           | Unset             | Largest expected clock error. Required to cache results with signed URLs; zero or more and smaller than the safety margin.                                            |
+| Setting                               | Default           | Meaning                                                                                                                                                                                                                    |
+| ------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fill_lease_seconds`                  | `30`              | How long one reader's reservation to fetch a missing result lasts. If that reader fails, another can fetch once the lease expires.                                                                                         |
+| `lease_wait_seconds`                  | `2`               | How long other readers of the same missing result wait for that fetch before reading SG themselves without storing the result.                                                                                             |
+| `max_dependency_tags`                 | `32`              | Most dependency tags one result can record. At most 32 when L2 is enabled. Larger lists are broadened, cached as TTL-only, or read directly.                                                                               |
+| `max_dependency_vector_bytes`         | `2048`            | Most encoded bytes for one result's dependency list.                                                                                                                                                                       |
+| `max_serialized_result_bytes`         | `1048576` (1 MiB) | Largest result the cache stores; larger results are returned but not cached. At most 1,048,576.                                                                                                                            |
+| `scoped_generation_retention_seconds` | `7200`            | How long an unused generation record for a specific entity, entity type, or field, or for one human user's visibility, stays in metadata. Site-wide, schema, permission, and shared human-visibility records never expire. |
+| `connect_timeout_seconds`             | `0.1`             | Valkey connection timeout.                                                                                                                                                                                                 |
+| `operation_timeout_seconds`           | `0.25`            | Valkey operation timeout. Synchronous and async clients apply it differently; see [async deadlines](operations.md#async-deadlines-and-shutdown).                                                                           |
+| `circuit_failure_threshold`           | `5`               | Consecutive failures that open a role's circuit, after which reads bypass to SG.                                                                                                                                           |
+| `circuit_probe_seconds`               | `10`              | Wait before one probe tries an open circuit again.                                                                                                                                                                         |
+| `incarnation_validation_seconds`      | `30`              | Approximate interval, with jitter, at which a client rechecks the metadata incarnation.                                                                                                                                    |
+| `signed_url_safety_margin_seconds`    | `30`              | Time subtracted from a signed URL's remaining lifetime. See [signed URLs](#signed-urls).                                                                                                                                   |
+| `transient_image_max_age_seconds`     | `5`               | Maximum age of results containing SG's temporary placeholder thumbnail.                                                                                                                                                    |
+| `clock_error_bound_seconds`           | Unset             | Largest expected clock error. Required to cache results with signed URLs; zero or more and smaller than the safety margin.                                                                                                 |
 
 The incarnation identifies the current contents of the metadata service; see
 [service layout](operations.md#service-layout). A local-only configuration may raise
 `max_dependency_tags` above 32 when its byte limits allow; with L2 enabled, the cache never sends
 more than 32 tags to Valkey.
-
-## Metrics correlation secret
-
-By default, metrics carry no per-call identifier. To correlate the metrics emitted during one exact
-read, set `metrics_digest_secret_env` to the name of an environment variable that holds a secret of
-at least 32 bytes. Loading the settings records only the variable name; the secret is read when you
-build the metrics boundary from the settings, the environment, and your sink:
-
-```python
-import os
-
-from sg_query_cache import CacheSettings, MetricsSink, QueryCache
-
-
-def cache_metrics(settings: CacheSettings, sink: MetricsSink) -> MetricsSink:
-    return QueryCache.build_metrics(settings, os.environ, sink)
-```
-
-The secret must be valid UTF-8 and at least 32 bytes when encoded. If it is missing, not a string,
-or too short, construction fails with one error that does not reveal the value. The returned
-boundary adds an `exact_call_digest` label, a keyed HMAC-SHA-256 digest, to `QueryCache` read
-metrics. Backend metrics never carry this label, including those emitted during a read. The
-boundary keeps neither the environment nor the variable name, and never emits the secret or the raw
-query. The secret does not affect cache keys or cached results.
-
-Without `metrics_digest_secret_env`, `QueryCache.build_metrics` still validates and forwards your
-sink's metrics, without `exact_call_digest`. Passing `NullMetrics()` as the sink discards all
-metrics.

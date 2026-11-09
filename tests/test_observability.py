@@ -1,10 +1,9 @@
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Barrier, Event, Lock
-from time import monotonic, sleep
-from typing import TypeVar, cast
+from time import monotonic
+from typing import cast
 
 import pytest
 
@@ -31,15 +30,18 @@ from sg_query_cache._valkey_scripts import (
     CHANGE_SCRIPT_SHA,
     LOOKUP_SCRIPT_SHA,
     RESOLVE_SCRIPT_SHA,
-    ScriptClient,
 )
 from sg_query_cache.valkey import ValkeyBackend, ValkeyMetadataStore, _CircuitBreaker
-from tests._fakes import _DelegatingBackend, _FakeClock, _RecordingMetrics
-from tests._valkey_control_cases import control_reply
+from tests._fakes import (
+    CLIENT_OPTIONS,
+    DelegatingBackend,
+    FakeClock,
+    RecordingMetrics,
+    ThrowingMetrics,
+    asset_plan,
+)
+from tests.valkey._control_helpers import AtomicControlClient
 
-_T = TypeVar('_T')
-
-_CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _REPLICATION = 'a' * 40
 _SENSITIVE_CANARIES = (
     'filter-private',
@@ -64,84 +66,38 @@ class _AgeDecision:
     reason: str
 
 
-class _ControlClient:
+class _ControlClient(AtomicControlClient):
     def __init__(self) -> None:
-        self._control: bytes | None = None
-        self._counters: set[str] = set()
-        self._fail_metadata = False
-        self._metadata_replies: list[object] = []
-        self._result_replies: list[object] = []
-
-    def _control_reply(
-        self,
-        sha: str,
-        numkeys: int,
-        keys_and_args: tuple[object, ...],
-    ) -> object:
-        self._control, reply = control_reply(
-            sha, numkeys, keys_and_args, self._control, self._counters
-        )
-        return reply
+        super().__init__(replication_id=_REPLICATION)
+        self.fail_metadata = False
+        self.result_replies: list[object] = []
 
     def _lookup_reply(self, numkeys: int) -> object:
         assert numkeys == 1
-        return self._result_replies.pop(0)
+        return self.result_replies.pop(0)
 
     def _metadata_reply(self, sha: str, numkeys: int) -> object:
-        if self._fail_metadata:
+        if self.fail_metadata:
             raise OSError('metadata unavailable')
-        if self._metadata_replies:
-            return self._metadata_replies.pop(0)
+        if self.metadata_replies:
+            return self.metadata_replies.pop(0)
         if sha == CHANGE_SCRIPT_SHA:
             return [b'ok', numkeys - 2, 0]
         return [b'ok', *(1 for _index in range(numkeys - 2))]
-
-    def close(self) -> None:
-        return None
-
-    def epoch(self) -> tuple[int, int, None]:
-        return 0, 0, None
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         if sha == LOOKUP_SCRIPT_SHA:
             return self._lookup_reply(numkeys)
         if sha in {CHANGE_SCRIPT_SHA, RESOLVE_SCRIPT_SHA}:
             return self._metadata_reply(sha, numkeys)
-        return self._control_reply(sha, numkeys, keys_and_args)
-
-    def exists(self, key: str) -> object:
-        return int(key in self._counters)
-
-    def get(self, key: str) -> object:
-        _ = key
-        return self._control
-
-    def info(self, section: str) -> object:
-        assert section == 'replication'
-        return {'role': 'master', 'master_replid': _REPLICATION}
-
-    @contextmanager
-    def pin(self) -> Generator['_ControlClient']:
-        yield self
-
-    def refresh(self) -> None:
-        return None
-
-    def refresh_endpoint(self) -> None:
-        return None
-
-    def run_operation(self, operation: Callable[[ScriptClient], _T]) -> _T:
-        return operation(self)
-
-    def script_load(self, script: bytes | str) -> object:
-        raise AssertionError(script)
+        return super().evalsha(sha, numkeys, *keys_and_args)
 
 
-class _FailingWaitBackend(_DelegatingBackend):
-    _fail_lookup = False
+class _FailingWaitBackend(DelegatingBackend):
+    fail_lookup = False
 
     def lookup(self, key: str) -> CacheHit | None:
-        if self._fail_lookup:
+        if self.fail_lookup:
             raise BackendUnavailable('lookup failed during wait')
         return super().lookup(key)
 
@@ -150,12 +106,12 @@ class _Interrupted(BaseException):
     pass
 
 
-class _ReserveBarrierBackend(_DelegatingBackend):
+class _ReserveBarrierBackend(DelegatingBackend):
     def __init__(self, backend: LocalBackend) -> None:
         super().__init__(backend)
         self._reserve_barrier = Barrier(2)
         self._reserve_lock = Lock()
-        self._reserves_completed = Event()
+        self.reserves_completed = Event()
         self._reserve_attempts = 0
         self._reserve_count = 0
 
@@ -165,20 +121,12 @@ class _ReserveBarrierBackend(_DelegatingBackend):
             self._reserve_attempts += 1
         if attempt < 2:
             self._reserve_barrier.wait(timeout=2)
-        lease = self._backend.reserve(key, lease_seconds)
+        lease = self.backend.reserve(key, lease_seconds)
         with self._reserve_lock:
             self._reserve_count += 1
             if self._reserve_count == 2:
-                self._reserves_completed.set()
+                self.reserves_completed.set()
         return lease
-
-
-class _ThrowingMetrics:
-    def increment(self, name: str, labels: object) -> None:
-        raise RuntimeError(f'counter failed: {name}: {labels!r}')
-
-    def observe(self, name: str, value: float, labels: object) -> None:
-        raise RuntimeError(f'observation failed: {name}: {value}: {labels!r}')
 
 
 def _advance_distributed_wait(
@@ -189,7 +137,7 @@ def _advance_distributed_wait(
     if outcome == 'cancelled':
         raise _Interrupted
     if outcome == 'failure':
-        backend._fail_lookup = True
+        backend.fail_lookup = True
         return
     assert backend.release(lease)
     if outcome == 'completed':
@@ -199,9 +147,9 @@ def _advance_distributed_wait(
         assert backend.commit(replacement, payload, 30)
 
 
-def _assert_metrics_private(*recordings: _RecordingMetrics) -> None:
+def _assert_metrics_private(*recordings: RecordingMetrics) -> None:
     for recording in recordings:
-        for name, labels in recording._increments:
+        for name, labels in recording.increments:
             fields: tuple[object, ...] = (
                 name,
                 *labels.keys(),
@@ -210,7 +158,7 @@ def _assert_metrics_private(*recordings: _RecordingMetrics) -> None:
             for field in fields:
                 rendered = repr(field)
                 assert all(canary not in rendered for canary in _SENSITIVE_CANARIES)
-        for name, value, labels in recording._observations:
+        for name, value, labels in recording.observations:
             fields = (
                 name,
                 value,
@@ -227,7 +175,7 @@ def _await_follower(cache: QueryCache, *, prefix: str = '') -> None:
     while monotonic() < deadline:
         with cache._flight_lock:
             if any(
-                key.startswith(prefix) and flight._participants == 2
+                key.startswith(prefix) and flight.participants == 2
                 for key, flight in cache._flights.items()
             ):
                 return
@@ -247,25 +195,25 @@ def _call() -> ExactCall:
     )
 
 
-def _metric_labels(recording: _RecordingMetrics, name: str) -> list[dict[str, str]]:
+def _metric_labels(recording: RecordingMetrics, name: str) -> list[dict[str, str]]:
     return [
         {key: value for key, value in labels.items() if key != 'exact_call_digest'}
-        for metric, labels in recording._increments
+        for metric, labels in recording.increments
         if metric == name
     ]
 
 
-def _recorded_names(metrics: _RecordingMetrics) -> set[str]:
+def _recorded_names(metrics: RecordingMetrics) -> set[str]:
     return {
-        *(name for name, _labels in metrics._increments),
-        *(name for name, _value, _labels in metrics._observations),
+        *(name for name, _labels in metrics.increments),
+        *(name for name, _value, _labels in metrics.observations),
     }
 
 
-def _wait_observations(recording: _RecordingMetrics) -> list[tuple[float, dict[str, str]]]:
+def _wait_observations(recording: RecordingMetrics) -> list[tuple[float, dict[str, str]]]:
     return [
         (value, {key: label for key, label in labels.items() if key != 'exact_call_digest'})
-        for name, value, labels in recording._observations
+        for name, value, labels in recording.observations
         if name == 'cache_wait_seconds'
     ]
 
@@ -278,19 +226,6 @@ def _wait_settings(topology: str, *, wait_seconds: float = 1.0) -> CacheSettings
     )
 
 
-def _plan(*, broadening: bool = False) -> DependencyPlan:
-    return DependencyPlan(
-        'event_aware',
-        (
-            DependencyTag.site(_SITE),
-            DependencyTag.authorization(_SITE),
-            DependencyTag.type_membership(_SITE, 'Asset'),
-        ),
-        'event_aware',
-        ('field_to_type',) if broadening else (),
-    )
-
-
 def _read(
     cache: QueryCache,
     fetch: Callable[[], object],
@@ -300,16 +235,16 @@ def _read(
 ) -> object:
     return cache.read(
         _call(),
-        plan or _plan(),
+        plan or asset_plan(),
         fetch,
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         _population_decision=decision,
     )
 
 
 def test_cache_and_local_backend_emit_the_complete_observability_contract() -> None:
-    clock = _FakeClock()
-    recording = _RecordingMetrics()
+    clock = FakeClock()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings(
         limits=LimitSettings(scoped_generation_retention_seconds=1),
@@ -318,7 +253,7 @@ def test_cache_and_local_backend_emit_the_complete_observability_contract() -> N
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
         metrics=metrics,
     )
@@ -326,7 +261,7 @@ def test_cache_and_local_backend_emit_the_complete_observability_contract() -> N
     assert _read(
         cache,
         lambda: [{'id': 1, 'value': 'result-private', 'image': 'signed-private'}],
-        plan=_plan(broadening=True),
+        plan=asset_plan(broadening=True),
         decision=lambda _value: _AgeDecision(5, 'signed_url'),
     ) == [{'id': 1, 'value': 'result-private', 'image': 'signed-private'}]
     assert _read(cache, lambda: [{'id': 2}]) == [
@@ -340,7 +275,7 @@ def test_cache_and_local_backend_emit_the_complete_observability_contract() -> N
 
     scoped = DependencyTag.entity(_SITE, 'Asset', 7)
     backend.resolve((scoped,))
-    clock._advance(2)
+    clock.advance(2)
     backend.resolve((scoped,))
     backend.change((GenerationChange(DependencyTag.entity(_SITE, 'Asset', 8)),))
     backend.change((GenerationChange(scoped),))
@@ -348,7 +283,7 @@ def test_cache_and_local_backend_emit_the_complete_observability_contract() -> N
 
     first = backend.reserve(_SENSITIVE_KEY, 1)
     assert first is not None
-    clock._advance(2)
+    clock.advance(2)
     second = backend.reserve(_SENSITIVE_KEY, 1)
     assert second is not None
     assert backend.commit(second, b'\x80', 1)
@@ -381,12 +316,12 @@ def test_cache_and_local_backend_emit_the_complete_observability_contract() -> N
 
 
 def test_circuit_breaker_transitions_ignore_metrics_sink_failures() -> None:
-    clock = _FakeClock()
+    clock = FakeClock()
     breaker = _CircuitBreaker(
         'result',
         threshold=1,
         probe_seconds=5,
-        metrics=_ThrowingMetrics(),
+        metrics=ThrowingMetrics(),
         clock=clock,
     )
 
@@ -394,18 +329,18 @@ def test_circuit_breaker_transitions_ignore_metrics_sink_failures() -> None:
     with pytest.raises(BackendUnavailable, match='circuit breaker is open'):
         breaker.admit()
 
-    clock._advance(5)
+    clock.advance(5)
     assert breaker.admit()
     breaker.fail()
     with pytest.raises(BackendUnavailable, match='circuit breaker is open'):
         breaker.admit()
 
-    clock._advance(5)
+    clock.advance(5)
     assert breaker.admit()
     breaker.succeed()
     assert not breaker.admit()
 
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     recorded = _CircuitBreaker(
         'result',
         threshold=1,
@@ -414,10 +349,10 @@ def test_circuit_breaker_transitions_ignore_metrics_sink_failures() -> None:
         clock=clock,
     )
     recorded.fail()
-    clock._advance(5)
+    clock.advance(5)
     assert recorded.admit()
     recorded.fail()
-    clock._advance(5)
+    clock.advance(5)
     assert recorded.admit()
     recorded.succeed()
     _assert_metrics_private(recording)
@@ -425,7 +360,7 @@ def test_circuit_breaker_transitions_ignore_metrics_sink_failures() -> None:
 
 def test_flush_metrics_use_only_fixed_internal_reason_labels() -> None:
     for owner in ('local', 'valkey'):
-        recording = _RecordingMetrics()
+        recording = RecordingMetrics()
         metrics = SafeMetrics(recording)
         settings = CacheSettings(
             l1=L1Settings(enabled=owner == 'local'),
@@ -435,7 +370,7 @@ def test_flush_metrics_use_only_fixed_internal_reason_labels() -> None:
             ),
         )
         backend = (
-            LocalBackend(settings, _FakeClock(), metrics)
+            LocalBackend(settings, FakeClock(), metrics)
             if owner == 'local'
             else ValkeyMetadataStore(_ControlClient(), settings, metrics)
         )
@@ -446,27 +381,27 @@ def test_flush_metrics_use_only_fixed_internal_reason_labels() -> None:
         assert (
             'cache_site_flush',
             {'reason': 'operator'},
-        ) in recording._increments
+        ) in recording.increments
         assert (
             'cache_site_flush',
             {'reason': 'daemon_setup'},
-        ) in recording._increments
-        assert 'customer-ticket-private' not in repr(recording._increments)
+        ) in recording.increments
+        assert 'customer-ticket-private' not in repr(recording.increments)
         _assert_metrics_private(recording)
 
 
 @pytest.mark.parametrize('topology', ['local', 'hierarchy', 'shared'])
 def test_followers_count_one_collapse_and_wait(topology: str) -> None:
     settings = _wait_settings(topology)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
-    backend = LocalBackend(settings, _FakeClock(), metrics)
+    backend = LocalBackend(settings, FakeClock(), metrics)
     selected_backend = _ReserveBarrierBackend(backend) if topology == 'shared' else backend
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        KeyBuilder(),
-        l1=LocalBackend(settings, _FakeClock(), SafeMetrics(recording))
+        key_builder=KeyBuilder(),
+        l1=LocalBackend(settings, FakeClock(), SafeMetrics(recording))
         if topology == 'hierarchy'
         else (backend if topology == 'local' else None),
         l2=selected_backend if topology != 'local' else None,
@@ -491,7 +426,7 @@ def test_followers_count_one_collapse_and_wait(topology: str) -> None:
             rendezvous.wait(timeout=2)
             assert fetch_entered.wait(timeout=2)
             if topology == 'shared':
-                assert cast('_ReserveBarrierBackend', selected_backend)._reserves_completed.wait(
+                assert cast('_ReserveBarrierBackend', selected_backend).reserves_completed.wait(
                     timeout=2
                 )
             else:
@@ -515,30 +450,34 @@ def test_distributed_wait_records_one_outcome(
     outcome: str,
 ) -> None:
     settings = _wait_settings(topology, wait_seconds=0.02)
-    recording = _RecordingMetrics()
-    backend = _FailingWaitBackend(LocalBackend(settings, _FakeClock(), SafeMetrics(recording)))
+    clock = FakeClock()
+    if outcome == 'takeover':
+        monkeypatch.setattr(cache_module, 'monotonic', clock)
+    recording = RecordingMetrics()
+    backend = _FailingWaitBackend(LocalBackend(settings, FakeClock(), SafeMetrics(recording)))
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        l1=LocalBackend(settings, _FakeClock(), SafeMetrics(recording))
+        l1=LocalBackend(settings, FakeClock(), SafeMetrics(recording))
         if topology == 'hierarchy'
         else None,
         l2=backend,
         metrics=SafeMetrics(recording),
     )
     base_key = KeyBuilder.base_key(
-        settings.site_namespace, _SENSITIVE_IDENTITY, _CLIENT_OPTIONS, _call()
+        settings.site_namespace, _SENSITIVE_IDENTITY, CLIENT_OPTIONS, _call()
     )
-    key = KeyBuilder.qualified_key(base_key, backend.resolve(_plan().tags), 'result')
+    key = KeyBuilder.qualified_key(base_key, backend.resolve(asset_plan().tags), 'result')
     lease = backend.reserve(key, 30)
     assert lease is not None
 
     def advance(_seconds: float) -> None:
+        clock.advance(0.0078125 if outcome == 'takeover' else 0)
         _advance_distributed_wait(backend, lease, outcome)
 
     def fetch() -> object:
         if outcome == 'takeover':
-            sleep(0.2)
+            clock.advance(1)
         return 2
 
     if outcome != 'timeout':
@@ -562,7 +501,7 @@ def test_distributed_wait_records_one_outcome(
         assert {'layer': 'l2'} not in _metric_labels(recording, 'cache_fill')
     if outcome == 'takeover':
         assert _metric_labels(recording, 'cache_fill').count({'layer': 'l2'}) == 1
-        assert observations[0][0] < 0.2
+        assert observations[0][0] == 0.0078125
     if outcome == 'failure':
         assert {'reason': 'backend_failure'} in _metric_labels(recording, 'cache_bypass')
 
@@ -570,9 +509,9 @@ def test_distributed_wait_records_one_outcome(
 def test_hierarchy_promotion_preserves_observed_sg_duration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     shared_settings = CacheSettings(
         l1=L1Settings(enabled=False),
@@ -582,13 +521,13 @@ def test_hierarchy_promotion_preserves_observed_sg_duration(
     shared = QueryCache(
         shared_settings,
         _SENSITIVE_IDENTITY,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l2=l2,
         metrics=metrics,
     )
 
     def fetch() -> str:
-        clock._advance(3.25)
+        clock.advance(3.25)
         return 'shared'
 
     assert _read(shared, fetch) == 'shared'
@@ -600,7 +539,7 @@ def test_hierarchy_promotion_preserves_observed_sg_duration(
     hierarchy = QueryCache(
         hierarchy_settings,
         _SENSITIVE_IDENTITY,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
@@ -612,17 +551,17 @@ def test_hierarchy_promotion_preserves_observed_sg_duration(
         'cache_sg_avoided_seconds',
         3.25,
         {'layer': 'l2'},
-    ) in recording._observations
+    ) in recording.observations
     assert (
         'cache_sg_avoided_seconds',
         3.25,
         {'layer': 'hierarchical_l1'},
-    ) in recording._observations
+    ) in recording.observations
     _assert_metrics_private(recording)
 
 
 def test_incarnation_validation_and_rotation_emit_stable_outcomes() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     client = _ControlClient()
     control = ValkeyControl(
@@ -638,14 +577,14 @@ def test_incarnation_validation_and_rotation_emit_stable_outcomes() -> None:
     second = control.rotate(first)
 
     assert first != second
-    assert ('cache_incarnation', {'outcome': 'validated'}) in recording._increments
-    assert ('cache_incarnation', {'outcome': 'rotated'}) in recording._increments
+    assert ('cache_incarnation', {'outcome': 'validated'}) in recording.increments
+    assert ('cache_incarnation', {'outcome': 'rotated'}) in recording.increments
     _assert_metrics_private(recording)
 
 
 def test_local_owner_reports_exact_storage_transitions() -> None:
-    clock = _FakeClock()
-    recording = _RecordingMetrics()
+    clock = FakeClock()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings(
         l1=L1Settings(result_budget_bytes=500),
@@ -661,17 +600,17 @@ def test_local_owner_reports_exact_storage_transitions() -> None:
     assert second is not None
     assert backend.commit(first, encode_value(('first',)), 30)
     assert backend.commit(second, encode_value(('second',)), 30)
-    clock._advance(2)
+    clock.advance(2)
     backend.resolve((scoped,))
 
     assert (
         'cache_scoped_generation',
         {'outcome': 'created', 'tag_kind': 'entity'},
-    ) in recording._increments
+    ) in recording.increments
     assert (
         'cache_scoped_generation',
         {'outcome': 'expired', 'tag_kind': 'entity'},
-    ) in recording._increments
+    ) in recording.increments
     assert any(
         name == 'cache_serialized_bytes'
         and labels
@@ -679,25 +618,25 @@ def test_local_owner_reports_exact_storage_transitions() -> None:
             'layer': 'local_l1',
             'outcome': 'evicted',
         }
-        for name, _value, labels in recording._observations
+        for name, _value, labels in recording.observations
     )
     assert {
         labels['tag_kind']
-        for name, _value, labels in recording._observations
+        for name, _value, labels in recording.observations
         if name == 'generation_metadata_bytes'
     } == {'global', 'scoped'}
     _assert_metrics_private(recording)
 
 
 def test_metric_payloads_never_disclose_sensitive_runtime_values() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings()
-    backend = LocalBackend(settings, _FakeClock(), metrics)
+    backend = LocalBackend(settings, FakeClock(), metrics)
     cache = QueryCache(
         settings,
         Identity('script', 'identity-private', 'credential-private'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
         metrics=metrics,
     )
@@ -713,9 +652,9 @@ def test_metric_payloads_never_disclose_sensitive_runtime_values() -> None:
 
     cache.read(
         call,
-        _plan(),
+        asset_plan(),
         lambda: {'value': 'result-private', 'url': 'https://signed-private.example'},
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
     )
     lease = backend.reserve(_SENSITIVE_KEY, 5)
     assert lease is not None
@@ -723,7 +662,7 @@ def test_metric_payloads_never_disclose_sensitive_runtime_values() -> None:
     backend.flush_site(_SITE, 'flush-reason-private')
 
     _assert_metrics_private(recording)
-    for _name, labels in recording._increments:
+    for _name, labels in recording.increments:
         assert set(labels) <= {
             'backend_operation',
             'classification',
@@ -734,7 +673,7 @@ def test_metric_payloads_never_disclose_sensitive_runtime_values() -> None:
             'reason',
             'tag_kind',
         }
-    for _name, value, labels in recording._observations:
+    for _name, value, labels in recording.observations:
         assert value >= 0
         assert set(labels) <= {
             'backend_operation',
@@ -749,12 +688,12 @@ def test_metric_payloads_never_disclose_sensitive_runtime_values() -> None:
 
 
 def test_parsed_follower_counts_one_local_collapse() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     settings = CacheSettings()
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        l1=LocalBackend(settings, _FakeClock(), SafeMetrics(recording)),
+        l1=LocalBackend(settings, FakeClock(), SafeMetrics(recording)),
         metrics=SafeMetrics(recording),
     )
     entered = Event()
@@ -769,7 +708,7 @@ def test_parsed_follower_counts_one_local_collapse() -> None:
         return value
 
     def read() -> object:
-        return cache.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, parse)
+        return cache.read_parsed(_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         leader = executor.submit(read)
@@ -786,12 +725,12 @@ def test_parsed_follower_counts_one_local_collapse() -> None:
 
 
 def test_parsed_wait_timeout_can_reuse_cached_result() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     settings = CacheSettings(limits=LimitSettings(lease_wait_seconds=0.02))
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        l1=LocalBackend(settings, _FakeClock(), SafeMetrics(recording)),
+        l1=LocalBackend(settings, FakeClock(), SafeMetrics(recording)),
         metrics=SafeMetrics(recording),
     )
     entered = Event()
@@ -813,7 +752,7 @@ def test_parsed_wait_timeout_can_reuse_cached_result() -> None:
         return value
 
     def read() -> object:
-        return cache.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, parse)
+        return cache.read_parsed(_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         leader = executor.submit(read)
@@ -830,29 +769,29 @@ def test_parsed_wait_timeout_can_reuse_cached_result() -> None:
 
 
 def test_raw_backend_hit_does_not_claim_an_avoided_sg_call() -> None:
-    clock = _FakeClock()
-    recording = _RecordingMetrics()
+    clock = FakeClock()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings()
     backend = LocalBackend(settings, clock, metrics)
     lease = backend.reserve(_SENSITIVE_KEY, 5)
     assert lease is not None
     assert backend.commit(lease, encode_value(('raw',)), 30)
-    recording._increments.clear()
-    recording._observations.clear()
+    recording.increments.clear()
+    recording.observations.clear()
 
     assert backend.lookup(_SENSITIVE_KEY) is not None
     assert not any(
-        name in {'cache_hit', 'cache_sg_avoided_calls'} for name, _labels in recording._increments
+        name in {'cache_hit', 'cache_sg_avoided_calls'} for name, _labels in recording.increments
     )
     assert not any(
-        name == 'cache_sg_avoided_seconds' for name, _value, _labels in recording._observations
+        name == 'cache_sg_avoided_seconds' for name, _value, _labels in recording.observations
     )
     _assert_metrics_private(recording)
 
 
 def test_raw_valkey_hit_does_not_claim_an_avoided_sg_call() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings(
         l1=L1Settings(enabled=False),
@@ -861,25 +800,25 @@ def test_raw_valkey_hit_does_not_claim_an_avoided_sg_call() -> None:
     client = _ControlClient()
     store = ValkeyMetadataStore(client, settings, metrics)
     backend = ValkeyBackend(client, store, settings, metrics)
-    client._result_replies.append([b'hit', encode_value(('raw',)), 1_000])
+    client.result_replies.append([b'hit', encode_value(('raw',)), 1_000])
 
     assert backend.lookup(_SENSITIVE_KEY) is not None
     assert not any(
-        name in {'cache_hit', 'cache_sg_avoided_calls'} for name, _labels in recording._increments
+        name in {'cache_hit', 'cache_sg_avoided_calls'} for name, _labels in recording.increments
     )
     assert not any(
-        name == 'cache_sg_avoided_seconds' for name, _value, _labels in recording._observations
+        name == 'cache_sg_avoided_seconds' for name, _value, _labels in recording.observations
     )
     _assert_metrics_private(recording)
 
 
 def test_request_counts_local_waits_once_across_memo_and_result_flights() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     settings = CacheSettings(limits=LimitSettings(lease_wait_seconds=0.05))
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        l1=LocalBackend(settings, _FakeClock(), SafeMetrics(recording)),
+        l1=LocalBackend(settings, FakeClock(), SafeMetrics(recording)),
         metrics=SafeMetrics(recording),
     )
     entered = Event()
@@ -898,7 +837,7 @@ def test_request_counts_local_waits_once_across_memo_and_result_flights() -> Non
         return value
 
     def read() -> object:
-        return cache.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, parse)
+        return cache.read_parsed(_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         leader = executor.submit(read)
@@ -920,31 +859,30 @@ def test_request_counts_local_waits_once_across_memo_and_result_flights() -> Non
 def test_successful_hit_reports_exact_observed_sg_duration_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings()
     backend = LocalBackend(settings, clock, metrics)
     cache = QueryCache(
         settings,
         _SENSITIVE_IDENTITY,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
         metrics=metrics,
     )
 
     def fetch() -> str:
-        clock._advance(2.5)
+        clock.advance(2.5)
         return 'fresh'
 
     assert _read(cache, fetch) == 'fresh'
     assert _read(cache, lambda: 'unexpected') == 'fresh'
 
-    assert recording._increments.count(('cache_sg_avoided_calls', {'layer': 'local_l1'})) == 1
+    assert recording.increments.count(('cache_sg_avoided_calls', {'layer': 'local_l1'})) == 1
     assert (
-        recording._observations.count(('cache_sg_avoided_seconds', 2.5, {'layer': 'local_l1'}))
-        == 1
+        recording.observations.count(('cache_sg_avoided_seconds', 2.5, {'layer': 'local_l1'})) == 1
     )
     _assert_metrics_private(recording)
 
@@ -960,16 +898,16 @@ def test_successful_hit_reports_exact_observed_sg_duration_once(
 def test_unsafe_envelope_falls_back_without_reporting_an_avoided_call(
     envelope: tuple[object, ...],
 ) -> None:
-    clock = _FakeClock()
-    recording = _RecordingMetrics()
+    clock = FakeClock()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings()
     backend = LocalBackend(settings, clock, metrics)
     builder = KeyBuilder()
     identity = _SENSITIVE_IDENTITY
-    cache = QueryCache(settings, identity, builder, l1=backend, metrics=metrics)
-    vector = backend.resolve(_plan().tags)
-    base_key = builder.base_key(_SITE, identity, _CLIENT_OPTIONS, _call())
+    cache = QueryCache(settings, identity, key_builder=builder, l1=backend, metrics=metrics)
+    vector = backend.resolve(asset_plan().tags)
+    base_key = builder.base_key(_SITE, identity, CLIENT_OPTIONS, _call())
     key = builder.qualified_key(base_key, vector, 'result')
     lease = backend.reserve(key, 5)
     assert lease is not None
@@ -985,21 +923,21 @@ def test_unsafe_envelope_falls_back_without_reporting_an_avoided_call(
 
 
 def test_valkey_backend_phases_noeviction_and_recovery_are_observable() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings(
         l1=L1Settings(enabled=False),
         l2=L2Settings(enabled=True, acknowledge_mutually_trusted_clients=True),
     )
     client = _ControlClient()
-    client._metadata_replies.extend(([b'capacity'], [b'ok', 1]))
+    client.metadata_replies.extend(([b'capacity'], [b'ok', 1]))
     store = ValkeyMetadataStore(client, settings, metrics)
     tag = DependencyTag.type_membership(_SITE, 'Asset')
 
     with pytest.raises(BackendCapacity):
         store.resolve((tag,))
     assert store.resolve((tag,)).entries[0][0] == tag
-    client._fail_metadata = True
+    client.fail_metadata = True
     with pytest.raises(BackendUnavailable):
         store.resolve((tag,))
 
@@ -1014,7 +952,7 @@ def test_valkey_backend_phases_noeviction_and_recovery_are_observable() -> None:
 
 
 def test_valkey_lookup_reports_observable_miss_reasons_without_guessing() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
     settings = CacheSettings(
         l1=L1Settings(enabled=False),
@@ -1024,7 +962,7 @@ def test_valkey_lookup_reports_observable_miss_reasons_without_guessing() -> Non
     client = _ControlClient()
     store = ValkeyMetadataStore(client, settings, metrics)
     backend = ValkeyBackend(client, store, settings, metrics)
-    client._result_replies.extend(
+    client.result_replies.extend(
         (
             [b'miss'],
             [b'hit', b'\xc1', 1_000],
@@ -1036,6 +974,6 @@ def test_valkey_lookup_reports_observable_miss_reasons_without_guessing() -> Non
     assert backend.lookup(_SENSITIVE_KEY) is None
     assert backend.lookup(_SENSITIVE_KEY) is None
 
-    reasons = {labels['reason'] for name, labels in recording._increments if name == 'cache_miss'}
+    reasons = {labels['reason'] for name, labels in recording.increments if name == 'cache_miss'}
     assert reasons == {'absence', 'malformed', 'oversized'}
     _assert_metrics_private(recording)

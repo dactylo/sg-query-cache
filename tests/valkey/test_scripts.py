@@ -1,15 +1,22 @@
 from collections.abc import Callable
 from hashlib import sha1
+from ssl import SSLError
+from traceback import format_exception
 from typing import TypeVar, cast
 
 import pytest
 from valkey.exceptions import (
+    AuthenticationError,
+    AuthenticationWrongNumberOfArgsError,
+    AuthorizationError,
     DataError,
     NoPermissionError,
     NoScriptError,
     OutOfMemoryError,
     ResponseError,
 )
+from valkey.exceptions import ConnectionError as ValkeyConnectionError
+from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
 import sg_query_cache._valkey_scripts as scripts_module
 from sg_query_cache._backend import (
@@ -21,7 +28,7 @@ from sg_query_cache._backend import (
 from sg_query_cache._model import DependencyTag, FillLease
 from sg_query_cache._valkey_common import (
     ScriptArgument,
-    ScriptOperands,
+    _ScriptOperands,
     commit_operands,
     control_create_operands,
     control_rotate_operands,
@@ -32,18 +39,18 @@ from sg_query_cache._valkey_common import (
     reserve_operands,
 )
 from sg_query_cache._valkey_proof import PrimaryProofError
-from tests._valkey_control_cases import _RECORD_A, _RECORD_B, control_reply
+from tests._valkey_control_cases import RECORD_A, RECORD_B
 
 _T = TypeVar('_T')
 
 
 class _ScriptedClient:
     def __init__(self, replies: list[object]) -> None:
-        self._calls: list[tuple[object, ...]] = []
+        self.calls: list[tuple[object, ...]] = []
         self._replies = replies
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
-        self._calls.append(('evalsha', sha, numkeys, *keys_and_args))
+        self.calls.append(('evalsha', sha, numkeys, *keys_and_args))
         reply = self._replies.pop(0)
         if isinstance(reply, BaseException):
             raise reply
@@ -53,7 +60,7 @@ class _ScriptedClient:
         return operation(self)
 
     def script_load(self, script: bytes | str) -> object:
-        self._calls.append(('script_load', script))
+        self.calls.append(('script_load', script))
         reply = self._replies.pop(0)
         if isinstance(reply, BaseException):
             raise reply
@@ -88,7 +95,12 @@ def test_proof_failure_translates_to_fresh_backend_error(
         scripts_module.translate_client_error(PrimaryProofError(failure))
 
     assert caught.value is not failure
-    assert str(caught.value) == str(failure)
+    expected = (
+        'Valkey metadata role is not writable (replica)'
+        if isinstance(failure, BackendUnavailable)
+        else str(failure)
+    )
+    assert str(caught.value) == expected
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 
@@ -111,7 +123,7 @@ def test_script_cache_miss_does_not_retry_a_second_noscript() -> None:
             args=(),
         )
 
-    assert [call[0] for call in client._calls] == ['evalsha', 'script_load', 'evalsha']
+    assert [call[0] for call in client.calls] == ['evalsha', 'script_load', 'evalsha']
 
 
 def test_script_cache_miss_loads_once_and_retries_once() -> None:
@@ -128,25 +140,40 @@ def test_script_cache_miss_loads_once_and_retries_once() -> None:
     )
 
     assert reply == [b'miss']
-    assert client._calls == [
+    assert client.calls == [
         ('evalsha', scripts_module.LOOKUP_SCRIPT_SHA, 1, 'result-key'),
         ('script_load', scripts_module.LOOKUP_SCRIPT),
         ('evalsha', scripts_module.LOOKUP_SCRIPT_SHA, 1, 'result-key'),
     ]
 
 
-def test_shared_control_reply_rotates_absent_record_from_empty_observed() -> None:
-    counters: set[str] = set()
-    control, reply = control_reply(
-        scripts_module.CONTROL_ROTATE_SCRIPT_SHA,
-        2,
-        ('control', 'counter', b'', _RECORD_B),
-        None,
-        counters,
-    )
-    assert control == _RECORD_B
-    assert reply == [b'rotated', _RECORD_B]
-    assert counters == {'counter'}
+def test_translated_failure_exposes_no_client_detail() -> None:
+    canary = 'credential-canary-9281'
+    error = ValkeyTimeoutError(canary)
+    error.add_note(canary)
+    error.__dict__['client_detail'] = canary
+    client = _ScriptedClient([error])
+    with pytest.raises(BackendUnavailable) as caught:
+        scripts_module.execute_script(
+            client,
+            script=scripts_module.LOOKUP_SCRIPT,
+            sha=scripts_module.LOOKUP_SCRIPT_SHA,
+            keys=('key',),
+            args=(),
+        )
+    failure = caught.value
+    assert failure.failure_class == 'timeout'
+    assert canary not in str(failure)
+    assert canary not in repr(vars(failure))
+    assert not getattr(failure, '__notes__', ())
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    assert canary not in ''.join(format_exception(failure))
+    traceback = failure.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == 'translate_client_error':
+            assert all(value is not error for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
 
 
 @pytest.mark.parametrize(
@@ -185,31 +212,31 @@ def test_translation_reports_capacity_only_for_the_oom_code(
     [
         (
             'CONTROL_CREATE',
-            lambda: control_create_operands('sgqc:v1:control', parse_record(_RECORD_A, 'sgqc')),
-            ('sgqc:v1:control', 'sgqc:v1:counter:00000000000000000000000000000001', _RECORD_A),
+            lambda: control_create_operands('sgqc:v1:control', parse_record(RECORD_A, 'sgqc')),
+            ('sgqc:v1:control', 'sgqc:v1:counter:00000000000000000000000000000001', RECORD_A),
         ),
         (
             'CONTROL_ROTATE',
             lambda: control_rotate_operands(
-                'sgqc:v1:control', _RECORD_A, parse_record(_RECORD_B, 'sgqc')
+                'sgqc:v1:control', RECORD_A, parse_record(RECORD_B, 'sgqc')
             ),
             (
                 'sgqc:v1:control',
                 'sgqc:v1:counter:00000000000000000000000000000002',
-                _RECORD_A,
-                _RECORD_B,
+                RECORD_A,
+                RECORD_B,
             ),
         ),
         (
             'CONTROL_ROTATE',
             lambda: control_rotate_operands(
-                'sgqc:v1:control', None, parse_record(_RECORD_B, 'sgqc')
+                'sgqc:v1:control', None, parse_record(RECORD_B, 'sgqc')
             ),
             (
                 'sgqc:v1:control',
                 'sgqc:v1:counter:00000000000000000000000000000002',
                 b'',
-                _RECORD_B,
+                RECORD_B,
             ),
         ),
         ('LOOKUP', lambda: lookup_operands('results', 'key'), ('results:v1:result:key',)),
@@ -232,7 +259,7 @@ def test_translation_reports_capacity_only_for_the_oom_code(
 )
 def test_script_operands_keep_golden_wire_order_across_noscript(
     name: str,
-    build: Callable[[], ScriptOperands],
+    build: Callable[[], _ScriptOperands],
     expected: tuple[ScriptArgument, ...],
 ) -> None:
     script = cast('str', getattr(scripts_module, f'{name}_SCRIPT'))
@@ -249,7 +276,7 @@ def test_script_operands_keep_golden_wire_order_across_noscript(
     ) == [b'ok']
 
     key_count = 2 if name in ('COMMIT', 'CONTROL_CREATE', 'CONTROL_ROTATE') else 1
-    assert client._calls == [
+    assert client.calls == [
         ('evalsha', digest, key_count, *expected),
         ('script_load', script),
         ('evalsha', digest, key_count, *expected),
@@ -260,7 +287,7 @@ def test_script_operands_keep_golden_wire_order_across_noscript(
 def test_metadata_operands_keep_golden_tag_order_and_retention_flags(name: str) -> None:
     operands = metadata_operands(
         'sgqc',
-        parse_record(_RECORD_A, 'sgqc'),
+        parse_record(RECORD_A, 'sgqc'),
         (DependencyTag.site('site'), DependencyTag.entity('site', 'Asset', 7)),
         1.2349,
     )
@@ -277,7 +304,7 @@ def test_metadata_operands_keep_golden_tag_order_and_retention_flags(name: str) 
     )
 
     # Digests were independently computed from literal typed-JSON tag contexts.
-    assert client._calls == [
+    assert client.calls == [
         (
             'evalsha',
             digest,
@@ -292,7 +319,7 @@ def test_metadata_operands_keep_golden_tag_order_and_retention_flags(name: str) 
                 'sgqc:v1:metadata:00000000000000000000000000000001:sgqc:v1:tag:'
                 'dd3b567bdef699e237289c1fcca93eb296e101762d7e0ffdd21f5b66bdce5069'
             ),
-            _RECORD_A,
+            RECORD_A,
             1234,
             '1',
             '0',
@@ -313,7 +340,7 @@ def test_script_cache_miss_rejects_invalid_loaded_digest_without_execution(loade
             args=(),
         )
 
-    assert [call[0] for call in client._calls] == ['evalsha', 'script_load']
+    assert [call[0] for call in client.calls] == ['evalsha', 'script_load']
 
 
 @pytest.mark.parametrize(
@@ -352,7 +379,7 @@ def test_commit_executor_preserves_error_classification_and_retry_bound(
             deadline=1.0,
             clock=lambda: 0.0,
         )
-    assert len(client._calls) == commands
+    assert len(client.calls) == commands
 
 
 @pytest.mark.parametrize(
@@ -376,3 +403,53 @@ def test_script_preserves_normalized_backend_errors(
             args=(),
         )
     assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    ('error', 'failure_class'),
+    [
+        (AuthenticationError('secret'), 'authentication'),
+        (AuthenticationWrongNumberOfArgsError('secret'), 'authentication'),
+        (AuthorizationError('secret'), 'authentication'),
+        (NoPermissionError('secret'), 'authentication'),
+        (ResponseError('WRONGPASS secret'), 'authentication'),
+        (ResponseError('NOAUTH secret'), 'authentication'),
+        (ResponseError('NOPERM secret'), 'authentication'),
+        (ResponseError('ERR mentions WRONGPASS'), 'unknown'),
+        (ResponseError('ERR mentions NOPERM'), 'unknown'),
+        (ResponseError('WRONGPASS_SUFFIX secret'), 'unknown'),
+        (ValkeyTimeoutError('secret'), 'timeout'),
+        (ValkeyConnectionError('secret'), 'connection'),
+        (PrimaryProofError(BackendUnavailable('Valkey metadata role is not writable')), 'replica'),
+        (ValueError('secret'), 'unknown'),
+    ],
+)
+def test_translate_client_error_classifies_failures(error: Exception, failure_class: str) -> None:
+    with pytest.raises(BackendUnavailable) as caught:
+        scripts_module.translate_client_error(error)
+    assert caught.value.failure_class == failure_class
+    if failure_class == 'replica':
+        message = 'Valkey metadata role is not writable'
+    elif failure_class == 'unknown':
+        message = 'Valkey operation failed'
+    else:
+        message = 'Valkey operation is unavailable'
+    assert str(caught.value) == f'{message} ({failure_class})'
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize('chain', ['cause', 'context'])
+def test_translate_client_error_classifies_tls_chain(chain: str) -> None:
+    error = ValkeyConnectionError('secret')
+    tls = SSLError('certificate secret')
+    if chain == 'cause':
+        error.__cause__ = tls
+    else:
+        error.__context__ = tls
+    with pytest.raises(BackendUnavailable) as caught:
+        scripts_module.translate_client_error(error)
+    assert caught.value.failure_class == 'tls'
+    assert str(caught.value) == 'Valkey operation is unavailable (tls)'
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

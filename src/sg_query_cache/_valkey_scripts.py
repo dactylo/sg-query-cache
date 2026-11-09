@@ -3,26 +3,32 @@
 from collections.abc import Callable
 from hashlib import sha1
 from math import floor
+from ssl import SSLError
 from typing import Never, Protocol, TypeVar
 
 from valkey.exceptions import (
-    ConnectionError as ValkeyConnectionError,
-)
-from valkey.exceptions import (
+    AuthenticationError,
+    AuthenticationWrongNumberOfArgsError,
+    AuthorizationError,
     DataError,
+    NoPermissionError,
     NoScriptError,
     OutOfMemoryError,
     ResponseError,
+)
+from valkey.exceptions import (
+    ConnectionError as ValkeyConnectionError,
 )
 from valkey.exceptions import (
     TimeoutError as ValkeyTimeoutError,
 )
 
 from sg_query_cache._backend import (
+    BACKEND_ERRORS,
     BackendCapacity,
     BackendProtocolError,
     BackendUnavailable,
-    StaleIncarnation,
+    FailureClass,
 )
 from sg_query_cache._config import VALKEY_MAX_DEPENDENCY_TAGS_V1
 from sg_query_cache._model import FillLease
@@ -298,11 +304,19 @@ class ScriptClient(Protocol):
     """Execute and load synchronous Valkey scripts."""
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: ScriptArgument) -> object:
-        """Execute one cached script by digest."""
+        """Execute a cached script for a backend metadata or result operation.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.evalsha`.
+        """
         ...
 
     def script_load(self, script: bytes | str) -> object:
-        """Load one script and return its server digest."""
+        """Load a backend script for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.script_load`.
+        """
         ...
 
 
@@ -310,8 +324,88 @@ class ResultClient(Protocol):
     """Run result work on one prepared pin through role settlement."""
 
     def run_operation(self, operation: Callable[[ScriptClient], _T]) -> _T:
-        """Execute result work within one observed physical-connection span."""
+        """Run result work within one verified physical-connection span.
+
+        Borrowing uses `valkey.Valkey.client`; discovery uses
+        `valkey.sentinel.SentinelConnectionPool.get_master_address`. Those
+        methods own their upstream contracts. Callback command contracts belong
+        to the corresponding `valkey.Valkey` methods.
+
+        Callback failures propagate after successful settlement; settlement
+        failures take precedence.
+
+        Args:
+            operation: Callback receiving a pinned client valid only for this
+                call. It may issue multiple commands.
+
+        Returns:
+            The callback result after endpoint and connection state settle
+            unchanged.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            Exception: The callback fails and role settlement succeeds.
+        """
         ...
+
+
+def _has_tls_failure(error: BaseException) -> bool:
+    """Inspect cause and context links without looping on cyclic exception chains."""
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, SSLError):
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
+def client_failure_class(error: Exception | None) -> FailureClass | None:
+    """Classify a client failure without retaining client messages or objects.
+
+    Already normalized failures retain their class. `None` and non-availability
+    backend errors carry no client availability classification.
+    """
+    if isinstance(error, BackendUnavailable):
+        return error.failure_class
+    if error is None or isinstance(error, BACKEND_ERRORS):
+        return None
+    if isinstance(error, PrimaryProofError):
+        return 'replica' if isinstance(error.failure, BackendUnavailable) else None
+    if isinstance(
+        error,
+        (
+            AuthenticationError,
+            AuthenticationWrongNumberOfArgsError,
+            AuthorizationError,
+            NoPermissionError,
+        ),
+    ) or (
+        isinstance(error, ResponseError)
+        and str(error).split(maxsplit=1)[:1] in (['WRONGPASS'], ['NOAUTH'], ['NOPERM'])
+    ):
+        failure_class: FailureClass = 'authentication'
+    elif isinstance(error, ValkeyConnectionError) and _has_tls_failure(error):
+        failure_class = 'tls'
+    elif isinstance(error, ValkeyTimeoutError):
+        failure_class = 'timeout'
+    elif isinstance(error, ValkeyConnectionError):
+        failure_class = 'connection'
+    else:
+        failure_class = 'unknown'
+    return failure_class
 
 
 def translate_client_error(error: Exception) -> Never:
@@ -324,19 +418,32 @@ def translate_client_error(error: Exception) -> Never:
         BackendUnavailable: Proof finds a replica or any other client failure
             occurs.
     """
-    if isinstance(error, PrimaryProofError):
-        raise type(error.failure)(*error.failure.args) from None
-    if isinstance(error, (ValkeyConnectionError, ValkeyTimeoutError)):
-        raise BackendUnavailable('Valkey operation is unavailable') from None
-    if isinstance(error, DataError):
-        raise BackendProtocolError('Valkey rejected a backend command') from None
-    if isinstance(error, OutOfMemoryError) or (
+    failure: BackendCapacity | BackendProtocolError | BackendUnavailable
+    if isinstance(error, PrimaryProofError) and isinstance(error.failure, BackendProtocolError):
+        failure = BackendProtocolError(*error.failure.args)
+    elif isinstance(error, DataError):
+        failure = BackendProtocolError('Valkey rejected a backend command')
+    elif isinstance(error, OutOfMemoryError) or (
         isinstance(error, ResponseError) and str(error).startswith('OOM ')
     ):
-        raise BackendCapacity('Valkey capacity rejected the operation') from None
-    if isinstance(error, ResponseError):
-        raise BackendUnavailable('Valkey operation failed') from None
-    raise BackendUnavailable('Valkey operation failed') from None
+        failure = BackendCapacity('Valkey capacity rejected the operation')
+    else:
+        failure_class = client_failure_class(error)
+        if failure_class == 'replica':
+            message = 'Valkey metadata role is not writable'
+        elif failure_class == 'unknown':
+            message = 'Valkey operation failed'
+        else:
+            message = 'Valkey operation is unavailable'
+        failure = BackendUnavailable(message, failure_class=failure_class)
+    del error
+    try:
+        raise failure from None
+    except BACKEND_ERRORS:
+        # A caller may still be unwinding a different raw client error. Clear
+        # the context after raising; a fresh raise would attach it again.
+        failure.__context__ = None
+        raise
 
 
 def execute_commit(  # noqa: PLR0913 - explicit commit deadline inputs
@@ -396,7 +503,7 @@ def execute_commit(  # noqa: PLR0913 - explicit commit deadline inputs
     failure: Exception | None = None
     try:
         return client.run_operation(operation)
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error
@@ -434,7 +541,7 @@ def execute_script(
         return client.evalsha(sha, len(keys), *keys, *args)
     except NoScriptError:
         pass
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error
@@ -447,7 +554,7 @@ def execute_script(
         return client.evalsha(sha, len(keys), *keys, *args)
     except NoScriptError:
         raise BackendUnavailable('Valkey script cache remained unavailable') from None
-    except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+    except BACKEND_ERRORS:
         raise
     except Exception as error:  # noqa: BLE001 - closed external-client boundary
         failure = error

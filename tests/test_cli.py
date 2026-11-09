@@ -1,7 +1,10 @@
 import argparse
+import importlib.machinery
 import importlib.metadata
+import importlib.util
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -22,28 +25,27 @@ from tests._cli_helpers import invoke_cli
 
 _T = TypeVar('_T')
 
-_VALID_COMMAND_ARGUMENTS = ['daemon-plugin-path']
-
 _METADATA_CREDENTIAL = 'metadata-credential'
 _PREFIX = 'metadata-prefix'
 _RESULT_CREDENTIAL = 'result-credential'
 _SITE = 'studio'
 _SITE_DIGEST = 'da0daaba4b156961c049ab4b85b6d0bcba2872200b7dedb4aa77f9208c601444'
+_VALID_COMMAND_ARGUMENTS = ['daemon-plugin-path']
 
 
 class _FakeMetadataStore:
-    _created_with: tuple[CacheSettings, dict[str, str], object] | None = None
+    created_with: tuple[CacheSettings, dict[str, str], object] | None = None
 
     def __init__(self) -> None:
-        self._rotations = 0
-        self._closed = False
-        self._flushed: tuple[str, str] | None = None
+        self.rotations = 0
+        self.closed = False
+        self.flushed: tuple[str, str] | None = None
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def flush_site(self, site_namespace: str, reason: str) -> None:
-        self._flushed = (site_namespace, reason)
+        self.flushed = (site_namespace, reason)
 
     @classmethod
     def from_settings(
@@ -52,11 +54,11 @@ class _FakeMetadataStore:
         environ: Mapping[str, str],
         metrics: object,
     ) -> '_FakeMetadataStore':
-        cls._created_with = settings, dict(environ), metrics
+        cls.created_with = settings, dict(environ), metrics
         return cls()
 
     def rotate_incarnation(self) -> None:
-        self._rotations += 1
+        self.rotations += 1
 
 
 def _fail_on_io(*_args: object, **_kwargs: object) -> None:
@@ -127,7 +129,8 @@ def _settings() -> CacheSettings:
         key_prefix=_PREFIX,
     )
     return CacheSettings(
-        l2=L2Settings(enabled=True, valkey=ValkeySettings(result=result, metadata=metadata))
+        site_namespace=_SITE,
+        l2=L2Settings(enabled=True, valkey=ValkeySettings(result=result, metadata=metadata)),
     )
 
 
@@ -221,10 +224,35 @@ def test_flush_acknowledges_opaque_site_digest_and_closes_store(
     assert status == 0
     assert stdout == f'flush acknowledged site={_SITE_DIGEST}\n'
     assert stderr == ''
-    assert store._flushed == (_SITE, 'operator')
-    assert store._closed
+    assert store.flushed == (_SITE, 'operator')
+    assert store.closed
     assert _SITE not in stdout
     assert _METADATA_CREDENTIAL not in stdout
+
+
+def test_flush_defaults_to_configured_site(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
+    implicit_store = _FakeMetadataStore()
+    monkeypatch.setattr(_cli, '_open_store', _return_store(implicit_store))
+
+    implicit_status = _cli.main(('flush', '--config', 'cache.toml', '--reason', 'operator'))
+    implicit_output = capsys.readouterr()
+
+    explicit_store = _FakeMetadataStore()
+    monkeypatch.setattr(_cli, '_open_store', _return_store(explicit_store))
+    explicit_status = _cli.main(
+        ('flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator')
+    )
+    explicit_output = capsys.readouterr()
+
+    assert implicit_status == explicit_status == 0
+    assert implicit_output == explicit_output == (f'flush acknowledged site={_SITE_DIGEST}\n', '')
+    assert implicit_store.flushed == explicit_store.flushed == (_SITE, 'operator')
+    assert implicit_store.closed
+    assert explicit_store.closed
 
 
 def test_flush_rejects_an_invalid_reason_as_a_usage_error() -> None:
@@ -245,6 +273,27 @@ def test_flush_rejects_an_invalid_site_as_a_usage_error() -> None:
     assert stderr.endswith(
         'sg-query-cache flush: error: argument --site: must be nonempty ASCII without '
         'leading or trailing spaces\n'
+    )
+
+
+def test_flush_rejects_site_that_differs_from_configuration(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def load_other_settings(_path: str) -> CacheSettings:
+        return replace(_settings(), site_namespace='other')
+
+    monkeypatch.setattr(_cli, '_load_settings', load_other_settings)
+    monkeypatch.setattr(_cli, '_open_store', _fail_on_io)
+
+    status = _cli.main(
+        ('flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator')
+    )
+
+    assert status == 2
+    assert capsys.readouterr() == (
+        '',
+        'error: --site does not match the configured site namespace\n',
     )
 
 
@@ -328,7 +377,7 @@ def test_normal_runs_do_not_read_metadata(monkeypatch: pytest.MonkeyPatch) -> No
 def test_open_store_uses_only_metadata_role_and_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _FakeMetadataStore._created_with = None
+    _FakeMetadataStore.created_with = None
     monkeypatch.setattr(
         _cli,
         'import_module',
@@ -341,16 +390,16 @@ def test_open_store_uses_only_metadata_role_and_secret(
     store = _cli._open_store(settings)
 
     assert isinstance(store, _FakeMetadataStore)
-    assert _FakeMetadataStore._created_with is not None
-    assert _FakeMetadataStore._created_with[:2] == (
+    assert _FakeMetadataStore.created_with is not None
+    assert _FakeMetadataStore.created_with[:2] == (
         settings,
         {'METADATA_PASSWORD': _METADATA_CREDENTIAL},
     )
-    assert isinstance(_FakeMetadataStore._created_with[2], NullMetrics)
-    created_settings = _FakeMetadataStore._created_with[0]
+    assert isinstance(_FakeMetadataStore.created_with[2], NullMetrics)
+    created_settings = _FakeMetadataStore.created_with[0]
     assert created_settings.l2.valkey.metadata.host == 'metadata.internal'
     assert created_settings.l2.valkey.result.host == 'result.internal'
-    assert _RESULT_CREDENTIAL not in _FakeMetadataStore._created_with[1].values()
+    assert _RESULT_CREDENTIAL not in _FakeMetadataStore.created_with[1].values()
 
 
 @pytest.mark.parametrize(
@@ -376,6 +425,43 @@ def test_parser_errors_exit_two_without_io(
     assert raised.value.code == 2
 
 
+@pytest.mark.parametrize(
+    ('operation', 'arguments', 'message'),
+    [
+        (
+            'flush_site',
+            ('flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'),
+            'error: flush operation was not acknowledged\n',
+        ),
+        (
+            'rotate_incarnation',
+            ('rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX),
+            'error: incarnation rotation was not acknowledged\n',
+        ),
+    ],
+)
+def test_owned_operation_failure_is_redacted_and_closes_store(
+    operation: str,
+    arguments: Sequence[str],
+    message: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _FakeMetadataStore()
+
+    def fail_operation(*_args: object) -> None:
+        raise BackendUnavailable(_METADATA_CREDENTIAL)
+
+    monkeypatch.setattr(store, operation, fail_operation)
+    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
+    monkeypatch.setattr(_cli, '_open_store', _return_store(store))
+    assert _cli.main(arguments) == 1
+    stdout, stderr = capsys.readouterr()
+    assert stdout == ''
+    assert stderr == message
+    assert store.closed
+
+
 def test_rotation_calls_owned_operation_once_and_closes_store(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -392,31 +478,9 @@ def test_rotation_calls_owned_operation_once_and_closes_store(
     assert status == 0
     assert stdout == 'incarnation rotation acknowledged for all sites\n'
     assert stderr == ''
-    assert store._rotations == 1
-    assert store._closed
+    assert store.rotations == 1
+    assert store.closed
     assert _PREFIX not in stdout
-
-
-def test_rotation_redacts_owned_operation_failure_and_closes_store(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _FakeMetadataStore()
-
-    def fail_rotation() -> None:
-        raise BackendUnavailable(_METADATA_CREDENTIAL)
-
-    monkeypatch.setattr(store, 'rotate_incarnation', fail_rotation)
-    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
-    monkeypatch.setattr(_cli, '_open_store', _return_store(store))
-    assert (
-        _cli.main(('rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX))
-        == 1
-    )
-    stdout, stderr = capsys.readouterr()
-    assert stdout == ''
-    assert stderr == 'error: incarnation rotation was not acknowledged\n'
-    assert store._closed
 
 
 def test_rotation_requires_exact_prefix_before_opening_store(
@@ -470,14 +534,28 @@ def test_store_construction_runtime_failure_is_redacted_operational_status(
 
 
 @pytest.mark.parametrize(
-    'error',
+    ('error', 'message'),
     [
         pytest.param(
-            ModuleNotFoundError(f"No module named 'valkey' {_METADATA_CREDENTIAL}", name='valkey'),
-            id='missing-valkey-extra',
+            KeyError(f'unrelated setting: {_METADATA_CREDENTIAL}'),
+            'the Valkey store could not be set up',
+            id='unrelated-key-error',
         ),
-        pytest.param(ValueError(_METADATA_CREDENTIAL), id='missing-password-or-disabled-l2'),
-        pytest.param(KeyError(_METADATA_CREDENTIAL), id='missing-setting'),
+        pytest.param(
+            OSError(_METADATA_CREDENTIAL),
+            'the Valkey store could not be set up',
+            id='store-os-error',
+        ),
+        pytest.param(
+            TypeError(_METADATA_CREDENTIAL),
+            'the Valkey settings are invalid',
+            id='store-type-error',
+        ),
+        pytest.param(
+            ValueError(_METADATA_CREDENTIAL),
+            'the Valkey settings are invalid',
+            id='store-value-error',
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -493,15 +571,249 @@ def test_store_construction_runtime_failure_is_redacted_operational_status(
         ),
     ],
 )
-def test_store_setup_failure_is_a_redacted_configuration_error(
+def test_store_setup_failure_names_cause_without_values(
     arguments: list[str],
     error: Exception,
+    message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
     monkeypatch.setattr(_cli, '_open_store', _open_store_raising(error))
+    monkeypatch.setenv('METADATA_PASSWORD', _METADATA_CREDENTIAL)
 
-    assert invoke_cli(arguments) == (2, '', 'error: configuration is invalid or unavailable\n')
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (2, '', f'error: {message}\n')
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
+
+
+@pytest.mark.parametrize(
+    ('valkey_spec', 'message'),
+    [
+        pytest.param(
+            None,
+            "the valkey extra is not installed: pip install 'sg-query-cache[valkey]'",
+            id='missing-extra',
+        ),
+        pytest.param(
+            importlib.machinery.ModuleSpec('valkey', loader=None),
+            'the Valkey store could not be set up',
+            id='installed-extra',
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param(
+            ['flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'],
+            id='flush',
+        ),
+        pytest.param(
+            ['rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX],
+            id='rotate-incarnation',
+        ),
+    ],
+)
+def test_store_import_error_distinguishes_missing_extra_from_setup_failure(
+    arguments: list[str],
+    valkey_spec: importlib.machinery.ModuleSpec | None,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fixed_spec(_name: str) -> importlib.machinery.ModuleSpec | None:
+        return valkey_spec
+
+    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
+    monkeypatch.setattr(
+        _cli, '_open_store', _open_store_raising(ImportError(_METADATA_CREDENTIAL))
+    )
+    monkeypatch.setattr(importlib.util, 'find_spec', fixed_spec)
+
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (2, '', f'error: {message}\n')
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
+
+
+@pytest.mark.parametrize(
+    ('error', 'message'),
+    [
+        pytest.param(
+            TypeError(_METADATA_CREDENTIAL),
+            'the settings file is invalid',
+            id='type-error',
+        ),
+        pytest.param(
+            ValueError(_METADATA_CREDENTIAL),
+            'the settings file is invalid',
+            id='value-error',
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param(
+            ['flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'],
+            id='flush',
+        ),
+        pytest.param(
+            ['rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX],
+            id='rotate-incarnation',
+        ),
+    ],
+)
+def test_invalid_settings_file_names_cause_without_values(
+    arguments: list[str],
+    error: Exception,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_loading(_path: str) -> CacheSettings:
+        raise error
+
+    monkeypatch.setattr(_cli, '_load_settings', fail_loading)
+    monkeypatch.setattr(_cli, '_open_store', _fail_on_io)
+
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (2, '', f'error: {message}\n')
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
+
+
+@pytest.mark.parametrize(
+    'command',
+    [
+        pytest.param(['flush', '--site', _SITE, '--reason', 'operator'], id='flush'),
+        pytest.param(['rotate-incarnation', '--confirm-prefix', _PREFIX], id='rotate-incarnation'),
+    ],
+)
+def test_oversized_settings_number_is_a_redacted_setup_error(
+    command: list[str], tmp_path: Path
+) -> None:
+    oversized_number = '9' * 400
+    path = tmp_path / 'cache.toml'
+    path.write_text(
+        f'schema_version = 1\n[cache.l1]\nhierarchical_max_age_seconds = {oversized_number}\n',
+        encoding='utf-8',
+    )
+
+    status, stdout, stderr = invoke_cli([*command, '--config', str(path)])
+
+    assert (status, stdout, stderr) == (2, '', 'error: the settings file is invalid\n')
+    assert oversized_number not in stderr
+    assert 'Traceback' not in stderr
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param(
+            ['flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'],
+            id='flush',
+        ),
+        pytest.param(
+            ['rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX],
+            id='rotate-incarnation',
+        ),
+    ],
+)
+def test_disabled_l2_names_cause_before_opening_store(
+    arguments: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def load_disabled_settings(_path: str) -> CacheSettings:
+        settings = _settings()
+        return replace(settings, l2=replace(settings.l2, enabled=False))
+
+    monkeypatch.setattr(_cli, '_load_settings', load_disabled_settings)
+    monkeypatch.setattr(_cli, '_open_store', _fail_on_io)
+
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (
+        2,
+        '',
+        'error: the settings do not enable the shared L2 cache\n',
+    )
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param(
+            ['flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'],
+            id='flush',
+        ),
+        pytest.param(
+            ['rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX],
+            id='rotate-incarnation',
+        ),
+    ],
+)
+def test_missing_metadata_password_names_variable_before_store_construction(
+    arguments: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
+    monkeypatch.setattr(_cli, 'import_module', _fake_valkey_import)
+    monkeypatch.setattr(_FakeMetadataStore, 'from_settings', _fail_on_io)
+    monkeypatch.delenv('METADATA_PASSWORD', raising=False)
+
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (
+        2,
+        '',
+        'error: environment variable METADATA_PASSWORD is not set\n',
+    )
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        pytest.param(
+            ['flush', '--config', 'cache.toml', '--site', _SITE, '--reason', 'operator'],
+            id='flush',
+        ),
+        pytest.param(
+            ['rotate-incarnation', '--config', 'cache.toml', '--confirm-prefix', _PREFIX],
+            id='rotate-incarnation',
+        ),
+    ],
+)
+def test_missing_valkey_extra_precedes_missing_metadata_password(
+    arguments: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_import(_name: str) -> ModuleType:
+        raise ModuleNotFoundError(_METADATA_CREDENTIAL, name='valkey')
+
+    def missing_spec(_name: str) -> None:
+        return None
+
+    monkeypatch.setattr(_cli, '_load_settings', _load_test_settings)
+    monkeypatch.setattr(_cli, 'import_module', fail_import)
+    monkeypatch.setattr(importlib.util, 'find_spec', missing_spec)
+    monkeypatch.delenv('METADATA_PASSWORD', raising=False)
+
+    status, stdout, stderr = invoke_cli(arguments)
+    assert (status, stdout, stderr) == (
+        2,
+        '',
+        "error: the valkey extra is not installed: pip install 'sg-query-cache[valkey]'\n",
+    )
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
 
 
 def test_unavailable_stdout_is_an_error(capsys: pytest.CaptureFixture[str]) -> None:
@@ -529,7 +841,10 @@ def test_unreadable_configuration_is_a_redacted_setup_error(
     status, stdout, stderr = invoke_cli([*command, '--config', str(missing)])
 
     assert (status, stdout) == (2, '')
-    assert stderr == 'error: configuration is invalid or unavailable\n'
+    assert stderr == 'error: cannot read the settings file\n'
+    assert _METADATA_CREDENTIAL not in stderr
+    assert _PREFIX not in stderr
+    assert _SITE not in stderr
 
 
 def test_version_ignores_other_valid_arguments(monkeypatch: pytest.MonkeyPatch) -> None:

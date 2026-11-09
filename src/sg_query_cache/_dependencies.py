@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Parse SG schema facts and derive conservative pre-fetch dependencies."""
 
 import json
@@ -24,10 +21,15 @@ from sg_query_cache._policy import (
     classify_query,
     is_known_field_type,
 )
-from sg_query_cache._query import ORDER_ITEM_KEYS, argument, filter_group, pair_mapping
+from sg_query_cache._query import (
+    ORDER_ITEM_KEYS,
+    argument,
+    filter_group,
+    pair_mapping,
+    simple_condition,
+)
 from sg_query_cache._validation import require_bool
 
-_CONDITION_LENGTH = 3
 _LINK_TYPES = frozenset({'addressing', 'entity', 'multi_entity', 'tag_list'})
 _MAX_COMPACT_BYTES = 16 * 1024 * 1024
 _NAME_OPERATORS = frozenset(
@@ -59,22 +61,30 @@ class _DependencyLimits(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class _EventTags:
+    """Carry derived event tags with any broadening steps derivation already applied."""
+
+    tags: tuple[DependencyTag, ...]
+    steps: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class _PathHop:
     """Describe one schema-proven traversal hop."""
 
-    _source_type: str
-    _field_name: str
-    _target_type: str
+    source_type: str
+    field_name: str
+    target_type: str
 
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedPath:
     """Hold every traversal hop and the final field fact."""
 
-    _final_field: FieldSchema
-    _final_field_name: str
-    _final_type: str
-    _hops: tuple[_PathHop, ...]
+    final_field: FieldSchema
+    final_field_name: str
+    final_type: str
+    hops: tuple[_PathHop, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,33 +113,6 @@ class SchemaView:
         """Look up one direct field without exposing mutable schema mappings."""
         fields = self._field_index.get(entity_type)
         return None if fields is None else fields.get(field_name)
-
-    def _resolve_path(self, entity_type: str, field_path: str) -> _ResolvedPath | None:
-        """Resolve alternating field and target-type segments conservatively."""
-        if not field_path:
-            return None
-        parts = field_path.split('.')
-        if len(parts) % 2 == 0:
-            return None
-        current_type = entity_type
-        hops: list[_PathHop] = []
-        for index in range(0, len(parts) - 1, 2):
-            field_name = parts[index]
-            target_type = parts[index + 1]
-            field = self._field(current_type, field_name)
-            if (
-                field is None
-                or field.data_type not in _LINK_TYPES
-                or target_type not in field.valid_types
-            ):
-                return None
-            hops.append(_PathHop(current_type, field_name, target_type))
-            current_type = target_type
-        final_field_name = parts[-1]
-        final_field = self._field(current_type, final_field_name)
-        if final_field is None:
-            return None
-        return _ResolvedPath(final_field, final_field_name, current_type, tuple(hops))
 
     @classmethod
     def from_api_response(cls, value: object) -> Self:
@@ -169,6 +152,43 @@ class SchemaView:
         """
         return cls(_compact_entities(_compact_document(data)))
 
+    def resolve_path(self, entity_type: str, field_path: str) -> _ResolvedPath | None:
+        """Resolve alternating field and target-type segments conservatively.
+
+        Args:
+            entity_type: Entity type at the start of the path.
+            field_path: Dot-separated field and target-type segments ending in
+                a field.
+
+        Returns:
+            The final field and ordered link hops, or `None` for an unknown
+            field, unsupported link, or malformed path.
+        """
+        if not field_path:
+            return None
+        parts = field_path.split('.')
+        if len(parts) % 2 == 0:
+            return None
+        current_type = entity_type
+        hops: list[_PathHop] = []
+        for index in range(0, len(parts) - 1, 2):
+            field_name = parts[index]
+            target_type = parts[index + 1]
+            field = self._field(current_type, field_name)
+            if (
+                field is None
+                or field.data_type not in _LINK_TYPES
+                or target_type not in field.valid_types
+            ):
+                return None
+            hops.append(_PathHop(current_type, field_name, target_type))
+            current_type = target_type
+        final_field_name = parts[-1]
+        final_field = self._field(current_type, final_field_name)
+        if final_field is None:
+            return None
+        return _ResolvedPath(final_field, final_field_name, current_type, tuple(hops))
+
     def resolve_field(self, entity_type: str, field_path: str) -> FieldSchema | None:
         """Resolve a final field only when every dotted traversal hop is known.
 
@@ -179,10 +199,10 @@ class SchemaView:
         Returns:
             The final field schema, or `None` when any fact is unknown.
         """
-        resolved = self._resolve_path(entity_type, field_path)
+        resolved = self.resolve_path(entity_type, field_path)
         if resolved is None:
             return None
-        return resolved._final_field
+        return resolved.final_field
 
     def to_compact(self) -> bytes:
         """Serialize the view as one compact opaque byte value.
@@ -205,22 +225,18 @@ class DependencyAnalyzer:
     """Derive complete ordered dependencies before an SG fetch begins.
 
     Attributes:
-        allow_ttl_only: Permit safe universal-tag fallback for unanalyzable
-            calls.
         enable_additional_filter_presets: Permit configured TTL-only preset
             calls.
     """
 
-    allow_ttl_only: bool = True
     enable_additional_filter_presets: bool = False
 
     def __post_init__(self) -> None:
-        """Validate the explicit dependency fallback and preset flags.
+        """Validate the explicit additional-filter-preset flag.
 
         Raises:
-            TypeError: A policy flag is not a boolean.
+            TypeError: The flag is not a boolean.
         """
-        require_bool(self.allow_ttl_only, 'TTL-only fallback flag')
         require_bool(
             self.enable_additional_filter_presets,
             'additional-filter-preset flag',
@@ -228,18 +244,18 @@ class DependencyAnalyzer:
 
     def _bounded_event_plan(
         self,
-        tags: tuple[DependencyTag, ...],
+        derived: _EventTags,
         policy: QueryPolicy,
         identity: Identity,
         site_namespace: str,
         limits: _DependencyLimits,
     ) -> DependencyPlan:
         """Broaden complete dependency classes until both bounds are satisfied."""
-        limit_reason = _limit_reason(tags, limits)
+        current = derived.tags
+        limit_reason = _limit_reason(current, limits)
         if limit_reason is None:
-            return DependencyPlan('event_aware', tags, policy.reason)
-        steps = [f'limit:{limit_reason}']
-        current = tags
+            return DependencyPlan('event_aware', current, policy.reason, derived.steps)
+        steps = list(derived.steps) or [f'limit:{limit_reason}']
         transformations = (
             (TagKind.ENTITY, 'broaden:entity_to_type', _broaden_entities),
             (TagKind.TYPE_FIELD, 'broaden:field_to_type_value', _broaden_fields),
@@ -256,7 +272,7 @@ class DependencyAnalyzer:
                         tuple(steps),
                     )
         ttl_tags = universal_tags(identity, site_namespace, include_schema=False)
-        if self.allow_ttl_only and _limit_reason(ttl_tags, limits) is None:
+        if _limit_reason(ttl_tags, limits) is None:
             return DependencyPlan(
                 'ttl_only',
                 ttl_tags,
@@ -278,8 +294,6 @@ class DependencyAnalyzer:
         limits: _DependencyLimits,
     ) -> DependencyPlan:
         """Return universal TTL-only tags or a policy-preserving bypass."""
-        if not self.allow_ttl_only:
-            return DependencyPlan('bypass', (), reason)
         tags = universal_tags(identity, site_namespace, include_schema=False)
         limit_reason = _limit_reason(tags, limits)
         if limit_reason is not None:
@@ -325,11 +339,17 @@ class DependencyAnalyzer:
             if policy.reason in {'unknown_field', 'unknown_field_type'}:
                 return self._fallback(policy.reason, identity, site_namespace, limits)
             return DependencyPlan('bypass', (), policy.reason)
-        tags, failure = _derive_event_tags(call, identity, site_namespace, schema)
-        if failure is not None:
-            return self._fallback(failure, identity, site_namespace, limits)
+        derived = _derive_event_tags(
+            call,
+            identity,
+            site_namespace,
+            schema,
+            limits.max_dependency_tags,
+        )
+        if isinstance(derived, str):
+            return self._fallback(derived, identity, site_namespace, limits)
         return self._bounded_event_plan(
-            tags,
+            derived,
             policy,
             identity,
             site_namespace,
@@ -350,25 +370,25 @@ def _add_path_tags(
     field_path: str,
 ) -> _ResolvedPath | None:
     """Add traversal-hop and final-field dependencies in path order."""
-    resolved = schema._resolve_path(entity_type, field_path)
+    resolved = schema.resolve_path(entity_type, field_path)
     if resolved is None:
         return None
-    for hop in resolved._hops:
+    for hop in resolved.hops:
         _append_unique(
             tags,
-            DependencyTag.type_field(site_namespace, hop._source_type, hop._field_name),
+            DependencyTag.type_field(site_namespace, hop.source_type, hop.field_name),
         )
         _append_unique(
             tags,
-            DependencyTag.type_membership(site_namespace, hop._target_type),
+            DependencyTag.type_membership(site_namespace, hop.target_type),
         )
-    if resolved._final_field_name != 'id':
+    if resolved.final_field_name != 'id':
         _append_unique(
             tags,
             DependencyTag.type_field(
                 site_namespace,
-                resolved._final_type,
-                resolved._final_field_name,
+                resolved.final_type,
+                resolved.final_field_name,
             ),
         )
     return resolved
@@ -380,11 +400,15 @@ def _broaden_entities(
 ) -> tuple[DependencyTag, ...]:
     """Replace the complete exact-entity class with type-wide dependencies."""
     broadened: dict[DependencyTag, None] = {}
+    broadened_types: set[str] = set()
     for tag in tags:
         if tag.kind is not TagKind.ENTITY:
             _append_unique(broadened, tag)
             continue
         entity_type = cast('str', tag.components[1])
+        if entity_type in broadened_types:
+            continue
+        broadened_types.add(entity_type)
         _append_unique(
             broadened,
             DependencyTag.type_membership(site_namespace, entity_type),
@@ -410,11 +434,13 @@ def _broaden_fields(
 
 def _ids_from_condition(values: tuple[object, ...]) -> tuple[int, ...] | None:
     """Return finite IDs, no IDs for another field, or `None` for malformed IDs."""
-    if len(values) != _CONDITION_LENGTH:
+    simple = simple_condition(values)
+    if simple is None:
         return None
-    if values[0] != 'id' or values[1] not in ('is', 'in'):
+    field_name, operator, value = simple
+    if field_name != 'id' or operator not in ('is', 'in'):
         return ()
-    candidates = (values[2],) if values[1] == 'is' else values[2]
+    candidates = (value,) if operator == 'is' else value
     if not isinstance(candidates, tuple):
         return None
     entity_ids: list[int] = []
@@ -521,7 +547,9 @@ def _add_order_tags(
         resolved = _add_path_tags(tags, site_namespace, schema, entity_type, field_path)
         if resolved is None:
             return 'unknown_field'
-        if not is_known_field_type(resolved._final_field.data_type):
+        if resolved.final_field.data_type in {'summary', 'calculated'}:
+            return 'uncertain_field_dependencies'
+        if not is_known_field_type(resolved.final_field.data_type):
             return 'unknown_field_type'
     return None
 
@@ -712,12 +740,14 @@ def _add_returned_tags(
         resolved = _add_path_tags(tags, site_namespace, schema, entity_type, field_path)
         if resolved is None:
             return 'unknown_field'
-        if not is_known_field_type(resolved._final_field.data_type):
+        if resolved.final_field.data_type in {'summary', 'calculated'}:
+            return 'uncertain_field_dependencies'
+        if not is_known_field_type(resolved.final_field.data_type):
             return 'unknown_field_type'
-        if resolved._final_field.data_type in _LINK_TYPES and not _add_link_targets(
+        if resolved.final_field.data_type in _LINK_TYPES and not _add_link_targets(
             tags,
             site_namespace,
-            resolved._final_field,
+            resolved.final_field,
             include_values=True,
         ):
             return 'unknown_link_targets'
@@ -746,7 +776,7 @@ def _add_direct_link_filter_tags(
     value: object,
 ) -> str | None:
     """Add target existence and value refinements for one direct linked-field filter."""
-    field = resolved._final_field
+    field = resolved.final_field
     if operator in _NAME_OPERATORS:
         added = _add_link_targets(tags, site_namespace, field, include_values=True)
     elif operator == 'type_is':
@@ -784,22 +814,24 @@ def _top_level_conditions(call: ExactCall) -> tuple[object, ...] | None:
 
 def _walk_conditions(
     conditions: tuple[object, ...],
-) -> tuple[tuple[str, str, object], ...]:
-    """Flatten nested conditions in caller order after policy validation."""
+) -> tuple[tuple[str, str, object], ...] | None:
+    """Flatten nested conditions in caller order, or `None` for any unrecognized shape."""
     flattened: list[tuple[str, str, object]] = []
     for condition in conditions:
         if not isinstance(condition, tuple):
-            continue
+            return None
         values = cast('tuple[object, ...]', condition)
-        _is_group, group = filter_group(values)
+        group = filter_group(values)[1]
         if group is not None:
-            flattened.extend(_walk_conditions(group))
-        elif (
-            len(values) == _CONDITION_LENGTH
-            and isinstance(values[0], str)
-            and isinstance(values[1], str)
-        ):
-            flattened.append((values[0], values[1], values[2]))
+            nested = _walk_conditions(group)
+            if nested is None:
+                return None
+            flattened.extend(nested)
+            continue
+        simple = simple_condition(values)
+        if simple is None:
+            return None
+        flattened.append(simple)
     return tuple(flattened)
 
 
@@ -811,13 +843,16 @@ def _add_filter_tags(
     conditions: tuple[object, ...],
 ) -> str | None:
     """Add filter dependencies in caller order or report one uncertainty."""
-    for field_path, operator, value in _walk_conditions(conditions):
+    walked = _walk_conditions(conditions)
+    if walked is None:
+        return 'malformed_filters'
+    for field_path, operator, value in walked:
         if field_path == 'id':
             continue
         resolved = _add_path_tags(tags, site_namespace, schema, entity_type, field_path)
         if resolved is None:
             return 'unknown_field'
-        if resolved._final_field.data_type in _LINK_TYPES:
+        if resolved.final_field.data_type in _LINK_TYPES:
             failure = _add_direct_link_filter_tags(
                 tags,
                 site_namespace,
@@ -860,18 +895,26 @@ def _derive_event_tags(
     identity: Identity,
     site_namespace: str,
     schema: SchemaView,
-) -> tuple[tuple[DependencyTag, ...], str | None]:
+    max_dependency_tags: int,
+) -> _EventTags | str:
     """Derive a complete narrow tag sequence or one conservative failure reason."""
     entity_type = argument(call, 'entity_type')
     if not isinstance(entity_type, str) or not entity_type:
-        return (), 'missing_entity_type'
+        return 'missing_entity_type'
     conditions = _top_level_conditions(call)
     if conditions is None:
-        return (), 'malformed_filters'
+        return 'malformed_filters'
     finite_ids = _finite_entity_ids(call, conditions)
     tags = dict.fromkeys(universal_tags(identity, site_namespace, include_schema=True))
+    steps: tuple[str, ...] = ()
     if finite_ids is None:
         _append_unique(tags, DependencyTag.type_membership(site_namespace, entity_type))
+    elif len(finite_ids) > max_dependency_tags:
+        # Entity broadening is certain, so emit its type-wide tags at the same position
+        # instead of building one validated entity tag per ID only to discard it.
+        _append_unique(tags, DependencyTag.type_membership(site_namespace, entity_type))
+        _append_unique(tags, DependencyTag.type_value(site_namespace, entity_type))
+        steps = ('limit:max_dependency_tags', 'broaden:entity_to_type')
     else:
         for entity_id in finite_ids:
             _append_unique(tags, DependencyTag.entity(site_namespace, entity_type, entity_id))
@@ -881,8 +924,8 @@ def _derive_event_tags(
     if failure is None:
         failure = _add_order_tags(tags, call, site_namespace, schema, entity_type)
     if failure is not None:
-        return (), failure
+        return failure
     if argument(call, 'include_archived_projects') is False:
         _append_unique(tags, DependencyTag.type_membership(site_namespace, 'Project'))
         _append_unique(tags, DependencyTag.type_value(site_namespace, 'Project'))
-    return tuple(tags), None
+    return _EventTags(tuple(tags), steps)

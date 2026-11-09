@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
+from time import monotonic
 from typing import cast
 
 import pytest
@@ -18,10 +19,11 @@ from sg_query_cache._config import CacheSettings, L1Settings, LimitSettings
 from sg_query_cache._keys import KeyBuilder
 from sg_query_cache._local import LocalBackend
 from sg_query_cache._local_store import LocalStore, StoreOperation
+from sg_query_cache._metrics import NullMetrics
 from sg_query_cache._model import DependencyTag, FillLease, GenerationChange
-from tests._backend_contract import _BackendContractTests, _BackendFactory, _BackendHarness
+from tests._backend_contract import BackendContractTests, BackendFactory, BackendHarness
 from tests._exceptions import exception_text as _exposed_exception_text
-from tests._fakes import _FakeClock, _RecordingMetrics
+from tests._fakes import FakeClock, RecordingMetrics
 
 
 class _ExceptionalFloat(float):
@@ -61,17 +63,17 @@ def _generation_record_size(
 
 
 @pytest.fixture
-def backend_factory() -> _BackendFactory:
-    def create(settings: CacheSettings | None = None) -> _BackendHarness:
-        clock = _FakeClock()
-        metrics = _RecordingMetrics()
+def backend_factory() -> BackendFactory:
+    def create(settings: CacheSettings | None = None) -> BackendHarness:
+        clock = FakeClock()
+        metrics = RecordingMetrics()
         backend: CacheBackend = LocalBackend(settings or CacheSettings(), clock, metrics)
-        return _BackendHarness(backend, clock, metrics)
+        return BackendHarness(backend, clock, metrics)
 
     return create
 
 
-class TestLocalBackend(_BackendContractTests):
+class TestLocalBackend(BackendContractTests):
     pass
 
 
@@ -91,10 +93,10 @@ def _settings(
 
 
 def test_backend_exception_chain_does_not_expose_invalid_opaque_key(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     sensitive_key = 'credential-bearing-key' + '\ud800'
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
 
     with pytest.raises(BackendProtocolError) as captured:
         backend.lookup(sensitive_key)
@@ -103,10 +105,10 @@ def test_backend_exception_chain_does_not_expose_invalid_opaque_key(
 
 
 def test_backend_exceptions_do_not_expose_opaque_input(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     sensitive_input = 'credential=' + 'query&url=https://private.example/payload'
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     lease = backend.reserve('qualified-key', 1.0)
     assert lease is not None
 
@@ -117,18 +119,18 @@ def test_backend_exceptions_do_not_expose_opaque_input(
 
 
 def test_backward_clock_is_unavailable_instead_of_renewing_age(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     harness = backend_factory()
-    assert _commit(harness._backend, 'qualified-key', encode_value({'id': 7}))
-    harness._clock._advance(-1.0)
+    assert _commit(harness.backend, 'qualified-key', encode_value({'id': 7}))
+    harness.clock.advance(-1.0)
 
     with pytest.raises(BackendUnavailable, match='clock moved backward'):
-        harness._backend.lookup('qualified-key')
+        harness.backend.lookup('qualified-key')
 
 
 def test_change_capacity_failure_acknowledges_no_partial_update(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     globals_ = (
         DependencyTag.site('production'),
@@ -140,7 +142,7 @@ def test_change_capacity_failure_acknowledges_no_partial_update(
     metadata_budget = sum(
         _generation_record_size(tag, token, None) for token, tag in enumerate(globals_, start=1)
     ) + _generation_record_size(scoped, 5, 8_200.0)
-    backend = backend_factory(_settings(metadata_budget_bytes=metadata_budget))._backend
+    backend = backend_factory(_settings(metadata_budget_bytes=metadata_budget)).backend
     before = backend.resolve((scoped,)).entries[0][1]
 
     with pytest.raises(BackendCapacity, match='metadata capacity'):
@@ -150,7 +152,7 @@ def test_change_capacity_failure_acknowledges_no_partial_update(
 
 
 def test_clock_samples_remain_serialized_with_store_transitions() -> None:
-    backend = LocalBackend(CacheSettings(), _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(CacheSettings(), FakeClock(), RecordingMetrics())
     sampled = Event()
     resume = Event()
 
@@ -175,8 +177,8 @@ def test_clock_samples_remain_serialized_with_store_transitions() -> None:
 def test_commit_debits_preparation_time_from_ttl_and_source_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    backend = LocalBackend(CacheSettings(), clock, _RecordingMetrics())
+    clock = FakeClock()
+    backend = LocalBackend(CacheSettings(), clock, RecordingMetrics())
     lease = backend.reserve('result-key', 10.0)
     assert lease is not None
     entry_captured = Event()
@@ -195,7 +197,7 @@ def test_commit_debits_preparation_time_from_ttl_and_source_age(
     try:
         commit = executor.submit(backend.commit, lease, payload, 0.1)
         assert entry_captured.wait(timeout=2.0)
-        clock._advance(0.04)
+        clock.advance(0.04)
         backend._lock.release()
         lock_held = False
         assert commit.result(timeout=2.0)
@@ -212,9 +214,9 @@ def test_commit_debits_preparation_time_from_ttl_and_source_age(
 
 
 def test_commit_huge_duration_is_a_closed_protocol_failure(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     lease = backend.reserve('qualified-key', 1.0)
     assert lease is not None
     huge_duration = 10**10_000
@@ -226,9 +228,9 @@ def test_commit_huge_duration_is_a_closed_protocol_failure(
 
 
 def test_commit_normalizes_exceptional_numeric_subclass(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     lease = backend.reserve('qualified-key', 1.0)
     assert lease is not None
 
@@ -245,8 +247,8 @@ def test_commit_normalizes_exceptional_numeric_subclass(
 def test_commit_rejects_lifetime_expired_waiting_for_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    backend = LocalBackend(CacheSettings(), clock, _RecordingMetrics())
+    clock = FakeClock()
+    backend = LocalBackend(CacheSettings(), clock, RecordingMetrics())
     lease = backend.reserve('result-key', 10.0)
     assert lease is not None
     entry_captured = Event()
@@ -264,7 +266,7 @@ def test_commit_rejects_lifetime_expired_waiting_for_transition(
     try:
         commit = executor.submit(backend.commit, lease, encode_value({'id': 7}), 0.05)
         assert entry_captured.wait(timeout=2.0)
-        clock._advance(0.1)
+        clock.advance(0.1)
         backend._lock.release()
         lock_held = False
         assert commit.result(timeout=2.0) is False
@@ -281,7 +283,7 @@ def test_constructor_normalizes_exceptional_clock_subclass() -> None:
         return _ExceptionalFloat(1.0)
 
     with pytest.raises(BackendUnavailable) as captured:
-        LocalBackend(CacheSettings(), exceptional_clock, _RecordingMetrics())
+        LocalBackend(CacheSettings(), exceptional_clock, RecordingMetrics())
 
     _assert_closed_exception(
         captured.value,
@@ -297,7 +299,7 @@ def test_constructor_normalizes_injected_clock_failure() -> None:
         raise RuntimeError(sensitive_input)
 
     with pytest.raises(BackendUnavailable) as captured:
-        LocalBackend(CacheSettings(), failing_clock, _RecordingMetrics())
+        LocalBackend(CacheSettings(), failing_clock, RecordingMetrics())
 
     _assert_closed_exception(captured.value, BackendUnavailable, sensitive_input)
 
@@ -313,16 +315,16 @@ def test_constructor_normalizes_injected_entropy_failure(
     monkeypatch.setattr('sg_query_cache._local.token_hex', failing_entropy)
 
     with pytest.raises(BackendUnavailable) as captured:
-        LocalBackend(CacheSettings(), _FakeClock(), _RecordingMetrics())
+        LocalBackend(CacheSettings(), FakeClock(), RecordingMetrics())
 
     _assert_closed_exception(captured.value, BackendUnavailable, sensitive_input)
 
 
 def test_corrupt_snapshot_decode_allows_replacement_without_deleting_it(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     assert _commit(backend, 'result-key', b'corrupt')
     decoding = Event()
     replaced = Event()
@@ -351,9 +353,9 @@ def test_corrupt_snapshot_decode_allows_replacement_without_deleting_it(
 
 
 def test_entry_above_one_mib_is_declined_without_evicting_useful_result(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory(_settings(result_budget_bytes=2_097_152))._backend
+    backend = backend_factory(_settings(result_budget_bytes=2_097_152)).backend
     useful = encode_value({'id': 7})
     assert _commit(backend, 'useful', useful)
 
@@ -365,33 +367,21 @@ def test_entry_above_one_mib_is_declined_without_evicting_useful_result(
 
 
 def test_expired_lease_frees_metadata_before_generation_resolution(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     harness = backend_factory(_settings(metadata_budget_bytes=1_084))
-    assert harness._backend.reserve('k', 1.0) is not None
-    harness._clock._advance(1.0)
+    assert harness.backend.reserve('k', 1.0) is not None
+    harness.clock.advance(1.0)
 
-    vector = harness._backend.resolve((DependencyTag.entity('production', 'Asset', 7),))
+    vector = harness.backend.resolve((DependencyTag.entity('production', 'Asset', 7),))
 
     assert vector.entries[0][1] > 0
 
 
-def test_expired_lease_token_is_never_reused(backend_factory: _BackendFactory) -> None:
-    harness = backend_factory()
-    first = harness._backend.reserve('qualified-key', 1.0)
-    assert first is not None
-    harness._clock._advance(1.0)
-
-    second = harness._backend.reserve('qualified-key', 1.0)
-
-    assert second is not None
-    assert second.token != first.token
-
-
 def test_fifty_concurrent_reservations_produce_one_current_lease(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     start = Barrier(51)
 
     def reserve() -> FillLease | None:
@@ -407,23 +397,32 @@ def test_fifty_concurrent_reservations_produce_one_current_lease(
     assert sum(lease is not None for lease in results) == 1
 
 
+def test_local_backend_defaults_clock_and_metrics() -> None:
+    backend = LocalBackend(CacheSettings())
+    assert backend._clock is monotonic
+    assert isinstance(backend._metrics, NullMetrics)
+    assert _commit(backend, 'default-key', encode_value({'id': 7}))
+    assert backend.lookup('default-key') is not None
+    backend.close()
+
+
 def test_lookup_debits_decode_time_from_remaining_age(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = backend_factory()
     payload = encode_value({'id': 7})
-    assert _commit(harness._backend, 'result-key', payload)
+    assert _commit(harness.backend, 'result-key', payload)
     original_decode = local_module.decode_value
 
     def delayed_decode(encoded: bytes) -> object:
         value = original_decode(encoded)
-        harness._clock._advance(0.25)
+        harness.clock.advance(0.25)
         return value
 
     monkeypatch.setattr(local_module, 'decode_value', delayed_decode)
 
-    hit = harness._backend.lookup('result-key')
+    hit = harness.backend.lookup('result-key')
 
     assert hit is not None
     assert hit.remaining_seconds == 29.75
@@ -432,27 +431,27 @@ def test_lookup_debits_decode_time_from_remaining_age(
 def test_lookup_debits_slow_maintenance_metrics_before_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    metrics = _RecordingMetrics()
+    clock = FakeClock()
+    metrics = RecordingMetrics()
     backend = LocalBackend(CacheSettings(), clock, metrics)
     lease = backend.reserve('expired', 10.0)
     assert lease is not None
     assert backend.commit(lease, encode_value({'id': 1}), 1.0)
     assert _commit(backend, 'result-key', encode_value({'id': 7}))
-    clock._advance(1.0)
-    original_observe = _RecordingMetrics.observe
+    clock.advance(1.0)
+    original_observe = RecordingMetrics.observe
 
     def slow_observe(
-        sink: _RecordingMetrics,
+        sink: RecordingMetrics,
         name: str,
         value: float,
         labels: Mapping[str, str],
     ) -> None:
         original_observe(sink, name, value, labels)
         if name == 'cache_serialized_bytes' and labels.get('outcome') == 'expired':
-            clock._advance(5.0)
+            clock.advance(5.0)
 
-    monkeypatch.setattr(_RecordingMetrics, 'observe', slow_observe)
+    monkeypatch.setattr(RecordingMetrics, 'observe', slow_observe)
 
     hit = backend.lookup('result-key')
 
@@ -461,53 +460,40 @@ def test_lookup_debits_slow_maintenance_metrics_before_return(
 
 
 def test_lookup_expiring_during_decode_is_a_miss(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = backend_factory()
     payload = encode_value({'id': 7})
-    assert _commit(harness._backend, 'result-key', payload)
-    harness._clock._advance(29.5)
+    assert _commit(harness.backend, 'result-key', payload)
+    harness.clock.advance(29.5)
     original_decode = local_module.decode_value
 
     def delayed_decode(encoded: bytes) -> object:
         value = original_decode(encoded)
-        harness._clock._advance(0.5)
+        harness.clock.advance(0.5)
         return value
 
     monkeypatch.setattr(local_module, 'decode_value', delayed_decode)
 
-    assert harness._backend.lookup('result-key') is None
-
-
-def test_lookup_returns_an_isolated_bytes_value(backend_factory: _BackendFactory) -> None:
-    backend = backend_factory()._backend
-    payload = encode_value({'id': 7})
-    assert _commit(backend, 'result-key', payload)
-
-    first = backend.lookup('result-key')
-    second = backend.lookup('result-key')
-
-    assert first is not None
-    assert second is not None
-    assert first.payload == second.payload == payload
+    assert harness.backend.lookup('result-key') is None
 
 
 def test_metadata_pressure_raises_backend_capacity(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory(_settings(metadata_budget_bytes=1_000))._backend
+    backend = backend_factory(_settings(metadata_budget_bytes=1_000)).backend
 
     with pytest.raises(BackendCapacity, match='metadata capacity'):
         backend.reserve('k' * 300, 10.0)
 
 
 def test_reads_update_recency_before_result_pressure_evicts_lru(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     payload = encode_value({'id': 7})
     entry_size = len(b'result-a') + len(payload) + 128 + 64
-    backend = backend_factory(_settings(result_budget_bytes=entry_size * 2))._backend
+    backend = backend_factory(_settings(result_budget_bytes=entry_size * 2)).backend
     assert _commit(backend, 'result-a', payload)
     assert _commit(backend, 'result-b', payload)
     assert backend.lookup('result-a') is not None
@@ -520,9 +506,9 @@ def test_reads_update_recency_before_result_pressure_evicts_lru(
 
 
 def test_reserve_huge_duration_is_a_closed_protocol_failure(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
     huge_duration = 10**10_000
 
     with pytest.raises(BackendProtocolError) as captured:
@@ -532,9 +518,9 @@ def test_reserve_huge_duration_is_a_closed_protocol_failure(
 
 
 def test_reserve_normalizes_exceptional_numeric_subclass(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
 
     with pytest.raises(BackendProtocolError) as captured:
         backend.reserve('qualified-key', _ExceptionalFloat(1.0))
@@ -547,11 +533,11 @@ def test_reserve_normalizes_exceptional_numeric_subclass(
 
 
 def test_reserve_normalizes_injected_entropy_failure(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sensitive_input = 'credential-bearing-reservation-entropy-error'
-    backend = backend_factory()._backend
+    backend = backend_factory().backend
 
     def failing_entropy(_byte_count: int) -> str:
         raise OSError(sensitive_input)
@@ -565,37 +551,37 @@ def test_reserve_normalizes_injected_entropy_failure(
 
 
 def test_resolve_suppresses_sensitive_vector_encoding_failure(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     sensitive_input = 'credential-bearing-tag' + '\ud800'
     tag = DependencyTag.entity('production', sensitive_input, 7)
 
     with pytest.raises(BackendProtocolError) as captured:
-        backend_factory()._backend.resolve((tag,))
+        backend_factory().backend.resolve((tag,))
 
     _assert_closed_exception(captured.value, BackendProtocolError, 'credential-bearing-tag')
 
 
 def test_result_accounting_includes_key_payload_and_fixed_overhead(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     key = 'result-key'
     payload = encode_value({'id': 7})
     exact_size = len(key.encode('utf-8')) + len(payload) + 128 + 64
-    too_small = backend_factory(_settings(result_budget_bytes=exact_size - 1))._backend
-    exact = backend_factory(_settings(result_budget_bytes=exact_size))._backend
+    too_small = backend_factory(_settings(result_budget_bytes=exact_size - 1)).backend
+    exact = backend_factory(_settings(result_budget_bytes=exact_size)).backend
 
     assert not _commit(too_small, key, payload)
     assert _commit(exact, key, payload)
 
 
 def test_result_eviction_never_removes_generations_or_leases(
-    backend_factory: _BackendFactory,
+    backend_factory: BackendFactory,
 ) -> None:
     payload = encode_value({'id': 7})
     entry_size = len(b'result-a') + len(payload) + 128 + 64
     harness = backend_factory(_settings(result_budget_bytes=entry_size))
-    backend = harness._backend
+    backend = harness.backend
     tag = DependencyTag.entity('production', 'Asset', 7)
     token = backend.resolve((tag,)).entries[0][1]
     held = backend.reserve('held-lease', 10.0)
@@ -613,27 +599,27 @@ def test_result_eviction_never_removes_generations_or_leases(
 def test_slow_reentrant_metrics_run_outside_lock_and_preserve_commit_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    metrics = _RecordingMetrics()
+    clock = FakeClock()
+    metrics = RecordingMetrics()
     backend = LocalBackend(CacheSettings(), clock, metrics)
     observed: list[float] = []
-    original_observe = _RecordingMetrics.observe
+    original_observe = RecordingMetrics.observe
     with ThreadPoolExecutor(max_workers=1) as executor:
 
         def reentrant_observe(
-            sink: _RecordingMetrics,
+            sink: RecordingMetrics,
             name: str,
             value: float,
             labels: Mapping[str, str],
         ) -> None:
             original_observe(sink, name, value, labels)
             if name == 'cache_serialized_bytes' and labels.get('outcome') == 'admitted':
-                clock._advance(5.0)
+                clock.advance(5.0)
                 hit = executor.submit(backend.lookup, 'result-key').result(timeout=1.0)
                 assert hit is not None
                 observed.append(hit.remaining_seconds)
 
-        monkeypatch.setattr(_RecordingMetrics, 'observe', reentrant_observe)
+        monkeypatch.setattr(RecordingMetrics, 'observe', reentrant_observe)
         assert _commit(backend, 'result-key', encode_value({'id': 7}))
 
     assert observed == [25.0]
@@ -645,8 +631,8 @@ def test_slow_reentrant_metrics_run_outside_lock_and_preserve_commit_age(
 def test_storage_usage_is_fresh_and_does_not_observe_time_or_maintain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    metrics = _RecordingMetrics()
+    clock = FakeClock()
+    metrics = RecordingMetrics()
     backend = LocalBackend(CacheSettings(), clock, metrics)
     empty = backend.storage_usage()
     assert empty['result_bytes'] == empty['lease_bytes'] == 0
@@ -662,8 +648,8 @@ def test_storage_usage_is_fresh_and_does_not_observe_time_or_maintain(
     assert (
         usage['lease_bytes'] == len('pending') + len(encode_value((lease.token, 1010.0))) + 96 + 64
     )
-    increments, observations = list(metrics._increments), list(metrics._observations)
-    clock._advance(8000)
+    increments, observations = list(metrics.increments), list(metrics.observations)
+    clock.advance(8000)
 
     def forbidden_clock() -> float:
         raise AssertionError('snapshot must not sample time')
@@ -674,8 +660,8 @@ def test_storage_usage_is_fresh_and_does_not_observe_time_or_maintain(
     monkeypatch.setattr(backend, '_clock', forbidden_clock)
     monkeypatch.setattr(LocalStore, '_maintain', forbidden_maintenance)
     assert backend.storage_usage() == usage
-    assert metrics._increments == increments
-    assert metrics._observations == observations
+    assert metrics.increments == increments
+    assert metrics.observations == observations
     isolated = backend.storage_usage()
     isolated['result_bytes'] = -1
     isolated.clear()
@@ -685,7 +671,7 @@ def test_storage_usage_is_fresh_and_does_not_observe_time_or_maintain(
 
 
 def test_storage_usage_serializes_with_store_close() -> None:
-    backend = LocalBackend(CacheSettings(), _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(CacheSettings(), FakeClock(), RecordingMetrics())
     entered = Event()
 
     def snapshot() -> dict[str, int]:

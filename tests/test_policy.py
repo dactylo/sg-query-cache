@@ -348,15 +348,19 @@ def test_event_log_entry_reads_always_bypass() -> None:
 
 
 @pytest.mark.parametrize(
-    ('field_type', 'operator', 'expected_classification'),
+    ('field_type', 'operator', 'expected'),
     [
         (
             field_type,
             operator,
             (
-                'event_aware'
-                if operator in _EXPECTED_EVENT_AWARE_OPERATORS[field_type]
-                else 'ttl_only'
+                QueryPolicy('ttl_only', 'addressing')
+                if field_type == 'addressing'
+                else QueryPolicy('ttl_only', 'relative_date_operator')
+                if field_type in ('date', 'date_time') and operator in _RELATIVE_DATE_OPERATORS
+                else QueryPolicy('event_aware', 'tag_list_contains')
+                if field_type == 'tag_list' and operator == 'is'
+                else QueryPolicy('event_aware', 'event_aware')
             ),
         )
         for field_type, operators in _DOCUMENTED_OPERATORS.items()
@@ -366,20 +370,19 @@ def test_event_log_entry_reads_always_bypass() -> None:
 def test_every_documented_pair_has_exact_event_awareness(
     field_type: str,
     operator: str,
-    expected_classification: str,
+    expected: QueryPolicy,
 ) -> None:
     value = None if field_type == 'image' else 'value'
 
     policy = classify_query(_call(field_type, operator, value), _schema())
 
-    assert policy.classification == expected_classification
+    assert policy == expected
 
 
-@pytest.mark.parametrize('operator', _DOCUMENTED_OPERATORS['addressing'])
-def test_addressing_operators_are_ttl_only(operator: str) -> None:
-    assert classify_query(_call('addressing', operator), _schema()) == QueryPolicy(
-        'ttl_only',
-        'addressing',
+@pytest.mark.parametrize('operator', ['is', 'is_not'])
+def test_image_filters_require_none(operator: str) -> None:
+    assert classify_query(_call('image', operator, 'https://example.invalid'), _schema()) == (
+        QueryPolicy('bypass', 'unsupported_image_value')
     )
 
 
@@ -409,26 +412,6 @@ def test_nested_filter_groups_are_walked_completely() -> None:
     assert classify_query(call, _schema()) == QueryPolicy(
         'ttl_only',
         'relative_date_operator',
-    )
-
-
-@pytest.mark.parametrize('field_type', ['date', 'date_time'])
-@pytest.mark.parametrize('operator', _RELATIVE_DATE_OPERATORS)
-def test_relative_date_operators_are_ttl_only(field_type: str, operator: str) -> None:
-    assert classify_query(_call(field_type, operator), _schema()) == QueryPolicy(
-        'ttl_only',
-        'relative_date_operator',
-    )
-
-
-@pytest.mark.parametrize('operator', ['is', 'is_not'])
-def test_image_filters_require_none(operator: str) -> None:
-    assert classify_query(_call('image', operator, 'https://example.invalid'), _schema()) == (
-        QueryPolicy('bypass', 'unsupported_image_value')
-    )
-    assert classify_query(_call('image', operator, None), _schema()) == QueryPolicy(
-        'event_aware',
-        'event_aware',
     )
 
 

@@ -6,6 +6,7 @@ from sg_query_cache._model import ExactCall
 
 FILTER_GROUP_KEYS = frozenset({'filter_operator', 'filters'})
 ORDER_ITEM_KEYS = frozenset({'direction', 'field_name'})
+_CONDITION_LENGTH = 3
 _PAIR_LENGTH = 2
 
 
@@ -51,3 +52,14 @@ def filter_group(value: tuple[object, ...]) -> tuple[bool, tuple[object, ...] | 
     if mapping['filter_operator'] not in ('all', 'any') or not isinstance(filters, tuple):
         return True, None
     return True, cast('tuple[object, ...]', filters)
+
+
+def simple_condition(values: tuple[object, ...]) -> tuple[str, str, object] | None:
+    """Parse one `(field, operator, value)` condition, returning `None` for other shapes."""
+    if (
+        len(values) != _CONDITION_LENGTH
+        or not isinstance(values[0], str)
+        or not isinstance(values[1], str)
+    ):
+        return None
+    return values[0], values[1], values[2]

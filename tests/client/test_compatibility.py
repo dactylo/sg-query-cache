@@ -2,22 +2,12 @@ import inspect
 import os
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from sg_query_cache import CachedShotgun
-from tests.client._compatibility import EXPLICIT_METHODS
-
-
-def _parameter_contract(
-    method: Callable[..., object],
-) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
-    return tuple(
-        (parameter.name, parameter.kind, parameter.default)
-        for parameter in inspect.signature(method).parameters.values()
-    )
+from sg_query_cache import AsyncCachedShotgun, CachedShotgun
+from tests.client._compatibility import EXPLICIT_METHODS, parameter_contract
 
 
 @pytest.mark.integration
@@ -69,13 +59,16 @@ def test_installed_official_client_cached_signatures_match() -> None:
     shotgun = shotgun_api3.Shotgun
 
     for method_name in EXPLICIT_METHODS:
-        assert _parameter_contract(getattr(CachedShotgun, method_name)) == _parameter_contract(
+        assert parameter_contract(getattr(CachedShotgun, method_name)) == parameter_contract(
             getattr(shotgun, method_name)
         )
 
 
-def test_wrapper_constructor_keeps_configuration_keyword_only() -> None:
-    parameters = tuple(inspect.signature(CachedShotgun).parameters.values())
+@pytest.mark.parametrize('wrapper_type', [CachedShotgun, AsyncCachedShotgun])
+def test_wrapper_constructor_keeps_configuration_keyword_only(
+    wrapper_type: type[CachedShotgun] | type[AsyncCachedShotgun],
+) -> None:
+    parameters = tuple(inspect.signature(wrapper_type).parameters.values())
 
     assert tuple(parameter.name for parameter in parameters) == (
         'client',

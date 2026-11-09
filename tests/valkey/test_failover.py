@@ -1,30 +1,31 @@
 import os
 import socket
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import ReadOnlyError
 
-from sg_query_cache._backend import BackendUnavailable, StaleIncarnation
+from sg_query_cache._backend import BackendUnavailable
 from sg_query_cache._codec import encode_value
 from sg_query_cache._keys import KeyBuilder
-from sg_query_cache._model import DependencyTag, FillLease, GenerationChange
-from sg_query_cache._valkey_scripts import RESOLVE_SCRIPT_SHA
+from sg_query_cache._model import DependencyTag, GenerationChange
 from sg_query_cache.valkey import ValkeyBackend
-from tests._fakes import _RecordingMetrics
+from tests._fakes import RecordingMetrics
 from tests.valkey._environment import integer
 from tests.valkey._integration_helpers import (
-    AdminClient,
     Profile,
-    Role,
-    Topology,
     assert_role_replaced,
+    assert_stale_metadata_control,
     backend_role_observation,
+    concurrent_replacement_incarnation,
+    observed_replacement,
+    observed_write,
     primary,
     replid,
     required,
+    reserve_until,
+    wait_for_new_primary,
 )
 from tests.valkey._integration_helpers import (
     topology as _make_topology,
@@ -52,45 +53,12 @@ def _control(command: str) -> None:
     assert reply == b'OK\n'
 
 
-def _reserve_after_failover(
-    backend: ValkeyBackend,
-    key: str,
-) -> tuple[FillLease | None, bool]:
-    deadline = time.monotonic() + _DEADLINE_SECONDS
-    neutral_failure = False
-    while time.monotonic() < deadline:
-        try:
-            return backend.reserve(key, 30), neutral_failure
-        except BackendUnavailable:
-            neutral_failure = True
-            time.sleep(0.1)
-    pytest.fail('result-role reserve did not recover before the failover deadline')
-
-
-def _wait_for_new_primary(
-    topology: Topology,
-    role: Role,
-    previous_replid: str,
-) -> AdminClient:
-    deadline = time.monotonic() + _DEADLINE_SECONDS
-    while time.monotonic() < deadline:
-        client = primary(topology, role)
-        try:
-            if replid(client) != previous_replid:
-                return client
-        except Exception as error:  # noqa: BLE001 - bounded external acceptance polling
-            _ = error
-        client.close()
-        time.sleep(0.1)
-    pytest.fail(f'{topology._profile} {role} promotion did not expose a new replication identity')
-
-
 @pytest.mark.parametrize('profile', ['sentinel', 'managed'])
-def test_metadata_failover_rotates_before_reuse_and_converges(  # noqa: PLR0915 - one failover retains its complete invariant sequence
+def test_metadata_failover_rotates_before_reuse_and_converges(
     profile: Profile,
 ) -> None:
     topology = _make_topology(profile)
-    backend = ValkeyBackend.from_settings(topology.settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(topology.settings, os.environ, RecordingMetrics())
     old_primary = primary(topology, 'metadata')
     tag = DependencyTag.site('failover')
     old_vector = backend.resolve((tag,))
@@ -115,44 +83,25 @@ def test_metadata_failover_rotates_before_reuse_and_converges(  # noqa: PLR0915 
     old_replid = replid(old_primary)
     started = time.monotonic()
     _control(f'PROMOTE {profile} metadata')
-    promoted = _wait_for_new_primary(topology, 'metadata', old_replid)
+    promoted = wait_for_new_primary(
+        topology,
+        'metadata',
+        old_replid,
+        timeout_seconds=_DEADLINE_SECONDS,
+        interval_seconds=0.1,
+    )
     print(f'pre-rotation interval started at monotonic {started:.6f}')
     with pytest.raises((ReadOnlyError, ValkeyConnectionError)):
         old_primary.set('sgqc-failover-demotion-probe', b'1')
     assert promoted.get(old_tag_key) != changed_only_on_old_primary
     before_first_attempt = backend_role_observation(backend, 'metadata')
-
-    def replace_incarnation(_index: int) -> str:
-        concurrent = ValkeyBackend.from_settings(
-            topology.settings, os.environ, _RecordingMetrics()
-        )
-        try:
-            return concurrent.resolve((tag,)).incarnation
-        finally:
-            concurrent.close()
-
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        replacement_incarnations = tuple(executor.map(replace_incarnation, range(50)))
-    assert len(set(replacement_incarnations)) == 1
-    replacement_incarnation = replacement_incarnations[0]
-    assert replacement_incarnation != old_vector.incarnation
-
-    deadline = time.monotonic() + _DEADLINE_SECONDS
-    new_vector = None
-    neutral_failure = False
-    while time.monotonic() < deadline:
-        try:
-            new_vector = backend.resolve((tag,))
-        except (BackendUnavailable, StaleIncarnation):
-            neutral_failure = True
-            time.sleep(0.1)
-            continue
-        if new_vector.incarnation != old_vector.incarnation:
-            break
-        time.sleep(0.1)
-    assert new_vector is not None
+    replacement_incarnation = concurrent_replacement_incarnation(
+        topology.settings, tag, old_vector.incarnation
+    )
+    new_vector, neutral_failure, settled = observed_replacement(
+        backend, tag, old_vector.incarnation, time.monotonic() + _DEADLINE_SECONDS, 0.1
+    )
     assert new_vector.incarnation == replacement_incarnation
-    settled = backend_role_observation(backend, 'metadata')
     assert_role_replaced(
         retained,
         before_first_attempt,
@@ -160,20 +109,11 @@ def test_metadata_failover_rotates_before_reuse_and_converges(  # noqa: PLR0915 
         neutral_failure=neutral_failure,
         profile=profile,
     )
-    assert (
-        promoted.get(f'{topology.settings.l2.valkey.metadata.key_prefix}:v1:control')
-        != old_control
-    )
-    old_counter = old_control.split(b'|')[2].decode('ascii')
-    stale_reply = promoted.evalsha(
-        RESOLVE_SCRIPT_SHA,
-        2,
+    assert_stale_metadata_control(
+        promoted,
         f'{topology.settings.l2.valkey.metadata.key_prefix}:v1:control',
-        old_counter,
         old_control,
-        7_200_000,
     )
-    assert stale_reply in ([b'stale'], [b'missing-counter'])
 
     new_result_key = KeyBuilder.qualified_key(_METADATA_FAILOVER_BASE_KEY, new_vector, 'result')
     assert new_result_key != old_result_key
@@ -195,13 +135,15 @@ def test_result_failover_preserves_age_or_causes_only_miss_and_duplicate_fill(
     profile: Profile,
 ) -> None:
     topology = _make_topology(profile)
-    backend = ValkeyBackend.from_settings(topology.settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(topology.settings, os.environ, RecordingMetrics())
     result_primary = primary(topology, 'result')
     vector = backend.resolve((DependencyTag.site('failover'),))
     result_key = KeyBuilder.qualified_key(_RESULT_FAILOVER_BASE_KEY, vector, 'result')
     lease = backend.reserve(result_key, 30)
     assert lease is not None
     assert backend.commit(lease, encode_value({'id': 1}), 60)
+    # A commit cannot expire later than its completion plus the supplied lifetime.
+    expiry_upper = time.monotonic() + 60
     before = backend.lookup(result_key)
     assert before is not None
     lost_lease_key = f'{result_key}-lease-loss'
@@ -211,32 +153,48 @@ def test_result_failover_preserves_age_or_causes_only_miss_and_duplicate_fill(
     _control(f'PREPARE {profile} result')
     old_replid = replid(result_primary)
     _control(f'PROMOTE {profile} result')
-    promoted = _wait_for_new_primary(topology, 'result', old_replid)
+    promoted = wait_for_new_primary(
+        topology,
+        'result',
+        old_replid,
+        timeout_seconds=_DEADLINE_SECONDS,
+        interval_seconds=0.1,
+    )
     with pytest.raises((ReadOnlyError, ValkeyConnectionError)):
         result_primary.set('sgqc-failover-demotion-probe', b'1')
     before_first_attempt = backend_role_observation(backend, 'result')
 
     deadline = time.monotonic() + _DEADLINE_SECONDS
-    after = None
     neutral_failure = False
     while time.monotonic() < deadline:
         try:
+            after_started = time.monotonic()
             after = backend.lookup(result_key)
             break
         except BackendUnavailable:
             neutral_failure = True
             time.sleep(0.1)
-    if after is not None:
-        assert after.remaining_seconds <= before.remaining_seconds
     else:
-        replacement, reserve_failed = _reserve_after_failover(backend, result_key)
+        pytest.fail('result lookup did not recover before the failover deadline')
+    first_write, write_failed, settled = observed_write(
+        backend, f'{result_key}-first-write', time.monotonic() + _DEADLINE_SECONDS, 0.1
+    )
+    neutral_failure |= write_failed
+    assert first_write is not None
+    if after is not None:
+        assert after_started + after.remaining_seconds <= expiry_upper + 0.01
+    else:
+        replacement, reserve_failed = reserve_until(
+            backend, result_key, time.monotonic() + _DEADLINE_SECONDS, 0.1
+        )
         neutral_failure |= reserve_failed
         assert replacement is not None
         assert replacement.token != lease.token
-    replacement_lease, reserve_failed = _reserve_after_failover(backend, lost_lease_key)
+    replacement_lease, reserve_failed = reserve_until(
+        backend, lost_lease_key, time.monotonic() + _DEADLINE_SECONDS, 0.1
+    )
     neutral_failure |= reserve_failed
     assert replacement_lease is None or replacement_lease.token != lost_lease.token
-    settled = backend_role_observation(backend, 'result')
     assert_role_replaced(
         retained,
         before_first_attempt,

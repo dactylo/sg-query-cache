@@ -1,8 +1,7 @@
-# pyright: reportPrivateUsage=false
 """Provide the synchronous path-loadable SG event-daemon plugin.
 
 Importing this module defines registration and lifecycle functions only. The
-optional Valkey backend is imported and connected during `setup()`.
+optional Valkey backend is imported and connected during `_setup()`.
 """
 
 from __future__ import annotations
@@ -74,39 +73,23 @@ class _SetupContext(Protocol):
 class _State:
     """Hold process-local plugin lifecycle state."""
 
-    _backend: ClassVar[ValkeyMetadataStore | None] = None
-    _config_path: ClassVar[Path | None] = None
-    _site_namespace: ClassVar[str | None] = None
+    backend: ClassVar[ValkeyMetadataStore | None] = None
+    config_path: ClassVar[Path | None] = None
+    site_namespace: ClassVar[str | None] = None
 
 
-def callback(context: _EventContext) -> None:
-    """Apply one event's changes through the metadata boundary.
-
-    Args:
-        context: Immutable daemon callback context.
-
-    Raises:
-        RuntimeError: Setup is incomplete. Backend failures propagate so the
-            daemon retries.
-    """
-    backend = _State._backend
-    site_namespace = _State._site_namespace
+def _callback(context: _EventContext) -> None:
+    """Apply one event's changes through the metadata boundary."""
+    backend = _State.backend
+    site_namespace = _State.site_namespace
     if backend is None or site_namespace is None:
         raise RuntimeError('cache invalidation setup is incomplete')
     backend.change(changes_for_event(site_namespace, context.event))
 
 
-def setup(context: _SetupContext) -> None:
-    """Create metadata state and flush the configured site before callbacks.
-
-    Args:
-        context: Daemon setup context containing the site and declared secrets.
-
-    Raises:
-        RuntimeError: Registration is incomplete or the daemon site differs
-            from the shared cache configuration. Backend failures propagate.
-    """
-    config_path = _State._config_path
+def _setup(context: _SetupContext) -> None:
+    """Create metadata state and flush the configured site before callbacks."""
+    config_path = _State.config_path
     if config_path is None:
         raise RuntimeError('cache invalidation plugin is not registered')
     settings = CacheSettings.from_toml(config_path)
@@ -114,6 +97,11 @@ def setup(context: _SetupContext) -> None:
         raise RuntimeError('daemon site does not match the cache site namespace')
 
     password_env = settings.l2.valkey.metadata.password_env
+    if password_env not in context.secrets:
+        raise RuntimeError(
+            f'daemon plugin settings need secrets.{password_env}; '
+            "declare it in the plugin's secrets"
+        )
     password = context.secrets[password_env].reveal()
     environ = {password_env: password}
 
@@ -128,9 +116,9 @@ def setup(context: _SetupContext) -> None:
             store.close()
         raise
 
-    previous = _State._backend
-    _State._backend = store
-    _State._site_namespace = settings.site_namespace
+    previous = _State.backend
+    _State.backend = store
+    _State.site_namespace = settings.site_namespace
     if previous is not None:
         previous.close()
 
@@ -154,6 +142,6 @@ def register(registrar: _Registrar) -> None:
         raise TypeError('config_path must be a string')
     if not config_path:
         raise ValueError('config_path must not be empty')
-    _State._config_path = Path(config_path)
-    registrar.set_setup(setup)
-    registrar.add_callback(id='invalidate-cache', callback=callback)
+    _State.config_path = Path(config_path)
+    registrar.set_setup(_setup)
+    registrar.add_callback(id='invalidate-cache', callback=_callback)

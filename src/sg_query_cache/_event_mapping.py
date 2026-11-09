@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Map closed SG event shapes to conservative generation changes."""
 
 from collections.abc import Mapping, Sequence
@@ -10,10 +7,9 @@ from re import compile as compile_pattern
 from typing import cast
 
 from sg_query_cache._client_common import (
-    HUMAN_VISIBILITY_ENTITY_TYPES,
-    HUMAN_VISIBILITY_FIELDS,
-    PERMISSION_FIELDS,
-    PERMISSION_TYPES,
+    affects_authorization,
+    affects_human_visibility,
+    site_changes,
 )
 from sg_query_cache._model import DependencyTag, GenerationChange
 
@@ -54,11 +50,11 @@ class _InvalidEventError(ValueError):
 class _ParsedEvent:
     """Hold validated event fields used by the closed mapper."""
 
-    _attribute_name: str | None
-    _entity: tuple[str, int] | None
-    _event_type: str
-    _meta: Mapping[str, object]
-    _project: tuple[str, int] | None
+    attribute_name: str | None
+    entity: tuple[str, int] | None
+    event_type: str
+    meta: Mapping[str, object]
+    project: tuple[str, int] | None
 
 
 def _affected_ids(meta: Mapping[str, object], key: str) -> tuple[int, ...] | None:
@@ -86,9 +82,7 @@ def _authorization_tags(
     attribute_name: str | None,
 ) -> tuple[DependencyTag, ...]:
     """Return global authorization tags for permission-bearing events."""
-    if entity_type in PERMISSION_TYPES or (
-        entity_type == 'HumanUser' and attribute_name in PERMISSION_FIELDS
-    ):
+    if affects_authorization(entity_type, () if attribute_name is None else (attribute_name,)):
         return (DependencyTag.authorization(site_namespace),)
     return ()
 
@@ -118,17 +112,15 @@ def _data_tags(
     return membership, type_value, type_field, entity
 
 
-def _event_mapping(value: object) -> Mapping[str, object] | None:
-    """Return a string-keyed event mapping with all public fields."""
-    if not isinstance(value, Mapping):
+def _event_parts(event_type: str) -> tuple[str, str] | None:
+    """Split one SG event type into its entity type and action."""
+    if not event_type.startswith('Shotgun_'):
         return None
-    untyped = cast('Mapping[object, object]', value)
-    if not all(isinstance(key, str) for key in untyped):
+    try:
+        entity_type, action = event_type.removeprefix('Shotgun_').rsplit('_', 1)
+    except ValueError:
         return None
-    event = cast('Mapping[str, object]', untyped)
-    if not _REQUIRED_FIELDS.issubset(event):
-        return None
-    return event
+    return entity_type, action
 
 
 def _field_name(value: object) -> str | None:
@@ -153,6 +145,16 @@ def _link(value: object) -> tuple[str, int] | None:
     ):
         return None
     return entity_type, entity_id
+
+
+def _event_entity(
+    entity: tuple[str, int] | None, meta: Mapping[str, object]
+) -> tuple[str, int] | None:
+    """Return the event's entity link, or the entity its metadata names when SG nulls the link."""
+    if entity is not None:
+        return entity
+    # SG nulls the link once the entity is retired, including on its own retirement event.
+    return _link({'type': meta.get('entity_type'), 'id': meta.get('entity_id')})
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -212,17 +214,13 @@ def _ordered_changes(
 
 
 def _ordinary_event(
-    event_type: str,
+    event_parts: tuple[str, str] | None,
     entity: tuple[str, int] | None,
 ) -> tuple[str, str, int] | None:
     """Extract one standard SG entity event."""
-    if not event_type.startswith('Shotgun_'):
+    if event_parts is None:
         return None
-    remainder = event_type.removeprefix('Shotgun_')
-    try:
-        event_entity_type, action = remainder.rsplit('_', 1)
-    except ValueError:
-        return None
+    event_entity_type, action = event_parts
     if (
         _ENTITY_TYPE_PATTERN.fullmatch(event_entity_type) is None
         or action not in _LIFECYCLE_ACTIONS | {'Change'}
@@ -258,18 +256,14 @@ def _required_text(value: object) -> str:
 
 def _schema_tags(
     site_namespace: str,
-    event_type: str,
+    event_parts: tuple[str, str] | None,
     attribute_name: str | None,
     meta: Mapping[str, object],
 ) -> tuple[DependencyTag, ...] | None:
     """Return tags for one recognized schema or field-definition event."""
-    if not event_type.startswith('Shotgun_'):
+    if event_parts is None:
         return None
-    remainder = event_type.removeprefix('Shotgun_')
-    try:
-        schema_type, action = remainder.rsplit('_', 1)
-    except ValueError:
-        return None
+    schema_type, action = event_parts
     if schema_type not in _SCHEMA_ENTITY_TYPES or action not in _LIFECYCLE_ACTIONS | {'Change'}:
         return None
     affected_type = meta.get('entity_type')
@@ -291,15 +285,10 @@ def _schema_tags(
     return tuple(tags)
 
 
-def _site_change(site_namespace: str) -> tuple[GenerationChange, ...]:
-    """Return the conservative site-wide fallback."""
-    return (GenerationChange(DependencyTag.site(site_namespace)),)
-
-
 def _validated_event(value: object) -> _ParsedEvent:
     """Validate the complete public daemon event boundary."""
-    event = _event_mapping(value)
-    if event is None:
+    event = _required_mapping(value)
+    if not _REQUIRED_FIELDS.issubset(event):
         raise _InvalidEventError
     _positive_id(event['id'])
     if event['type'] != 'EventLogEntry':
@@ -334,8 +323,8 @@ def _visibility_tags(
     affected_humans = _affected_ids(meta, _AFFECTED_HUMANS_KEY)
     if affected_humans is None:
         return (DependencyTag.human_visibility(site_namespace),)
-    uncertain = (
-        entity_type in HUMAN_VISIBILITY_ENTITY_TYPES or attribute_name in HUMAN_VISIBILITY_FIELDS
+    uncertain = affects_human_visibility(
+        entity_type, () if attribute_name is None else (attribute_name,)
     )
     identifiers = list(affected_humans)
     if entity_type == 'HumanUser' and entity_id not in identifiers:
@@ -350,36 +339,37 @@ def _visibility_tags(
 def _map_event(site_namespace: str, event: object) -> tuple[GenerationChange, ...]:
     """Map one validated event or reject uncertain coverage."""
     parsed = _validated_event(event)
+    event_parts = _event_parts(parsed.event_type)
     schema = _schema_tags(
         site_namespace,
-        parsed._event_type,
-        parsed._attribute_name,
-        parsed._meta,
+        event_parts,
+        parsed.attribute_name,
+        parsed.meta,
     )
     if schema is not None:
         return _ordered_changes((schema,))
-    if parsed._event_type in _PERMISSION_RULE_EVENTS:
+    if parsed.event_type in _PERMISSION_RULE_EVENTS:
         return _ordered_changes(((DependencyTag.authorization(site_namespace),),))
-    ordinary = _ordinary_event(parsed._event_type, parsed._entity)
+    ordinary = _ordinary_event(event_parts, _event_entity(parsed.entity, parsed.meta))
     if ordinary is None:
         raise _InvalidEventError
     _, entity_type, entity_id = ordinary
-    _match_entity_metadata(parsed._meta, entity_type, entity_id)
+    _match_entity_metadata(parsed.meta, entity_type, entity_id)
     membership, type_value, type_field, entity = _data_tags(
         site_namespace,
         ordinary,
-        parsed._attribute_name,
-        parsed._meta,
+        parsed.attribute_name,
+        parsed.meta,
     )
     return _ordered_changes(
         (
-            _authorization_tags(site_namespace, entity_type, parsed._attribute_name),
+            _authorization_tags(site_namespace, entity_type, parsed.attribute_name),
             _visibility_tags(
                 site_namespace,
                 entity_type,
                 entity_id,
-                parsed._attribute_name,
-                parsed._meta,
+                parsed.attribute_name,
+                parsed.meta,
             ),
             membership,
             type_value,
@@ -406,4 +396,4 @@ def changes_for_event(
     try:
         return _map_event(site_namespace, event)
     except _InvalidEventError:
-        return _site_change(site_namespace)
+        return site_changes(site_namespace)

@@ -35,15 +35,15 @@ permissions:
   contents: read
 
 env:
-  BIOME_VERSION: 2.5.14
+  BIOME_VERSION: 2.6.6
   CI_HOSTED: >-
     ${{ !github.event.repository.private || github.event_name != 'workflow_dispatch' ||
         inputs.hosted || !(vars.CI_LINUX_RUNNER || vars.CI_MACOS_RUNNER || vars.CI_WINDOWS_RUNNER) }}
   CI_IMPORT: sg_query_cache
-  NODE_VERSION: 24.21.0
+  NODE_VERSION: 26.12.0
   UV_PYTHON_DOWNLOADS: never
   UV_SYSTEM_PYTHON: "0"
-  UV_VERSION: 0.12.23
+  UV_VERSION: 0.13.6
 
 defaults:
   run:
@@ -68,23 +68,23 @@ jobs:
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           architecture: >-
             ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           python-version: "3.13"
       - name: Set up Node for Pyright
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
       - name: Set up Biome
@@ -176,11 +176,11 @@ jobs:
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           architecture: >-
             ${{ (matrix.os == 'macos-15' ||
@@ -192,7 +192,7 @@ jobs:
           python --version
           python -c 'import sys; print(sys.executable)'
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
       - name: Create test environment
@@ -243,18 +243,19 @@ jobs:
             test "$CI_RUNNER_ENVIRONMENT" = github-hosted
           fi
       - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           architecture: >-
             ${{ runner.environment == 'self-hosted' && runner.arch == 'ARM64' && 'arm64' || 'x64' }}
           python-version: "3.13"
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
+          enable-cache: false # published distributions are built without a restored cache
           version: ${{ env.UV_VERSION }}
       - name: Build distributions
         run: uv build --python python --no-python-downloads --build-constraints requirements-ci.txt --require-hashes
@@ -318,7 +319,7 @@ jobs:
         run: git diff --exit-code
       - name: Save distributions
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ env.CI_HOSTED == 'true' && 'python-distributions' || 'local-distributions' }}
           path: dist/

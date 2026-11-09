@@ -142,11 +142,15 @@ class L1Settings:
                 type.
             ValueError: An age or byte budget is not positive.
         """
-        require_bool(self.enabled, 'L1 enabled')
-        require_positive_number(self.hierarchical_max_age_seconds, 'L1 hierarchical maximum age')
-        require_positive_number(self.local_only_max_age_seconds, 'L1 local-only maximum age')
-        require_positive_int(self.result_budget_bytes, 'L1 result budget')
-        require_positive_int(self.metadata_budget_bytes, 'L1 metadata budget')
+        require_bool(self.enabled, 'cache.l1.enabled')
+        require_positive_number(
+            self.hierarchical_max_age_seconds, 'cache.l1.hierarchical_max_age_seconds'
+        )
+        require_positive_number(
+            self.local_only_max_age_seconds, 'cache.l1.local_only_max_age_seconds'
+        )
+        require_positive_int(self.result_budget_bytes, 'cache.l1.result_budget_bytes')
+        require_positive_int(self.metadata_budget_bytes, 'cache.l1.metadata_budget_bytes')
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,25 +188,27 @@ class ValkeyRoleSettings:
                 settings do not match the selected mode.
         """
         _require_valkey_host(self.host)
-        _require_environment_name(self.password_env, 'Valkey password environment name')
+        _require_environment_name(self.password_env, 'password_env')
         _valkey_mode(self.mode)
         _require_valkey_port(self.port)
-        _require_nonnegative_int(self.database, 'Valkey database')
-        require_bool(self.tls, 'Valkey TLS')
+        _require_nonnegative_int(self.database, 'database')
+        require_bool(self.tls, 'tls')
         if self.username is not None:
-            _require_safe_ascii(self.username, 'Valkey username')
+            _require_safe_ascii(self.username, 'username')
         _require_key_prefix(self.key_prefix)
-        sentinels = _require_string_tuple(self.sentinels, 'Valkey sentinels')
+        sentinels = _require_string_tuple(self.sentinels, 'sentinels')
         if self.mode == 'sentinel':
-            parsed = tuple(parse_sentinel_address(value) for value in sentinels)
+            parsed = tuple(parse_sentinel_address(value, 'sentinels') for value in sentinels)
             distinct = {_endpoint_identity(host, port) for host, port in parsed}
             if len(parsed) < _MIN_SENTINELS or len(distinct) < _MIN_SENTINELS:
-                raise ValueError('Valkey Sentinel mode requires three distinct sentinel addresses')
+                raise ValueError(
+                    'sentinels requires three distinct sentinel addresses in sentinel mode'
+                )
             if self.service_name is None:
-                raise ValueError('Valkey Sentinel mode requires a service name')
-            _require_safe_ascii(self.service_name, 'Valkey Sentinel service name')
+                raise ValueError('service_name is required in sentinel mode')
+            _require_safe_ascii(self.service_name, 'service_name')
         elif sentinels or self.service_name is not None:
-            raise ValueError('Valkey sentinels and service name require sentinel mode')
+            raise ValueError('sentinels and service_name require sentinel mode')
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,8 +216,6 @@ class ValkeySettings:
     """Configure the separate result and metadata Valkey service roles.
 
     Both roles must use the same deployment mode and distinct endpoints.
-    `allow_same_endpoint_for_testing` permits a shared endpoint only for direct
-    construction in disposable tests; the TOML loader does not expose it.
     """
 
     result: ValkeyRoleSettings = field(
@@ -226,29 +230,28 @@ class ValkeySettings:
             'SG_QUERY_CACHE_METADATA_PASSWORD',
         )
     )
-    allow_same_endpoint_for_testing: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate role types, matching modes, and separate endpoints.
 
         Raises:
-            TypeError: A role is not a `ValkeyRoleSettings` value or the test
-                flag is not boolean.
-            ValueError: Role modes differ or endpoints coincide without the
-                explicit test allowance.
+            TypeError: A role is not a `ValkeyRoleSettings` value.
+            ValueError: Role modes differ or endpoints coincide.
         """
         result_value = cast('object', self.result)
         metadata_value = cast('object', self.metadata)
         if not isinstance(result_value, ValkeyRoleSettings) or not isinstance(
             metadata_value, ValkeyRoleSettings
         ):
-            raise TypeError('Valkey roles must be immutable ValkeyRoleSettings values')
-        require_bool(
-            self.allow_same_endpoint_for_testing,
-            'same-endpoint test flag',
-        )
+            raise TypeError(
+                'cache.l2.valkey.result and cache.l2.valkey.metadata must '
+                'be immutable ValkeyRoleSettings values'
+            )
         if self.result.mode != self.metadata.mode:
-            raise ValueError('Valkey roles must use the same deployment mode')
+            raise ValueError(
+                'cache.l2.valkey.result.mode and '
+                'cache.l2.valkey.metadata.mode must use the same deployment mode'
+            )
         if self.result.mode == 'sentinel':
             result_endpoint = (self.result.service_name, self.result.database)
             metadata_endpoint = (self.metadata.service_name, self.metadata.database)
@@ -261,8 +264,10 @@ class ValkeySettings:
                 *_endpoint_identity(self.metadata.host, self.metadata.port),
                 self.metadata.database,
             )
-        if not self.allow_same_endpoint_for_testing and result_endpoint == metadata_endpoint:
-            raise ValueError('Valkey result and metadata roles must use separate endpoints')
+        if result_endpoint == metadata_endpoint:
+            raise ValueError(
+                'cache.l2.valkey.result and cache.l2.valkey.metadata must use separate endpoints'
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,19 +301,21 @@ class L2Settings:
             ValueError: The backend is unsupported or an age or budget is not
                 positive.
         """
-        require_bool(self.enabled, 'L2 enabled')
+        require_bool(self.enabled, 'cache.l2.enabled')
         if self.backend != 'valkey':
-            raise ValueError('L2 backend must be valkey')
+            raise ValueError('cache.l2.backend must be valkey')
         if not isinstance(cast('object', self.valkey), ValkeySettings):
-            raise TypeError('L2 Valkey settings must be an immutable ValkeySettings value')
-        require_positive_number(self.event_aware_max_age_seconds, 'L2 event-aware maximum age')
-        require_positive_number(self.ttl_only_max_age_seconds, 'L2 TTL-only maximum age')
-        require_positive_number(self.schema_max_age_seconds, 'L2 schema maximum age')
-        require_positive_int(self.result_budget_bytes, 'L2 result budget')
-        require_positive_int(self.metadata_budget_bytes, 'L2 metadata budget')
+            raise TypeError('cache.l2.valkey must be an immutable ValkeySettings value')
+        require_positive_number(
+            self.event_aware_max_age_seconds, 'cache.l2.event_aware_max_age_seconds'
+        )
+        require_positive_number(self.ttl_only_max_age_seconds, 'cache.l2.ttl_only_max_age_seconds')
+        require_positive_number(self.schema_max_age_seconds, 'cache.l2.schema_max_age_seconds')
+        require_positive_int(self.result_budget_bytes, 'cache.l2.result_budget_bytes')
+        require_positive_int(self.metadata_budget_bytes, 'cache.l2.metadata_budget_bytes')
         require_bool(
             self.acknowledge_mutually_trusted_clients,
-            'L2 mutually-trusted-client acknowledgement',
+            'cache.l2.acknowledge_mutually_trusted_clients',
         )
 
 
@@ -350,58 +357,59 @@ class LimitSettings:
             ValueError: A bound is outside its range, the result limit exceeds
                 1 MiB, or the clock error reaches the URL safety margin.
         """
-        require_positive_number(self.fill_lease_seconds, 'fill-lease duration')
-        require_positive_number(self.lease_wait_seconds, 'lease-wait budget')
-        require_positive_int(self.max_dependency_tags, 'maximum dependency tags')
-        require_positive_int(self.max_dependency_vector_bytes, 'maximum dependency-vector bytes')
-        require_positive_int(self.max_serialized_result_bytes, 'maximum serialized-result bytes')
+        require_positive_number(self.fill_lease_seconds, 'cache.limits.fill_lease_seconds')
+        require_positive_number(self.lease_wait_seconds, 'cache.limits.lease_wait_seconds')
+        require_positive_int(self.max_dependency_tags, 'cache.limits.max_dependency_tags')
+        require_positive_int(
+            self.max_dependency_vector_bytes, 'cache.limits.max_dependency_vector_bytes'
+        )
+        require_positive_int(
+            self.max_serialized_result_bytes, 'cache.limits.max_serialized_result_bytes'
+        )
         if self.max_serialized_result_bytes > MAX_BYTES:
             raise ValueError(
-                'maximum serialized-result bytes cannot exceed the 1 MiB codec ceiling'
+                'cache.limits.max_serialized_result_bytes cannot exceed the 1 MiB codec ceiling'
             )
         require_positive_number(
             self.scoped_generation_retention_seconds,
-            'scoped-generation retention',
+            'cache.limits.scoped_generation_retention_seconds',
         )
-        require_positive_number(self.connect_timeout_seconds, 'backend connect timeout')
-        require_positive_number(self.operation_timeout_seconds, 'backend operation timeout')
-        require_positive_int(self.circuit_failure_threshold, 'circuit failure threshold')
-        require_positive_number(self.circuit_probe_seconds, 'circuit probe interval')
+        require_positive_number(
+            self.connect_timeout_seconds, 'cache.limits.connect_timeout_seconds'
+        )
+        require_positive_number(
+            self.operation_timeout_seconds, 'cache.limits.operation_timeout_seconds'
+        )
+        require_positive_int(
+            self.circuit_failure_threshold, 'cache.limits.circuit_failure_threshold'
+        )
+        require_positive_number(self.circuit_probe_seconds, 'cache.limits.circuit_probe_seconds')
         require_positive_number(
             self.incarnation_validation_seconds,
-            'incarnation validation interval',
+            'cache.limits.incarnation_validation_seconds',
         )
         require_positive_number(
             self.signed_url_safety_margin_seconds,
-            'signed-URL safety margin',
+            'cache.limits.signed_url_safety_margin_seconds',
         )
         require_positive_number(
             self.transient_image_max_age_seconds,
-            'transient-image maximum age',
+            'cache.limits.transient_image_max_age_seconds',
         )
         if self.clock_error_bound_seconds is not None:
-            _require_nonnegative_number(self.clock_error_bound_seconds, 'clock error bound')
+            _require_nonnegative_number(
+                self.clock_error_bound_seconds, 'cache.limits.clock_error_bound_seconds'
+            )
             if self.clock_error_bound_seconds >= self.signed_url_safety_margin_seconds:
                 raise ValueError(
-                    'clock error bound must be smaller than the signed-URL safety margin'
+                    'cache.limits.clock_error_bound_seconds must be smaller '
+                    'than cache.limits.signed_url_safety_margin_seconds'
                 )
 
 
 @dataclass(frozen=True, slots=True)
-class TTLRule:
-    """Override a layer default for one supported policy match.
-
-    Exactly one match shape is allowed, in descending precedence: method plus
-    entity type, method alone, entity type alone, query class alone, or
-    identity kind alone. Rule order does not override this precedence.
-
-    Attributes:
-        maximum_age_seconds: Positive age no greater than 3,600 seconds.
-        method: Optional SG read method match.
-        entity_type: Optional SG entity type match.
-        query_class: Optional query-policy classification match.
-        identity_kind: Optional `script` or `human` match.
-    """
+class _TTLRule:
+    """Override a layer default for one supported policy match."""
 
     maximum_age_seconds: float
     method: str | None = None
@@ -410,8 +418,8 @@ class TTLRule:
     identity_kind: str | None = None
 
     @property
-    def _match_key(self) -> tuple[bool, bool, bool, bool]:
-        """Return the match-field shape used for validation and precedence."""
+    def match_key(self) -> tuple[bool, bool, bool, bool]:
+        """Return which match fields are set, in method, entity, query, identity order."""
         return (
             self.method is not None,
             self.entity_type is not None,
@@ -420,31 +428,30 @@ class TTLRule:
         )
 
     def __post_init__(self) -> None:
-        """Validate the age cap and one supported unambiguous match shape.
-
-        Raises:
-            TypeError: The age or a supplied match value has the wrong type.
-            ValueError: The age is outside (0, 3600], a match value is invalid,
-                or the match combination is unsupported.
-        """
-        require_positive_number(self.maximum_age_seconds, 'TTL-rule maximum age')
+        """Validate the age cap and one supported unambiguous match shape."""
+        require_positive_number(self.maximum_age_seconds, 'cache.ttl_rule.maximum_age_seconds')
         if self.maximum_age_seconds > _GLOBAL_MAXIMUM_SECONDS:
-            raise ValueError('TTL-rule maximum age cannot exceed 3,600 seconds')
-        for value in (self.method, self.entity_type, self.query_class, self.identity_kind):
+            raise ValueError('cache.ttl_rule.maximum_age_seconds cannot exceed 3,600 seconds')
+        for key, value in (
+            ('method', self.method),
+            ('entity_type', self.entity_type),
+            ('query_class', self.query_class),
+            ('identity_kind', self.identity_kind),
+        ):
             if value is not None:
-                require_nonempty_string(value, 'TTL-rule match value')
+                require_nonempty_string(value, f'cache.ttl_rule.{key}')
         if self.identity_kind is not None and self.identity_kind not in ('script', 'human'):
-            raise ValueError('TTL-rule identity kind must be script or human')
+            raise ValueError('cache.ttl_rule.identity_kind must be script or human')
         if self.query_class is not None and self.query_class not in _QUERY_CLASSES:
-            raise ValueError('TTL-rule query class must be event_aware, ttl_only, or schema')
+            raise ValueError('cache.ttl_rule.query_class must be event_aware, ttl_only, or schema')
         if not any((self.method, self.entity_type, self.query_class, self.identity_kind)):
-            raise ValueError('TTL rule requires at least one match field')
-        if self._match_key not in _RULE_PRECEDENCE:
-            raise ValueError('unsupported or ambiguous TTL-rule match combination')
+            raise ValueError('cache.ttl_rule requires at least one match field')
+        if self.match_key not in _RULE_PRECEDENCE:
+            raise ValueError('cache.ttl_rule has an unsupported or ambiguous match combination')
 
     @property
-    def _match_tuple(self) -> tuple[str | None, str | None, str | None, str | None]:
-        """Return the complete match tuple used for duplicate detection."""
+    def match_tuple(self) -> tuple[str | None, str | None, str | None, str | None]:
+        """Return method, entity type, query class, and identity kind for duplicate checks."""
         return (self.method, self.entity_type, self.query_class, self.identity_kind)
 
 
@@ -554,7 +561,7 @@ class CacheSettings:
     l1: L1Settings = field(default_factory=L1Settings)
     l2: L2Settings = field(default_factory=L2Settings)
     limits: LimitSettings = field(default_factory=LimitSettings)
-    ttl_rules: tuple[TTLRule, ...] = ()
+    ttl_rules: tuple[_TTLRule, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the complete topology and its shared policy constraints.
@@ -567,26 +574,26 @@ class CacheSettings:
         """
         _require_cache_components(self.l1, self.l2, self.limits)
         if self.l2.enabled and self.limits.max_dependency_tags > VALKEY_MAX_DEPENDENCY_TAGS_V1:
-            raise ValueError('shared Valkey dependency tag limit cannot exceed the v1 ceiling')
+            raise ValueError('cache.limits.max_dependency_tags cannot exceed the v1 ceiling')
         if self.schema_version != 1:
-            raise ValueError('unsupported cache schema version')
+            raise ValueError('schema_version is unsupported')
         if self.identity_policy not in ('scripts_only', 'scripts_and_humans'):
-            raise ValueError('identity policy must be scripts_only or scripts_and_humans')
-        require_positive_number(self.global_safety_max_seconds, 'global safety maximum')
+            raise ValueError('cache.identity_policy must be scripts_only or scripts_and_humans')
+        require_positive_number(self.global_safety_max_seconds, 'cache.global_safety_max_seconds')
         if self.global_safety_max_seconds > _GLOBAL_MAXIMUM_SECONDS:
-            raise ValueError('global safety maximum cannot exceed 3,600 seconds')
+            raise ValueError('cache.global_safety_max_seconds cannot exceed 3,600 seconds')
         if self.metrics_digest_secret_env is not None:
             require_nonempty_string(
-                self.metrics_digest_secret_env, 'metrics secret environment name'
+                self.metrics_digest_secret_env, 'cache.metrics_digest_secret_env'
             )
-        require_site_namespace(self.site_namespace)
+        require_site_namespace(self.site_namespace, 'cache.site_namespace')
         require_bool(
             self.enable_additional_filter_presets,
-            'additional-filter-preset enablement',
+            'cache.enable_additional_filter_presets',
         )
         ttl_only_methods = _require_string_tuple(
             self.enabled_ttl_only_methods,
-            'enabled TTL-only methods',
+            'cache.enabled_ttl_only_methods',
         )
         ttl_rules = _require_ttl_rule_tuple(self.ttl_rules)
         _validate_ttl_only_methods(ttl_only_methods)
@@ -597,10 +604,11 @@ class CacheSettings:
             and not self.l2.acknowledge_mutually_trusted_clients
         ):
             raise ValueError(
-                'shared human caching requires acknowledging mutually trusted clients'
+                'cache.l2.acknowledge_mutually_trusted_clients must be true '
+                'for cache.identity_policy scripts_and_humans'
             )
         if not self.l1.enabled and not self.l2.enabled:
-            raise ValueError('at least one cache layer must be enabled')
+            raise ValueError('cache.l1.enabled or cache.l2.enabled must be true')
 
     @classmethod
     def from_toml(cls, path: str | Path) -> Self:
@@ -614,6 +622,8 @@ class CacheSettings:
 
         Raises:
             OSError: The configuration file cannot be opened or read.
+            OverflowError: A numeric value is too large to convert to a finite
+                number.
             TypeError: A configuration scalar or table has the wrong type.
             ValueError: TOML syntax or a configuration value is invalid,
                 unknown, unsupported, or unsafe.
@@ -628,7 +638,7 @@ class CacheSettings:
     @classmethod
     def _from_mapping(cls, document: Mapping[str, object]) -> Self:
         """Build settings from a decoded TOML mapping."""
-        _reject_unknown_keys(document, _ROOT_KEYS, 'top-level configuration')
+        _reject_unknown_keys(document, _ROOT_KEYS, 'root table')
         schema_version = _integer(document, 'schema_version', 0)
         cache = _mapping(document.get('cache', {}), 'cache table')
         _reject_unknown_keys(cache, _CACHE_KEYS, 'cache table')
@@ -648,18 +658,28 @@ class CacheSettings:
         return cls(
             schema_version=schema_version,
             identity_policy=_identity_policy(
-                cache.get('identity_policy', defaults.identity_policy)
+                _string(cache, 'identity_policy', defaults.identity_policy, owner='cache.')
             ),
             global_safety_max_seconds=_number(
-                cache, 'global_safety_max_seconds', defaults.global_safety_max_seconds
+                cache,
+                'global_safety_max_seconds',
+                defaults.global_safety_max_seconds,
+                owner='cache.',
             ),
-            metrics_digest_secret_env=_optional_string(cache, 'metrics_digest_secret_env'),
-            site_namespace=_string(cache, 'site_namespace', defaults.site_namespace),
-            enabled_ttl_only_methods=_string_tuple(cache, 'enabled_ttl_only_methods'),
+            metrics_digest_secret_env=_optional_string(
+                cache, 'metrics_digest_secret_env', owner='cache.'
+            ),
+            site_namespace=_string(
+                cache, 'site_namespace', defaults.site_namespace, owner='cache.'
+            ),
+            enabled_ttl_only_methods=_string_tuple(
+                cache, 'enabled_ttl_only_methods', owner='cache.'
+            ),
             enable_additional_filter_presets=_boolean(
                 cache,
                 'enable_additional_filter_presets',
                 default=defaults.enable_additional_filter_presets,
+                owner='cache.',
             ),
             l1=l1,
             l2=l2,
@@ -668,10 +688,10 @@ class CacheSettings:
         )
 
 
-def _boolean(mapping: Mapping[str, object], key: str, *, default: bool) -> bool:
+def _boolean(mapping: Mapping[str, object], key: str, *, default: bool, owner: str = '') -> bool:
     """Read one strict TOML boolean."""
     value = mapping.get(key, default)
-    return require_bool(value, key)
+    return require_bool(value, f'{owner}{key}')
 
 
 def _endpoint_identity(host: str, port: int) -> tuple[str, int]:
@@ -689,14 +709,14 @@ def _identity_policy(value: object) -> _IdentityPolicy:
         return 'scripts_only'
     if value == 'scripts_and_humans':
         return 'scripts_and_humans'
-    raise ValueError('identity policy must be scripts_only or scripts_and_humans')
+    raise ValueError('cache.identity_policy must be scripts_only or scripts_and_humans')
 
 
-def _integer(mapping: Mapping[str, object], key: str, default: int) -> int:
+def _integer(mapping: Mapping[str, object], key: str, default: int, owner: str = '') -> int:
     """Read one strict TOML integer."""
     value = mapping.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f'{key} must be an integer')
+        raise TypeError(f'{owner}{key} must be an integer')
     return value
 
 
@@ -731,14 +751,17 @@ def _mapping(value: object, owner: str) -> Mapping[str, object]:
     return cast('Mapping[str, object]', untyped)
 
 
-def _number(mapping: Mapping[str, object], key: str, default: float) -> float:
+def _number(mapping: Mapping[str, object], key: str, default: float, owner: str = '') -> float:
     """Read one finite TOML integer or float."""
     value = mapping.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError(f'{key} must be a number')
-    result = float(value)
+        raise TypeError(f'{owner}{key} must be a number')
+    try:
+        result = float(value)
+    except OverflowError:
+        raise OverflowError(f'{owner}{key} must fit a finite number') from None
     if not math.isfinite(result):
-        raise ValueError(f'{key} must be finite')
+        raise ValueError(f'{owner}{key} must be finite')
     return result
 
 
@@ -746,83 +769,116 @@ def _load_l1(mapping: Mapping[str, object]) -> L1Settings:
     """Load the L1 settings table."""
     defaults = L1Settings()
     return L1Settings(
-        enabled=_boolean(mapping, 'enabled', default=defaults.enabled),
+        enabled=_boolean(mapping, 'enabled', default=defaults.enabled, owner='cache.l1.'),
         hierarchical_max_age_seconds=_number(
-            mapping, 'hierarchical_max_age_seconds', defaults.hierarchical_max_age_seconds
+            mapping,
+            'hierarchical_max_age_seconds',
+            defaults.hierarchical_max_age_seconds,
+            owner='cache.l1.',
         ),
         local_only_max_age_seconds=_number(
-            mapping, 'local_only_max_age_seconds', defaults.local_only_max_age_seconds
+            mapping,
+            'local_only_max_age_seconds',
+            defaults.local_only_max_age_seconds,
+            owner='cache.l1.',
         ),
-        result_budget_bytes=_integer(mapping, 'result_budget_bytes', defaults.result_budget_bytes),
+        result_budget_bytes=_integer(
+            mapping, 'result_budget_bytes', defaults.result_budget_bytes, owner='cache.l1.'
+        ),
         metadata_budget_bytes=_integer(
-            mapping, 'metadata_budget_bytes', defaults.metadata_budget_bytes
+            mapping, 'metadata_budget_bytes', defaults.metadata_budget_bytes, owner='cache.l1.'
         ),
     )
 
 
-def _optional_number(mapping: Mapping[str, object], key: str) -> float | None:
+def _optional_number(mapping: Mapping[str, object], key: str, owner: str = '') -> float | None:
     """Read an optional finite TOML integer or float."""
     if key not in mapping:
         return None
-    return _number(mapping, key, 0)
+    return _number(mapping, key, 0, owner=owner)
 
 
 def _load_limits(mapping: Mapping[str, object]) -> LimitSettings:
     """Load the bounded operational limits table."""
     defaults = LimitSettings()
     return LimitSettings(
-        fill_lease_seconds=_number(mapping, 'fill_lease_seconds', defaults.fill_lease_seconds),
-        lease_wait_seconds=_number(mapping, 'lease_wait_seconds', defaults.lease_wait_seconds),
-        max_dependency_tags=_integer(mapping, 'max_dependency_tags', defaults.max_dependency_tags),
+        fill_lease_seconds=_number(
+            mapping, 'fill_lease_seconds', defaults.fill_lease_seconds, owner='cache.limits.'
+        ),
+        lease_wait_seconds=_number(
+            mapping, 'lease_wait_seconds', defaults.lease_wait_seconds, owner='cache.limits.'
+        ),
+        max_dependency_tags=_integer(
+            mapping, 'max_dependency_tags', defaults.max_dependency_tags, owner='cache.limits.'
+        ),
         max_dependency_vector_bytes=_integer(
-            mapping, 'max_dependency_vector_bytes', defaults.max_dependency_vector_bytes
+            mapping,
+            'max_dependency_vector_bytes',
+            defaults.max_dependency_vector_bytes,
+            owner='cache.limits.',
         ),
         max_serialized_result_bytes=_integer(
             mapping,
             'max_serialized_result_bytes',
             defaults.max_serialized_result_bytes,
+            owner='cache.limits.',
         ),
         scoped_generation_retention_seconds=_number(
             mapping,
             'scoped_generation_retention_seconds',
             defaults.scoped_generation_retention_seconds,
+            owner='cache.limits.',
         ),
         connect_timeout_seconds=_number(
-            mapping, 'connect_timeout_seconds', defaults.connect_timeout_seconds
+            mapping,
+            'connect_timeout_seconds',
+            defaults.connect_timeout_seconds,
+            owner='cache.limits.',
         ),
         operation_timeout_seconds=_number(
-            mapping, 'operation_timeout_seconds', defaults.operation_timeout_seconds
+            mapping,
+            'operation_timeout_seconds',
+            defaults.operation_timeout_seconds,
+            owner='cache.limits.',
         ),
         circuit_failure_threshold=_integer(
-            mapping, 'circuit_failure_threshold', defaults.circuit_failure_threshold
+            mapping,
+            'circuit_failure_threshold',
+            defaults.circuit_failure_threshold,
+            owner='cache.limits.',
         ),
         circuit_probe_seconds=_number(
-            mapping, 'circuit_probe_seconds', defaults.circuit_probe_seconds
+            mapping, 'circuit_probe_seconds', defaults.circuit_probe_seconds, owner='cache.limits.'
         ),
         incarnation_validation_seconds=_number(
             mapping,
             'incarnation_validation_seconds',
             defaults.incarnation_validation_seconds,
+            owner='cache.limits.',
         ),
         signed_url_safety_margin_seconds=_number(
             mapping,
             'signed_url_safety_margin_seconds',
             defaults.signed_url_safety_margin_seconds,
+            owner='cache.limits.',
         ),
         transient_image_max_age_seconds=_number(
             mapping,
             'transient_image_max_age_seconds',
             defaults.transient_image_max_age_seconds,
+            owner='cache.limits.',
         ),
-        clock_error_bound_seconds=_optional_number(mapping, 'clock_error_bound_seconds'),
+        clock_error_bound_seconds=_optional_number(
+            mapping, 'clock_error_bound_seconds', owner='cache.limits.'
+        ),
     )
 
 
-def _reject_duplicate_rules(rules: tuple[TTLRule, ...]) -> None:
+def _reject_duplicate_rules(rules: tuple[_TTLRule, ...]) -> None:
     """Reject duplicate matches rather than choose by declaration order."""
-    matches = [rule._match_tuple for rule in rules]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    matches = [rule.match_tuple for rule in rules]
     if len(matches) != len(set(matches)):
-        raise ValueError('configuration contains a duplicate TTL rule match')
+        raise ValueError('cache.ttl_rule contains a duplicate TTL rule match')
 
 
 def _reject_unknown_keys(
@@ -830,17 +886,19 @@ def _reject_unknown_keys(
 ) -> None:
     """Reject schema extensions so every process interprets one closed document."""
     if not mapping.keys() <= allowed:
-        raise ValueError(f'{owner} contains an unknown key')
+        raise ValueError(
+            f'{owner} contains an unknown key; allowed keys: {", ".join(sorted(allowed))}'
+        )
 
 
 def _require_cache_components(l1: object, l2: object, limits: object) -> None:
     """Require immutable validated nested settings values."""
     if not isinstance(l1, L1Settings):
-        raise TypeError('L1 settings must be an immutable L1Settings value')
+        raise TypeError('cache.l1 must be an immutable L1Settings value')
     if not isinstance(l2, L2Settings):
-        raise TypeError('L2 settings must be an immutable L2Settings value')
+        raise TypeError('cache.l2 must be an immutable L2Settings value')
     if not isinstance(limits, LimitSettings):
-        raise TypeError('limit settings must be an immutable LimitSettings value')
+        raise TypeError('cache.limits must be an immutable LimitSettings value')
 
 
 def _require_nonnegative_int(value: object, owner: str) -> None:
@@ -881,11 +939,11 @@ def _require_environment_name(value: object, owner: str) -> str:
 
 def _require_key_prefix(value: object) -> str:
     """Require one short literal ASCII Valkey namespace prefix."""
-    prefix = _require_safe_ascii(value, 'Valkey key prefix')
+    prefix = _require_safe_ascii(value, 'key_prefix')
     if len(prefix) > _MAX_KEY_PREFIX_LENGTH or any(
         character in '*?[]|\\/' for character in prefix
     ):
-        raise ValueError('Valkey key prefix must be short literal ASCII')
+        raise ValueError('key_prefix must be short literal ASCII')
     return prefix
 
 
@@ -899,19 +957,19 @@ def _require_string_tuple(value: object, owner: str) -> tuple[str, ...]:
     return cast('tuple[str, ...]', values)
 
 
-def _require_ttl_rule_tuple(value: object) -> tuple[TTLRule, ...]:
+def _require_ttl_rule_tuple(value: object) -> tuple[_TTLRule, ...]:
     """Require an immutable tuple containing only validated TTL rules."""
     if not isinstance(value, tuple):
-        raise TypeError('TTL rules must be a tuple')
+        raise TypeError('cache.ttl_rule must be a tuple')
     values = cast('tuple[object, ...]', value)
-    if not all(isinstance(item, TTLRule) for item in values):
-        raise TypeError('TTL rules must contain only immutable TTLRule values')
-    return cast('tuple[TTLRule, ...]', values)
+    if not all(isinstance(item, _TTLRule) for item in values):
+        raise TypeError('cache.ttl_rule must contain only immutable TTLRule values')
+    return cast('tuple[_TTLRule, ...]', values)
 
 
-def _require_valkey_host(value: object) -> str:
+def _require_valkey_host(value: object, owner: str = 'host') -> str:
     """Require a credential-free literal Valkey host name or address."""
-    host = _require_safe_ascii(value, 'Valkey host')
+    host = _require_safe_ascii(value, owner)
     try:
         ip_address(host)
     except ValueError:
@@ -934,19 +992,18 @@ def _require_valkey_host(value: object) -> str:
         )
         or (len(labels) > 1 and all(label.isdecimal() for label in labels))
     ):
-        raise ValueError('Valkey host must be a DNS name or raw IP address')
+        raise ValueError(f'{owner} must be a DNS name or raw IP address')
     return host
 
 
-def _require_valkey_port(value: object) -> None:
+def _require_valkey_port(value: object, owner: str = 'port') -> None:
     """Require one TCP port number."""
-    require_positive_int(value, 'Valkey port')
-    if cast('int', value) > _MAX_TCP_PORT:
-        raise ValueError('Valkey port must not exceed 65,535')
+    if require_positive_int(value, owner) > _MAX_TCP_PORT:
+        raise ValueError(f'{owner} must not exceed 65,535')
 
 
 def _rule_matches(
-    rule: TTLRule,
+    rule: _TTLRule,
     *,
     method: str,
     entity_type: str | None,
@@ -962,19 +1019,19 @@ def _rule_matches(
     )
 
 
-def _rule_precedence(rule: TTLRule) -> int:
+def _rule_precedence(rule: _TTLRule) -> int:
     """Return the documented strength of one validated rule shape."""
-    return _RULE_PRECEDENCE[rule._match_key]  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    return _RULE_PRECEDENCE[rule.match_key]
 
 
 def _select_ttl_rule(
-    rules: Sequence[TTLRule],
+    rules: Sequence[_TTLRule],
     *,
     method: str,
     entity_type: str | None,
     query_class: str,
     identity_kind: str,
-) -> TTLRule | None:
+) -> _TTLRule | None:
     """Select one configured rule using the documented specificity order."""
     matches = [
         rule
@@ -992,39 +1049,39 @@ def _select_ttl_rule(
     return max(matches, key=_rule_precedence)
 
 
-def _string(mapping: Mapping[str, object], key: str, default: str) -> str:
+def _string(mapping: Mapping[str, object], key: str, default: str, owner: str = '') -> str:
     """Read one TOML string."""
     value = mapping.get(key, default)
     if not isinstance(value, str):
-        raise TypeError(f'{key} must be a string')
+        raise TypeError(f'{owner}{key} must be a string')
     return value
 
 
-def _optional_string(mapping: Mapping[str, object], key: str) -> str | None:
+def _optional_string(mapping: Mapping[str, object], key: str, owner: str = '') -> str | None:
     """Read an optional TOML string."""
     if key not in mapping:
         return None
-    return _string(mapping, key, '')
+    return _string(mapping, key, '', owner=owner)
 
 
-def _load_ttl_rules(value: object) -> tuple[TTLRule, ...]:
+def _load_ttl_rules(value: object) -> tuple[_TTLRule, ...]:
     """Load repeated TTL-rule tables in declaration order."""
     if not isinstance(value, list | tuple):
         raise TypeError('cache.ttl_rule must be an array of tables')
     items = cast('list[object] | tuple[object, ...]', value)
-    rules: list[TTLRule] = []
+    rules: list[_TTLRule] = []
     for item in items:
         mapping = _mapping(item, 'cache.ttl_rule record')
         _reject_unknown_keys(mapping, _TTL_RULE_KEYS, 'cache.ttl_rule record')
         if 'maximum_age_seconds' not in mapping:
-            raise ValueError('TTL rule requires maximum_age_seconds')
+            raise ValueError('cache.ttl_rule requires maximum_age_seconds')
         rules.append(
-            TTLRule(
-                _number(mapping, 'maximum_age_seconds', 0),
-                method=_optional_string(mapping, 'method'),
-                entity_type=_optional_string(mapping, 'entity_type'),
-                query_class=_optional_string(mapping, 'query_class'),
-                identity_kind=_optional_string(mapping, 'identity_kind'),
+            _TTLRule(
+                _number(mapping, 'maximum_age_seconds', 0, owner='cache.ttl_rule.'),
+                method=_optional_string(mapping, 'method', owner='cache.ttl_rule.'),
+                entity_type=_optional_string(mapping, 'entity_type', owner='cache.ttl_rule.'),
+                query_class=_optional_string(mapping, 'query_class', owner='cache.ttl_rule.'),
+                identity_kind=_optional_string(mapping, 'identity_kind', owner='cache.ttl_rule.'),
             )
         )
     loaded = tuple(rules)
@@ -1032,38 +1089,41 @@ def _load_ttl_rules(value: object) -> tuple[TTLRule, ...]:
     return loaded
 
 
-def _string_tuple(mapping: Mapping[str, object], key: str) -> tuple[str, ...]:
+def _string_tuple(mapping: Mapping[str, object], key: str, owner: str = '') -> tuple[str, ...]:
     """Read an ordered TOML string array."""
     value = mapping.get(key, ())
     if not isinstance(value, list | tuple):
-        raise TypeError(f'{key} must be an array of strings')
+        raise TypeError(f'{owner}{key} must be an array of strings')
     items = cast('list[object] | tuple[object, ...]', value)
     if not all(isinstance(item, str) for item in items):
-        raise TypeError(f'{key} must be an array of strings')
+        raise TypeError(f'{owner}{key} must be an array of strings')
     return tuple(cast('list[str] | tuple[str, ...]', items))
 
 
 def _validate_ttl_only_methods(methods: tuple[str, ...]) -> None:
     """Accept only composite methods whose documented response shape carries no URL."""
     if not set(methods) <= URL_PROVEN_TTL_ONLY_METHODS:
-        raise ValueError('configuration contains an unknown TTL-only method')
+        raise ValueError('cache.enabled_ttl_only_methods contains an unknown TTL-only method')
     if len(methods) != len(set(methods)):
-        raise ValueError('TTL-only method names must be unique')
+        raise ValueError('cache.enabled_ttl_only_methods must be unique')
 
 
-def _valkey_mode(value: object) -> _ValkeyMode:
+def _valkey_mode(value: object, owner: str = 'mode') -> _ValkeyMode:
     """Narrow one validated value to the configured deployment vocabulary."""
     if isinstance(value, str) and value in get_args(_ValkeyMode):
         return cast('_ValkeyMode', value)
-    raise ValueError('Valkey mode must be standalone, sentinel, or managed')
+    raise ValueError(f'{owner} must be standalone, sentinel, or managed')
 
 
-def parse_sentinel_address(value: object) -> tuple[str, int]:
+def parse_sentinel_address(
+    value: object, owner: str = 'Valkey sentinel address'
+) -> tuple[str, int]:
     """Parse one credential-free Sentinel `host:port` address.
 
     Args:
         value: ASCII DNS name or raw IP address followed by a decimal TCP port;
             hosts containing colons require brackets.
+        owner: TOML field path or caller label used in validation errors.
 
     Returns:
         The unbracketed host and integer port, without DNS normalization.
@@ -1072,56 +1132,77 @@ def parse_sentinel_address(value: object) -> tuple[str, int]:
         TypeError: The address is not a string.
         ValueError: The address violates the configured host or port grammar.
     """
-    text = _require_safe_ascii(value, 'Valkey sentinel address')
+    text = _require_safe_ascii(value, owner)
     host: str
     port_text: str
     if text.startswith('['):
         closing = text.find(']')
         if closing < 0 or closing + 1 >= len(text) or text[closing + 1] != ':':
-            raise ValueError('Valkey sentinel address must use host:port')
+            raise ValueError(f'{owner} must use host:port')
         host = text[1:closing]
         port_text = text[closing + 2 :]
     else:
         host, separator, port_text = text.rpartition(':')
         if not separator or ':' in host:
-            raise ValueError('Valkey sentinel address must use host:port')
-    _require_valkey_host(host)
+            raise ValueError(f'{owner} must use host:port')
+    _require_valkey_host(host, owner)
     if not port_text.isdecimal():
-        raise ValueError('Valkey sentinel address must use host:port')
-    port = int(port_text)
-    _require_valkey_port(port)
+        raise ValueError(f'{owner} must use host:port')
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise ValueError(f'{owner} must use host:port') from None
+    _require_valkey_port(port, owner)
     return host, port
 
 
 def _load_valkey_role(mapping: Mapping[str, object], role: str) -> ValkeyRoleSettings:
     """Load one complete Valkey role table."""
+    owner = f'cache.l2.valkey.{role}.'
     defaults = ValkeySettings().result
-    mode = _valkey_mode(_string(mapping, 'mode', defaults.mode))
+    mode = _valkey_mode(_string(mapping, 'mode', defaults.mode, owner=owner), f'{owner}mode')
     connection_keys = {'sentinels', 'service_name'} if mode == 'sentinel' else {'host'}
     required = {'password_env'} | connection_keys
     if not required <= mapping.keys():
-        raise ValueError(f'Valkey {role} role is missing required connection settings')
-    sentinels = _string_tuple(mapping, 'sentinels')
-    host = _string(mapping, 'host', parse_sentinel_address(sentinels[0])[0] if sentinels else '')
-    return ValkeyRoleSettings(
-        mode=mode,
-        host=host,
-        port=_integer(mapping, 'port', defaults.port),
-        database=_integer(mapping, 'database', defaults.database),
-        tls=_boolean(mapping, 'tls', default=defaults.tls),
-        username=_optional_string(mapping, 'username'),
-        password_env=_string(mapping, 'password_env', ''),
-        key_prefix=_string(mapping, 'key_prefix', defaults.key_prefix),
-        sentinels=sentinels,
-        service_name=_optional_string(mapping, 'service_name'),
+        missing = ', '.join(sorted(required - mapping.keys()))
+        raise ValueError(f'cache.l2.valkey.{role} missing required keys: {missing}')
+    sentinels = _string_tuple(mapping, 'sentinels', owner=owner)
+    host = _string(
+        mapping,
+        'host',
+        parse_sentinel_address(sentinels[0], f'{owner}sentinels')[0] if sentinels else '',
+        owner=owner,
     )
+    port = _integer(mapping, 'port', defaults.port, owner=owner)
+    database = _integer(mapping, 'database', defaults.database, owner=owner)
+    tls = _boolean(mapping, 'tls', default=defaults.tls, owner=owner)
+    username = _optional_string(mapping, 'username', owner=owner)
+    password_env = _string(mapping, 'password_env', '', owner=owner)
+    key_prefix = _string(mapping, 'key_prefix', defaults.key_prefix, owner=owner)
+    service_name = _optional_string(mapping, 'service_name', owner=owner)
+    try:
+        return ValkeyRoleSettings(
+            mode=mode,
+            host=host,
+            port=port,
+            database=database,
+            tls=tls,
+            username=username,
+            password_env=password_env,
+            key_prefix=key_prefix,
+            sentinels=sentinels,
+            service_name=service_name,
+        )
+    except (TypeError, ValueError) as error:
+        raise type(error)(f'{owner}{error}') from None
 
 
 def _load_valkey(mapping: Mapping[str, object]) -> ValkeySettings:
     """Load the required pair of Valkey role tables."""
     _reject_unknown_keys(mapping, _VALKEY_KEYS, 'cache.l2.valkey table')
     if set(mapping) != set(_VALKEY_KEYS):
-        raise ValueError('cache.l2.valkey requires result and metadata role tables')
+        missing = ', '.join(sorted(_VALKEY_KEYS - mapping.keys()))
+        raise ValueError(f'cache.l2.valkey missing required role tables: {missing}')
     result = _mapping(mapping['result'], 'cache.l2.valkey.result table')
     metadata = _mapping(mapping['metadata'], 'cache.l2.valkey.metadata table')
     _reject_unknown_keys(result, _VALKEY_ROLE_KEYS, 'cache.l2.valkey.result table')
@@ -1135,7 +1216,7 @@ def _load_valkey(mapping: Mapping[str, object]) -> ValkeySettings:
 def _load_l2(mapping: Mapping[str, object]) -> L2Settings:
     """Load the L2 settings table."""
     defaults = L2Settings()
-    enabled = _boolean(mapping, 'enabled', default=defaults.enabled)
+    enabled = _boolean(mapping, 'enabled', default=defaults.enabled, owner='cache.l2.')
     if enabled and 'valkey' not in mapping:
         raise ValueError('enabled L2 requires cache.l2.valkey role tables')
     valkey = (
@@ -1145,25 +1226,34 @@ def _load_l2(mapping: Mapping[str, object]) -> L2Settings:
     )
     return L2Settings(
         enabled=enabled,
-        backend=_string(mapping, 'backend', defaults.backend),
+        backend=_string(mapping, 'backend', defaults.backend, owner='cache.l2.'),
         valkey=valkey,
         event_aware_max_age_seconds=_number(
-            mapping, 'event_aware_max_age_seconds', defaults.event_aware_max_age_seconds
+            mapping,
+            'event_aware_max_age_seconds',
+            defaults.event_aware_max_age_seconds,
+            owner='cache.l2.',
         ),
         ttl_only_max_age_seconds=_number(
-            mapping, 'ttl_only_max_age_seconds', defaults.ttl_only_max_age_seconds
+            mapping,
+            'ttl_only_max_age_seconds',
+            defaults.ttl_only_max_age_seconds,
+            owner='cache.l2.',
         ),
         schema_max_age_seconds=_number(
-            mapping, 'schema_max_age_seconds', defaults.schema_max_age_seconds
+            mapping, 'schema_max_age_seconds', defaults.schema_max_age_seconds, owner='cache.l2.'
         ),
-        result_budget_bytes=_integer(mapping, 'result_budget_bytes', defaults.result_budget_bytes),
+        result_budget_bytes=_integer(
+            mapping, 'result_budget_bytes', defaults.result_budget_bytes, owner='cache.l2.'
+        ),
         metadata_budget_bytes=_integer(
-            mapping, 'metadata_budget_bytes', defaults.metadata_budget_bytes
+            mapping, 'metadata_budget_bytes', defaults.metadata_budget_bytes, owner='cache.l2.'
         ),
         acknowledge_mutually_trusted_clients=_boolean(
             mapping,
             'acknowledge_mutually_trusted_clients',
             default=defaults.acknowledge_mutually_trusted_clients,
+            owner='cache.l2.',
         ),
     )
 

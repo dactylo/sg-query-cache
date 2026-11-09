@@ -65,11 +65,9 @@ def _invoke(store: LocalStore, operation: str, now: float) -> None:
         case 'reserve':
             store.reserve('new', 10.0, 'b' * 32, op)
         case 'commit':
-            store.commit(
-                FillLease('lease-193', store._leases['lease-193']._token), b'[]', 10.0, op
-            )
+            store.commit(FillLease('lease-193', store._leases['lease-193'].token), b'[]', 10.0, op)
         case 'release':
-            store.release(FillLease('lease-193', store._leases['lease-193']._token), op)
+            store.release(FillLease('lease-193', store._leases['lease-193'].token), op)
         case 'change':
             store.change((GenerationChange(tag),), op)
         case 'flush':
@@ -139,7 +137,7 @@ def test_every_operation_bounds_all_queue_visits_without_table_scans(
 
     _invoke(store, operation, now)
 
-    assert results._visits == leases._visits == generations._visits == 64
+    assert results.visits == leases.visits == generations.visits == 64
     _assert_indexes(store)
 
 
@@ -162,8 +160,8 @@ def test_expired_scoped_tail_resolves_fresh_at_equal_deadlines() -> None:
 
     vector = store.resolve((tag,), StoreOperation(7_200.0))
 
-    assert vector.entries[0][1] > old._token
-    assert store._generations[tag]._retirement_deadline == 14_400.0
+    assert vector.entries[0][1] > old.token
+    assert store._generations[tag].retirement_deadline == 14_400.0
     _assert_indexes(store)
 
 
@@ -172,7 +170,7 @@ def test_expired_tail_lease_rejects_commit_without_replacement_owner() -> None:
     key = next(reversed(store._lease_queue))
     old = store._leases[key]
 
-    assert not store.commit(FillLease(key, old._token), b'[]', 60.0, StoreOperation(61.0))
+    assert not store.commit(FillLease(key, old.token), b'[]', 60.0, StoreOperation(61.0))
     assert key not in store._leases
     assert store.lookup(key, StoreOperation(61.0)) is None
 
@@ -199,7 +197,7 @@ def test_isolated_addressed_expiry_is_immediate_for_lookup_and_reserve() -> None
     target = next(reversed(store._result_queue))
     assert store.lookup(target, StoreOperation(60.0)) is None
     key = next(reversed(store._lease_queue))
-    old = store._leases[key]._token
+    old = store._leases[key].token
 
     replacement = store.reserve(key, 10.0, 'b' * 32, StoreOperation(60.0))
 
@@ -288,4 +286,4 @@ def test_small_live_queues_visit_each_record_only_once() -> None:
 
     store.lookup('absent', StoreOperation(0.0))
 
-    assert results._visits == leases._visits == generations._visits == 3
+    assert results.visits == leases.visits == generations.visits == 3

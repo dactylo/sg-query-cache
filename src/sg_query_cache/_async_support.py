@@ -14,6 +14,7 @@ from asyncio import (
 )
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Generic, Literal, TypeVar
 
@@ -21,25 +22,23 @@ from sg_query_cache._backend import BackendUnavailable
 
 _T = TypeVar('_T')
 
+PUBLISHED_DEADLINE: ContextVar['DeadlineRecord | None'] = ContextVar(
+    'published_deadline', default=None
+)
 
-@dataclass(frozen=True)
-class CleanupOutcome(Generic[_T]):
-    """Keep cleanup results separate from deferred caller cancellation.
 
-    The caller must settle final synchronous obligations before applying its
-    error policy or re-raising `cancellation`. Cancellation counts are
-    retained.
+@dataclass(slots=True)
+class DeadlineRecord:
+    """Share an absolute deadline and its timer expiry across owned tasks.
 
     Attributes:
-        value: Action result on success, including a successful `None` result.
-        error: Ordinary action failure, `TimeoutError` for an expired deadline,
-            or `BackendUnavailable` for independently cancelled inner work.
-        cancellation: First caller cancellation received while joining, if any.
+        deadline: Absolute running-loop time in seconds.
+        expired: Whether a timer owning this deadline has expired. Once set,
+            this remains true for the lifetime of the record.
     """
 
-    value: _T | None = None
-    error: Exception | None = None
-    cancellation: CancelledError | None = None
+    deadline: float
+    expired: bool = False
 
 
 class LoopAffinity:
@@ -63,6 +62,52 @@ class LoopAffinity:
             self._loop = loop
         elif loop is not self._loop:
             raise RuntimeError('async cache component used from a different event loop')
+
+
+async def _wait_deferring_cancellation(completion: Future[_T]) -> CancelledError | None:
+    """Wait until completion is done and return the first caller cancellation."""
+    cancellation: CancelledError | None = None
+    while not completion.done():
+        try:
+            await shield(completion)
+        except CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+    return cancellation
+
+
+@contextmanager
+def publish_deadline(record: DeadlineRecord) -> Generator[None]:
+    """Publish a deadline for this scope and restore the previous record on exit.
+
+    Args:
+        record: Mutable deadline inherited by tasks created within this scope.
+    """
+    token = PUBLISHED_DEADLINE.set(record)
+    try:
+        yield
+    finally:
+        PUBLISHED_DEADLINE.reset(token)
+
+
+@dataclass(frozen=True)
+class CleanupOutcome(Generic[_T]):
+    """Keep cleanup results separate from deferred caller cancellation.
+
+    The caller must settle final synchronous obligations before applying its
+    error policy or re-raising `cancellation`. Cancellation counts are
+    retained.
+
+    Attributes:
+        value: Action result on success, including a successful `None` result.
+        error: Ordinary action failure, `TimeoutError` for an expired deadline,
+            or `BackendUnavailable` for independently cancelled inner work.
+        cancellation: First caller cancellation received while joining, if any.
+    """
+
+    value: _T | None = None
+    error: Exception | None = None
+    cancellation: CancelledError | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -117,7 +162,12 @@ class Admission:
 
     @property
     def closed(self) -> bool:
-        """Check loop affinity and report whether terminal close has finished."""
+        """Check loop affinity and report whether terminal close has finished.
+
+        Raises:
+            RuntimeError: The query runs outside a running event loop or on a
+                different loop from the guard's owner.
+        """
         self._affinity.check()
         return self._state == 'closed'
 
@@ -179,6 +229,10 @@ class Admission:
         Call after `begin_close` to prevent new admission during the join.
         This does not cancel operation owners or detect indirect dependency
         cycles.
+
+        Raises:
+            RuntimeError: The call uses a different event loop.
+            CancelledError: The caller cancels the wait.
         """
         self._affinity.check()
         await self._idle.wait()
@@ -189,23 +243,16 @@ async def _capture_cleanup(
     deadline: float | None,
 ) -> CleanupOutcome[_T]:
     """Capture ordinary failure inside the owned task under one deadline."""
+    record = PUBLISHED_DEADLINE.get()
+    timer = timeout_at(deadline)
     try:
-        async with timeout_at(deadline):
+        async with timer:
             return CleanupOutcome(value=await action())
     except Exception as error:  # noqa: BLE001 - capture ordinary cleanup failure before joining
         return CleanupOutcome(error=error)
-
-
-async def _wait_deferring_cancellation(completion: Future[_T]) -> CancelledError | None:
-    """Wait until completion is done and return the first caller cancellation."""
-    cancellation: CancelledError | None = None
-    while not completion.done():
-        try:
-            await shield(completion)
-        except CancelledError as error:
-            if cancellation is None:
-                cancellation = error
-    return cancellation
+    finally:
+        if timer.expired() and record is not None:
+            record.expired = True
 
 
 async def join_shared_close(

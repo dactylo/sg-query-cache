@@ -11,13 +11,13 @@ from sg_query_cache._query import FILTER_GROUP_KEYS, ORDER_ITEM_KEYS
 
 _KeyPurpose: TypeAlias = Literal['lease', 'result']
 
+METRICS_KEY_MIN_BYTES = 32
 _CACHE_FORMAT = 'v1'
 _CLIENT_OPTION_NAMES = ('localized', 'convert_datetimes_to_utc')
 _CREDENTIAL_NAMES = frozenset({'api_key', 'session_token'})
 _DIGEST_LENGTH = 64
 _INCARNATION_LENGTH = 32
 _MAX_GENERATION = 2**63 - 1
-METRICS_KEY_MIN_BYTES = 32
 _OPTIONAL_CLIENT_OPTION_NAMES = ('records_per_page',)
 _PAIR_LENGTH = 2
 

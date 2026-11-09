@@ -73,6 +73,12 @@ def opaque_key(value: object) -> str:
     return value
 
 
+def require_vector_byte_bound(encoded_bytes: int, maximum: int) -> None:
+    """Raise `BackendProtocolError` when encoded vector bytes exceed the maximum."""
+    if encoded_bytes > maximum:
+        raise BackendProtocolError('dependency vector exceeds the byte bound')
+
+
 def validate_vector_tags(tags: object, maximum: int) -> tuple[DependencyTag, ...]:
     """Validate an ordered immutable dependency tuple.
 
@@ -102,9 +108,3 @@ def vector_bytes(tags: tuple[DependencyTag, ...]) -> int:
     if size is None:
         raise BackendProtocolError('dependency vector cannot be encoded safely')
     return size
-
-
-def require_vector_byte_bound(vector_bytes: int, maximum: int) -> None:
-    """Raise `BackendProtocolError` when encoded vector bytes exceed the maximum."""
-    if vector_bytes > maximum:
-        raise BackendProtocolError('dependency vector exceeds the byte bound')

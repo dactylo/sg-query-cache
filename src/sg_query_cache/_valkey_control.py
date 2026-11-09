@@ -11,6 +11,7 @@ from sg_query_cache._backend import (
     BackendCapacity,
     BackendProtocolError,
     BackendUnavailable,
+    FailureClass,
     StaleIncarnation,
 )
 from sg_query_cache._metrics import MetricsSink, NullMetrics
@@ -43,6 +44,7 @@ from sg_query_cache._valkey_scripts import (
     CONTROL_ROTATE_SCRIPT,
     CONTROL_ROTATE_SCRIPT_SHA,
     ScriptClient,
+    client_failure_class,
     execute_script,
     translate_client_error,
 )
@@ -60,15 +62,25 @@ class PinnedControlClient(ScriptClient, Protocol):
     """Read the commands needed to validate writable primary state."""
 
     def exists(self, key: str) -> object:
-        """Return whether one key exists."""
+        """Check control-key presence for the cache backend.
+
+        Arguments, results and client errors are those of
+        `valkey.Valkey.exists`.
+        """
         ...
 
     def get(self, key: str) -> object:
-        """Return one raw string value."""
+        """Read the control record for the cache backend.
+
+        Arguments, results and client errors are those of `valkey.Valkey.get`.
+        """
         ...
 
     def info(self, section: str) -> object:
-        """Return one server information section."""
+        """Read replication information for the cache backend.
+
+        Arguments, results and client errors are those of `valkey.Valkey.info`.
+        """
         ...
 
 
@@ -80,15 +92,63 @@ class ControlClient(PinnedControlClient, Protocol):
         ...
 
     def pin(self) -> AbstractContextManager[PinnedControlClient]:
-        """Borrow one physical connection for a complete validation."""
+        """Borrow one physical connection for a complete backend operation.
+
+        Borrowing follows `valkey.Valkey.client`; release follows
+        `valkey.Valkey.close`. Those methods own their upstream contracts.
+
+        Return the borrowed connection to its pool on context exit.
+
+        Returns:
+            A context manager yielding a command wrapper for one physical
+            connection, valid only inside its context and released on exit.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+        """
         ...
 
     def refresh(self) -> None:
-        """Discard the current pool and construct a fresh connection."""
+        """Discard the current pool and construct a replacement client.
+
+        The replacement is constructed after detachment; it is not a borrowed
+        pin.
+
+        Pool release uses `valkey.Valkey.close`, which owns the upstream
+        release contract. This boundary normalizes client failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+        """
         ...
 
     def refresh_endpoint(self) -> None:
-        """Explicitly refresh Sentinel discovery when applicable."""
+        """Refresh primary discovery and discard a pool whose endpoint changed.
+
+        Do nothing when the role has no endpoint probe.
+
+        Discovery arguments, results and upstream errors are owned by
+        `valkey.sentinel.SentinelConnectionPool.get_master_address`; this
+        boundary normalizes discovery failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+        """
         ...
 
 
@@ -130,11 +190,10 @@ class ValkeyControl:
             metrics: Optional safe metrics destination.
 
         Raises:
-            BackendProtocolError: The prefix or validation interval is invalid.
             BackendUnavailable: The jitter source fails or returns an invalid
                 interval.
         """
-        interval = validation_interval(key_prefix, validation_seconds, jitter_factory)
+        interval = validation_interval(validation_seconds, jitter_factory)
         self._client = client
         self._clock = clock
         self._control_key = control_key(key_prefix)
@@ -208,9 +267,14 @@ class ValkeyControl:
         return decode_exists(self._call(lambda: client.exists(candidate.counter_key)))
 
     def _read_replication_id(self, client: PinnedControlClient) -> str:
-        """Read and validate the writable primary's replication identity."""
+        """Read the writable primary's replication identity, discarding a demoted pool."""
         raw = self._call(lambda: client.info('replication'))
-        return primary_replication_id(raw)
+        try:
+            return primary_replication_id(raw)
+        except BackendUnavailable:
+            # A replica reply identifies a demoted node, like a READONLY error.
+            self._discard_pool()
+            raise
 
     def _refresh_endpoint(self) -> None:
         """Refresh Sentinel discovery through the maintained role client."""
@@ -280,7 +344,12 @@ class ValkeyControl:
             return (), error, False
         return (), None, True
 
-    def _settle(self, client: PinnedControlClient, initial_epoch: RoleEpoch) -> None:
+    def _settle(
+        self,
+        client: PinnedControlClient,
+        initial_epoch: RoleEpoch,
+        operation_class: FailureClass | None,
+    ) -> None:
         """Settle one returned or raised operation outcome against its epoch."""
         failure: Exception | None = None
         try:
@@ -289,7 +358,13 @@ class ValkeyControl:
             failure = error
         if span_epoch(self._client.epoch(), client) != initial_epoch:
             self._discard_pool()
-            raise BackendUnavailable('Valkey role changed during operation')
+            failure_class = (
+                client_failure_class(failure) if failure is not None else operation_class
+            )
+            del failure
+            raise BackendUnavailable(
+                'Valkey role changed during operation', failure_class=failure_class
+            ) from None
         if failure is not None:
             raise failure
 
@@ -364,7 +439,7 @@ class ValkeyControl:
                         candidate,
                         operation,
                     )
-                    self._settle(client, initial_epoch)
+                    self._settle(client, initial_epoch, client_failure_class(operation_failure))
                     if rotation_required:
                         self._increment('old_incarnation_rejected')
                         self._clear_validation()

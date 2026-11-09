@@ -25,11 +25,33 @@ class AsyncCacheBackend(Protocol):
 
         Args:
             changes: Ordered generation replacements to acknowledge together.
+
+        Raises:
+            BackendCapacity: Required generation metadata cannot be retained.
+            BackendProtocolError: The ordered change tuple is malformed.
+            BackendUnavailable: The change cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
     async def close(self) -> None:
-        """Release backend resources; repeated same-loop calls have no effect."""
+        """Release backend resources; repeated same-loop calls have no effect.
+
+        Backends with active asynchronous work join it before terminal cleanup.
+        Caller cancellation may be deferred until owned cleanup settles.
+
+        Raises:
+            RuntimeError: The close uses another event loop or would wait on
+                its own admitted operation.
+            BackendCapacity: Owned cleanup reports a capacity failure.
+            BackendProtocolError: Owned cleanup reports malformed client state.
+            BackendUnavailable: Owned cleanup cannot complete reliably.
+            CancelledError: Caller cancellation propagates after required
+                cleanup settlement.
+        """
         ...
 
     async def commit(self, lease: FillLease, payload: bytes, remaining_seconds: float) -> bool:
@@ -42,6 +64,16 @@ class AsyncCacheBackend(Protocol):
 
         Returns:
             Whether the lease remained current and the result was admitted.
+
+        Raises:
+            BackendCapacity: Result-role preparation or oversized-payload lease
+                cleanup encounters a capacity failure.
+            BackendProtocolError: An argument is outside the backend contract.
+            BackendUnavailable: The commit cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
@@ -51,6 +83,15 @@ class AsyncCacheBackend(Protocol):
         Args:
             site_namespace: Stable configured site namespace.
             reason: Short operator-facing reason code.
+
+        Raises:
+            BackendCapacity: Required global metadata cannot be retained.
+            BackendProtocolError: The site namespace or reason is malformed.
+            BackendUnavailable: The flush cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
@@ -63,6 +104,16 @@ class AsyncCacheBackend(Protocol):
         Returns:
             An isolated hit, optionally carrying the backend's fresh decoded
             value, or `None` for absence, expiry, or corruption.
+
+        Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
+            BackendProtocolError: The key or backend reply is malformed.
+            BackendUnavailable: The lookup cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
@@ -74,6 +125,16 @@ class AsyncCacheBackend(Protocol):
 
         Returns:
             Whether the current lease was removed.
+
+        Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
+            BackendProtocolError: The lease or backend reply is malformed.
+            BackendUnavailable: The release cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
@@ -82,10 +143,19 @@ class AsyncCacheBackend(Protocol):
 
         Args:
             key: Opaque generation-qualified result key.
-            lease_seconds: Positive ownership duration.
+            lease_seconds: Positive ownership duration in seconds.
 
         Returns:
             A fresh lease, or `None` while another lease remains current.
+
+        Raises:
+            BackendCapacity: Metadata capacity cannot retain a new lease.
+            BackendProtocolError: An argument is outside the backend contract.
+            BackendUnavailable: The reservation cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...
 
@@ -97,5 +167,15 @@ class AsyncCacheBackend(Protocol):
 
         Returns:
             Every requested tag and current token under one incarnation.
+
+        Raises:
+            BackendCapacity: Metadata capacity cannot retain the vector.
+            BackendProtocolError: The vector is malformed or exceeds its
+                bounds.
+            BackendUnavailable: Resolution cannot complete reliably.
+            StaleIncarnation: The backend incarnation is no longer current.
+            RuntimeError: The backend rejects the operation's lifecycle or
+                event-loop context.
+            CancelledError: The caller cancels the asynchronous operation.
         """
         ...

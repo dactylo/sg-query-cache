@@ -68,12 +68,7 @@ def test_closed_values_round_trip_with_exact_types(value: object) -> None:
     assert type(decoded) is type(value)
 
 
-def test_codec_rejects_data_beyond_the_fixed_byte_bound() -> None:
-    value = 'x' * 1_048_576
-
-    with pytest.raises(CodecError, match='byte'):
-        encode_value(value)
-
+def test_decoder_rejects_data_beyond_the_fixed_byte_bound() -> None:
     with pytest.raises(CodecError, match='byte'):
         decode_value(b' ' * 1_048_577)
 

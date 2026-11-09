@@ -13,12 +13,12 @@ from unittest import mock
 from sg_query_cache._cli import main
 
 # Hang guard, not a performance assertion. Allow for scheduling on shared CI hosts.
-CHILD_TIMEOUT_SECONDS = 300
+_CHILD_TIMEOUT_SECONDS = 300
 _COLLECT_AFTER_KILL_SECONDS = 10
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
 _ENV = {**os.environ, 'PYTHON_COLORS': '0'}
 _Output = TypeVar('_Output', str, bytes)
-PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
+_PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
 _TRANSCRIPT_FIELD_CHARACTERS = 2048
 _TRANSCRIPT_HEAD_BYTES = 2048
 _TRANSCRIPT_TAIL_BYTES = 6144
@@ -169,11 +169,11 @@ def _kill_and_describe(
     return process_transcript(killed, cwd=cwd, note=reason)
 
 
-def finish_process(
+def _finish_process(
     process: subprocess.Popen[_Output],
     *,
     stdin: _Output | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
 ) -> subprocess.CompletedProcess[_Output]:
     try:
@@ -202,12 +202,24 @@ def run_cli(
         env=dict(_ENV if env is None else env),
         cwd=cwd,
         start_new_session=True,
-        creationflags=PROCESS_GROUP_FLAGS,
+        creationflags=_PROCESS_GROUP_FLAGS,
     )
-    result = finish_process(process, timeout=CHILD_TIMEOUT_SECONDS, cwd=cwd)
+    result = _finish_process(process, timeout=_CHILD_TIMEOUT_SECONDS, cwd=cwd)
     if expect is not None and result.returncode != expect:
         raise AssertionError(f'expected status {expect}\n{process_transcript(result, cwd=cwd)}')
     return result
+
+
+def run_python(*arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
+    return subprocess.run(
+        [sys.executable, *arguments],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+    )
 
 
 def run_setup(
@@ -222,9 +234,9 @@ def run_setup(
         stderr=subprocess.PIPE,
         cwd=cwd,
         start_new_session=True,
-        creationflags=PROCESS_GROUP_FLAGS,
+        creationflags=_PROCESS_GROUP_FLAGS,
     )
-    result = finish_process(process, timeout=CHILD_TIMEOUT_SECONDS, cwd=cwd)
+    result = _finish_process(process, timeout=_CHILD_TIMEOUT_SECONDS, cwd=cwd)
     if result.returncode != 0:
         raise AssertionError(f'setup command failed\n{process_transcript(result, cwd=cwd)}')
     return result
@@ -243,8 +255,8 @@ def run_with_closed_output(
             stderr=subprocess.PIPE,
             env=_ENV,
             start_new_session=True,
-            creationflags=PROCESS_GROUP_FLAGS,
+            creationflags=_PROCESS_GROUP_FLAGS,
         )
     finally:
         os.close(write_fd)
-    return finish_process(process, timeout=CHILD_TIMEOUT_SECONDS)
+    return _finish_process(process, timeout=_CHILD_TIMEOUT_SECONDS)

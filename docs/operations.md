@@ -19,6 +19,8 @@ commands. Your deployment supplies and operates Valkey.
 | Plan metadata capacity                       | [Metadata capacity](#metadata-capacity)                           |
 | Collect metrics and set alerts               | [Metrics and alerts](#metrics-and-alerts)                         |
 | Bound timeouts and shut down async caches    | [Async deadlines and shutdown](#async-deadlines-and-shutdown)     |
+| Look up command arguments or errors          | [Command reference](#command-reference)                           |
+| Understand connection and circuit recovery   | [Connection recovery](#connection-recovery)                       |
 | Look up a metric or label name               | [Metric reference](#metric-reference)                             |
 
 ## Service layout
@@ -52,10 +54,16 @@ dependency-list limits, and each process enforces its own L1 budgets.
 
 ## Supported deployments
 
-Standalone Valkey and Valkey Sentinel are supported. Each role connects to one writable primary, so
-ElastiCache Serverless and Valkey Cluster are not supported. You can configure a managed primary
-endpoint with `mode = "managed"`, but compatibility with specific providers has not been verified,
-including node-based, cluster-mode-disabled Multi-AZ ElastiCache.
+Use one of these deployment shapes, with separate result and metadata services:
+
+| Deployment                                                        | Configuration                    | Primary routing                                   |
+| ----------------------------------------------------------------- | -------------------------------- | ------------------------------------------------- |
+| Standalone Valkey                                                 | `mode = "standalone"`            | Direct connection to each role's writable primary |
+| Valkey Sentinel                                                   | `mode = "sentinel"`              | Sentinel discovers each role's writable primary   |
+| Node-based, cluster-mode-disabled Multi-AZ ElastiCache for Valkey | `mode = "managed"`, TLS and RBAC | One primary endpoint per replication group        |
+
+Each role connects to one writable primary. ElastiCache Serverless and Valkey Cluster are not
+supported.
 
 A managed deployment needs, for each role:
 
@@ -70,9 +78,9 @@ For ElastiCache, use one cluster-mode-disabled Multi-AZ replication group per ro
 in a disposable environment, and check the provider's current failover-test limits before
 scheduling repeated tests.
 
-Measure your SG workload, node sizes, latency, and failover behavior before rollout; local tests do
-not establish behavior at farm scale. The [benchmark guide](benchmarks.md) measures duplicate-call
-savings and cache costs for a synthetic workload.
+Measure your SG workload, node sizes, latency, and failover behavior before rollout. Include
+Sentinel discovery latency when sizing a Sentinel deployment. Use the
+[benchmark guide](benchmarks.md) to estimate duplicate-call savings and cache costs.
 
 ## Network and access control
 
@@ -84,7 +92,9 @@ that role's key prefix, and only these commands, including those that the cache'
 GET SET DEL EXISTS INCR PERSIST PEXPIRE PTTL EVALSHA SCRIPT LOAD INFO replication SELECT
 ```
 
-The `SELECT` permission is needed when a role uses a nonzero `database`. Do not grant broad
+The `SELECT` permission is needed when a role uses a nonzero `database`. `AUTH` and `HELLO` need no
+grant. The Valkey client also sends `CLIENT SETINFO` when it connects and ignores a rejection, so
+the ACL log records that denial unless you also grant `CLIENT SETINFO`. Do not grant broad
 administrative or cross-prefix access. The cache uses `INFO replication` to confirm that each new
 connection in managed and Sentinel modes reaches a writable primary, and to detect a change of
 primary.
@@ -94,10 +104,8 @@ Sentinel address as well as its primary. Each Sentinel must accept those credent
 settings and allow `SENTINEL MASTERS` for discovery. A Sentinel that rejects discovery prevents
 operator commands from completing and causes cache reads to bypass L2.
 
-Both roles use short connect and operation timeouts, 0.1 and 0.25 seconds by default, so an
-unavailable Valkey delays reads only briefly. Five consecutive failures open a role's circuit by
-default; while it is open, reads go directly to SG. After 10 seconds, one probe tries again with a
-fresh connection pool. Success closes the circuit, and failure reopens it.
+For timeouts, startup bursts, and circuit behavior, see
+[connection recovery](#connection-recovery).
 
 Backend keys contain SHA-256 digests rather than raw query text, so ordinary key listings do not
 show field values or filter text. Hashing is not encryption: someone who can list keys and guess
@@ -175,7 +183,7 @@ maximum age. Choose one recovery path:
 
   ```sh
   sg-query-cache flush --config /etc/sg-query-cache.toml \
-      --site production --reason daemon_recovery
+      --reason daemon_recovery
   sg-event-daemon skip-callback --config "$DAEMON_CONFIG" \
       --site production --group cache-invalidation --reason "$REASON"
   ```
@@ -194,13 +202,11 @@ generation; it does not delete result data:
 
 ```sh
 sg-query-cache flush --config /etc/sg-query-cache.toml \
-    --site production --reason incident_recovery
+    --reason incident_recovery
 ```
 
-`--site` is the site namespace and `--reason` is 1 to 64 ASCII characters. The backend classifies
-`cache_site_flush` reasons as `daemon_setup`, `daemon_recovery`, or `operator` for any other
-reason. The supplied CLI and daemon plugin use `NullMetrics`, so their flushes do not emit this
-metric to a sink.
+The flush uses `cache.site_namespace` from the settings file. To flush another site, use its
+settings file.
 
 To invalidate every site under the key prefix at once, rotate the incarnation. Confirm the metadata
 role's `key_prefix`:
@@ -210,33 +216,20 @@ sg-query-cache rotate-incarnation --config /etc/sg-query-cache.toml \
     --confirm-prefix sgqc-production
 ```
 
-Rotation is wider than a site flush. Neither command reclaims metadata memory; see
-[metadata capacity](#metadata-capacity).
+Neither command reclaims metadata memory; see [metadata capacity](#metadata-capacity).
 
-On success, `flush` prints `flush acknowledged site=` followed by a SHA-256 digest of the site
-namespace, and `rotate-incarnation` prints `incarnation rotation acknowledged for all sites`. The
-exit status tells you what happened:
-
-| Exit | Meaning                                                                                                                                                      |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0    | The metadata role acknowledged the operation.                                                                                                                |
-| 1    | The operation was not acknowledged. Check Valkey and run the command again.                                                                                  |
-| 2    | The settings file is invalid, unavailable, or has L2 disabled; the `valkey` extra or the metadata password is missing; or `--confirm-prefix` does not match. |
-
-Apart from usage errors, which print the command's usage, each failure prints one line to standard
-error without settings values or secrets: `error: flush operation was not acknowledged` or
-`error: incarnation rotation was not acknowledged` for exit 1, and
-`error: configuration is invalid or unavailable` or
-`error: prefix confirmation does not match configuration` for exit 2.
+Check the acknowledgement before continuing recovery. See the
+[command reference](#command-reference) for arguments, output, exit statuses, and error messages.
 
 ## Metadata capacity
 
 The metadata role uses `noeviction`, so when it is full, Valkey rejects new metadata writes and the
 affected cache operations go directly to SG. Nothing removes generation records early. A record for
-a specific entity, entity type, field, or project expires after it goes unused for
-`scoped_generation_retention_seconds`, 7,200 seconds by default; site-wide, schema, and permission
-records never expire. Space returns as those records expire, or when you add capacity to the
-metadata service and raise `metadata_budget_bytes` to match.
+a specific entity, entity type, or field, or for one human user's visibility, expires after it goes
+unused for `scoped_generation_retention_seconds`, 7,200 seconds by default. Site-wide, schema,
+permission, and shared human-visibility records never expire. Space returns as those records
+expire, or when you add capacity to the metadata service and raise `metadata_budget_bytes` to
+match.
 
 A site flush or incarnation rotation changes key names and invalidates old results, but neither
 deletes old metadata or reclaims its memory, so neither is a capacity remedy. Before the service
@@ -244,20 +237,21 @@ fills, monitor its memory headroom, `cache_metadata_write_rejection`, and backen
 
 ## Metrics and alerts
 
-Cache components report counters and observations to a metrics sink: any object with
-`increment(name, labels)` and `observe(name, value, labels)` methods. Build the safe metrics
-boundary from your sink before passing it to cache components:
+Pass a metrics sink to either wrapper's owning factory with `metrics=sink`. A sink provides
+`increment(name, labels)` and `observe(name, value, labels)` methods. Both `CachedShotgun.open()`
+and `AsyncCachedShotgun.open()` build the safe metrics boundary for you.
+
+For manual construction, build the boundary first:
 
 ```python
 metrics = QueryCache.build_metrics(settings, os.environ, sink)
 ```
 
-Pass the returned `metrics` to `LocalBackend`, `ValkeyBackend.from_settings`, and `QueryCache`. The
-boundary accepts only documented metric names and safe labels. With the
-[metrics correlation secret](configuration.md#metrics-correlation-secret) configured, metrics
-emitted by `QueryCache` during a read include `exact_call_digest`. Backend metrics never carry it,
-including those emitted during a read. `AsyncCachedShotgun.open()` builds the boundary itself from
-its `metrics=` argument. `NullMetrics` discards all metrics.
+Pass that `metrics` object to each backend and the cache. It accepts only the
+[documented metric names and safe labels](#metric-reference). `NullMetrics` discards all metrics.
+To correlate events from one exact read, configure a
+[metrics correlation secret](configuration.md#metrics-correlation-secret); that section lists which
+events receive the digest.
 
 Alert on:
 
@@ -266,44 +260,99 @@ Alert on:
 - `cache_metadata_write_rejection`, which means the metadata service is full;
 - `cache_lease_timeout`, which means a wait budget expired; the request may still use a cached
   result, fetch SG, or publish a parsed memo afterward;
-- a rising `cache_bypass` rate;
+- a rising `cache_bypass` rate. Reason `unacknowledged_fence` means a layer missed a write's fence
+  and serves no hits to that wrapper until a later write through it fences the layer successfully,
+  or the process restarts;
 - unexpected `cache_incarnation` activity. Its `validated` outcome is routine: it recurs for each
   metadata connection in every validation interval and after each reconnect;
 - `cache_site_flush` activity from cache components configured with a metrics sink. The supplied
   CLI and daemon plugin discard their metrics.
+
+When `backend_failure` includes a `failure_class`, use the
+[failure classification table](#failure-classification) to choose your first check.
 
 Judge the benefit by comparing `cache_sg_avoided_calls` and `cache_sg_avoided_seconds` with your SG
 request durations; hit rate alone does not describe it.
 
 ## Async deadlines and shutdown
 
-`limits.operation_timeout_seconds`, 0.25 seconds by default, applies differently in the two
-execution models:
-
-- Synchronous Valkey clients use it as a socket timeout, so a reconnect and a script reload can
-  each take another full timeout.
-- Async clients use it as one cooperative budget for each backend operation, and for each whole
-  fence or release cleanup. Reconnecting, loading scripts, and settling share that budget. Each
-  backend close gets its own budget.
-
-Neither is a hard wall-clock limit: cancellation cleanup can finish after the deadline. A custom
-async backend must propagate cancellation after finite, nonblocking cleanup.
-
-Async metrics show how operations ended. An SG fetch cancelled before it returns a result emits
-`cache_fill` with outcome `cancelled`. Cancellation while a result is being stored keeps the
-successful fill metric and any valid stored result. An expired backend deadline emits
-`backend_failure` with reason `finalization_timeout`; a fill lease whose release failed expires on
-its own.
+If your service needs a shutdown time limit, cancel and await its request tasks first, then close
+the cache from outside those tasks.
 
 Closing an async cache is final. Close waits, with no deadline of its own, for every admitted
 operation, including SG calls and their cleanup, before it closes each backend. If the caller of
 close is cancelled, close keeps waiting and then raises the original cancellation.
 
-Close a cache from outside the chain of operations that are using it. The cache rejects a close
-from the task that is running one of its operations, but it checks only that task, not its parents.
-A parent operation waiting on a child task, or a `TaskGroup` child, that closes the cache can
-deadlock. If your service needs a shutdown time limit, cancel and await its request tasks first,
-from outside that chain, and then close the cache.
+Always initiate shutdown from outside the tasks using the cache. The cache rejects a close from the
+task that is running one of its operations, but it checks only that task, not its parents. A parent
+operation waiting on a child task, or a `TaskGroup` child, that closes the cache can deadlock.
+
+### Operation deadlines
+
+`limits.operation_timeout_seconds`, 0.25 seconds by default, applies differently in the two
+execution models:
+
+- Synchronous Valkey clients use it as a socket timeout, so a reconnect and a script reload can
+  each take another full timeout.
+- The shipped async Valkey backends own one cooperative deadline published by the cache for each
+  backend operation, each whole fence or release cleanup, and each backend close. The cache adds no
+  second timer for these backends. Reconnecting, loading scripts, and settling share the
+  operation's budget. Operations inside a cleanup are bounded by the cleanup's remaining budget. A
+  custom async backend that does not claim deadline ownership retains the cache's timer.
+
+Neither is a hard wall-clock limit: cancellation cleanup can finish after the deadline. The shipped
+async backends propagate cancellation after finite, nonblocking cleanup.
+
+Async metrics show how operations ended. An SG fetch cancelled before it returns a result emits
+`cache_fill` with outcome `cancelled`. Cancellation while a result is being stored keeps the
+successful fill metric and any valid stored result. For each expired published deadline, the cache
+emits one `backend_failure` with reason `finalization_timeout`, even if cancellation cleanup
+finishes later or the caller cancels during it. The Valkey backend can also emit its own failure
+metric. A fill lease whose release failed expires on its own.
+
+## Command reference
+
+### `flush` and `rotate-incarnation`
+
+| Argument                  | Command              | Meaning                                             |
+| ------------------------- | -------------------- | --------------------------------------------------- |
+| `--config PATH`           | Both                 | Required settings file with L2 enabled              |
+| `--reason TEXT`           | `flush`              | Required reason, 1 to 64 ASCII characters           |
+| `--site NAME`             | `flush`              | Optional; must match the configured site namespace  |
+| `--confirm-prefix PREFIX` | `rotate-incarnation` | Required; must match the metadata role's key prefix |
+
+A different `--site` exits 2 before opening the store. The backend classifies `cache_site_flush`
+reasons as `daemon_setup`, `daemon_recovery`, or `operator` for any other reason. The supplied CLI
+and daemon plugin use `NullMetrics`, so their flushes do not emit this metric to a sink.
+
+On success, `flush` prints `flush acknowledged site=` followed by a SHA-256 digest of the site
+namespace, and `rotate-incarnation` prints `incarnation rotation acknowledged for all sites`. The
+exit status tells you what happened:
+
+| Exit | Meaning                                                                                                                                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | The metadata role acknowledged the operation.                                                                                                                            |
+| 1    | The operation was not acknowledged. Check Valkey and run the command again.                                                                                              |
+| 2    | The settings file is invalid, unavailable, or has L2 disabled; the `valkey` extra or the metadata password is missing; or `--site` or `--confirm-prefix` does not match. |
+
+Apart from usage errors, which print the command's usage, each failure prints one line to standard
+error without settings values or secrets. Exit 1 prints
+`error: flush operation was not acknowledged` or
+`error: incarnation rotation was not acknowledged`. Exit 2 prints the applicable line:
+
+| Cause                                                 | Error line                                                                       |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Settings file cannot be read                          | `error: cannot read the settings file`                                           |
+| Settings file is invalid                              | `error: the settings file is invalid`                                            |
+| Shared L2 cache is disabled                           | `error: the settings do not enable the shared L2 cache`                          |
+| `valkey` extra is missing                             | `error: the valkey extra is not installed: pip install 'sg-query-cache[valkey]'` |
+| Metadata password environment variable is unset       | `error: environment variable <name> is not set`                                  |
+| Other store setup `KeyError` or `OSError`             | `error: the Valkey store could not be set up`                                    |
+| Other store setup `TypeError` or `ValueError`         | `error: the Valkey settings are invalid`                                         |
+| `--site` differs from the configured site             | `error: --site does not match the configured site namespace`                     |
+| `--confirm-prefix` differs from the configured prefix | `error: prefix confirmation does not match configuration`                        |
+
+`<name>` is the configured metadata `password_env` variable name.
 
 ## Metric reference
 
@@ -344,11 +393,22 @@ generation_metadata_bytes
 `generation_metadata_bytes` reports L1 metadata only; use Valkey's own memory telemetry for the
 metadata role.
 
-The only label names are `backend_operation`, `classification`, `layer`, `method`, `outcome`,
-`reason`, and `tag_kind`. Label values are nonempty ASCII of at most 64 characters. `layer` is
-`local_l1`, `hierarchical_l1`, or `l2`. When a metrics correlation secret is configured,
-`exact_call_digest` is also allowed; it holds only a keyed lowercase HMAC-SHA-256 digest.
-Credentials, fields, filters, payloads, queries, and URLs are never labels.
+The standard label names are:
+
+| Label               | Describes                                          |
+| ------------------- | -------------------------------------------------- |
+| `backend_operation` | Backend operation being measured                   |
+| `classification`    | Query classification                               |
+| `failure_class`     | [Valkey failure category](#failure-classification) |
+| `layer`             | `local_l1`, `hierarchical_l1`, or `l2`             |
+| `method`            | SG method                                          |
+| `outcome`           | Result of the measured operation                   |
+| `reason`            | Why the event occurred                             |
+| `tag_kind`          | Dependency tag category                            |
+
+Label values are nonempty ASCII of at most 64 characters. When a metrics correlation secret is
+configured, `exact_call_digest` is also allowed; it holds only a keyed lowercase HMAC-SHA-256
+digest. Credentials, fields, filters, payloads, queries, and URLs are never labels.
 
 The cache keeps a parsed copy of the SG schema in each process to analyze queries.
 `cache_schema_view` reports how each use of that copy was satisfied:
@@ -360,6 +420,28 @@ The cache keeps a parsed copy of the SG schema in each process to analyze querie
 | `rebuild`     | A schema result was fetched or read from the cache and parsed successfully. |
 | `malformed`   | A schema result failed to parse.                                            |
 | `refetch`     | After a parse failure, the schema was fetched directly from SG.             |
+
+### Failure classification
+
+`backend_failure` includes a `failure_class` label when a classified Valkey failure caused the
+event. The closed vocabulary gives an operator a starting check:
+
+| `failure_class`  | Check                                                                                                     |
+| ---------------- | --------------------------------------------------------------------------------------------------------- |
+| `authentication` | Check the configured credentials, permissions, and server authentication policy.                          |
+| `tls`            | Check the TLS configuration, certificate trust, and handshake.                                            |
+| `connection`     | Check endpoint reachability, DNS, and server availability.                                                |
+| `timeout`        | Check network and server latency against the operation timeout.                                           |
+| `replica`        | Check whether the configured or discovered endpoint currently serves a writable primary.                  |
+| `unknown`        | Check client and server diagnostics outside the metric; the translated error did not match another class. |
+
+`BackendUnavailable.failure_class` exposes the same value for classified Valkey failures. Direct
+metadata validation that finds a replica carries `replica` even without a client error. The metric
+label is absent when `failure_class` is `None`, as with cache-owned deadlines, closed circuits, and
+cache-level `finalization_timeout` events, and on the breaker's `half_open` and `closed`
+transitions. The shipped async Valkey backends classify their own expired deadlines as `timeout`.
+The breaker's `open` and `reopened` events carry the class of the failure that caused them. Failure
+messages, hosts, and client exception chains are not exposed through this classification.
 
 ### Waiting for another fill
 
@@ -408,3 +490,31 @@ thread finding a held lease waits as `distributed`. Synchronous `read_parsed` st
 not wait for a lease held elsewhere; it fetches without storing. Hierarchical result paths and
 every async cache normally coordinate followers locally, while the elected reader may wait for the
 deepest lease.
+
+## Connection recovery
+
+Constructing a synchronous `ValkeyBackend` or `ValkeyMetadataStore` performs no Valkey I/O,
+including in managed and Sentinel modes. The first operation connects and proves the writable
+primary. An unavailable Valkey therefore does not prevent backend construction at startup; cache
+reads fall back to SG while the role circuit breaker tracks failures and probes for recovery.
+
+Five consecutive failures open a role's circuit by default; while it is open, reads go directly to
+SG. After 10 seconds, one probe tries again with a fresh connection pool. Success closes the
+circuit, and failure reopens it. If the caller cancels a half-open probe and its backend deadline
+does not expire, the circuit returns to open without counting a failure. The `backend_failure`
+outcome `probe_abandoned` marks this transition; the next operation may probe immediately.
+
+Both roles use short connect and operation timeouts, 0.1 and 0.25 seconds by default, so an
+unavailable Valkey delays reads only briefly. In synchronous clients, `connect_timeout_seconds`
+bounds only the TCP connection; the TLS handshake, authentication, and the primary check each run
+under `operation_timeout_seconds`. In async clients, `connect_timeout_seconds` bounds the TCP
+connection and TLS handshake together, and each backend operation, including any reconnect, shares
+one `operation_timeout_seconds` budget; see [async deadlines](#async-deadlines-and-shutdown).
+
+Each Sentinel backend operation makes two `SENTINEL MASTERS` discovery round trips: one before
+execution and one during settlement. In async mode, both share that operation's timeout budget.
+
+Many clients connecting at once can cause occasional bypasses, for example after a failover or a
+fleet restart. Reuse one backend per process and stagger process startup before raising timeouts
+for every operation. See the
+[connection setup measurements](benchmarks.md#connection-setup-measurements).

@@ -41,7 +41,7 @@ from sg_query_cache._model import DependencyTag, GenerationChange, GenerationVec
 from sg_query_cache._valkey_common import (
     Incarnation,
     ScriptArgument,
-    ScriptOperands,
+    _ScriptOperands,
     commit_operands,
     control_create_operands,
     control_rotate_operands,
@@ -50,8 +50,8 @@ from sg_query_cache._valkey_common import (
 )
 from sg_query_cache.valkey import ValkeyBackend
 from sg_query_cache.valkey_async import AsyncValkeyBackend
-from tests._backend_contract import _BackendContractTests, _BackendFactory, _BackendHarness
-from tests._fakes import _FakeClock, _RecordingMetrics
+from tests._backend_contract import BackendContractTests, BackendFactory, BackendHarness
+from tests._fakes import FakeClock, RecordingMetrics
 from tests.valkey._environment import settings as _integration_settings
 from tests.valkey._integration_helpers import ServerClock, flush_roles, integration_client
 
@@ -147,7 +147,7 @@ def _metadata_error_case(
     prefix: str,
     incarnation: Incarnation,
     case: str,
-) -> tuple[str, str, ScriptOperands, bytes | None, str | None]:
+) -> tuple[str, str, _ScriptOperands, bytes | None, str | None]:
     control = f'{prefix}:v1:control'
     if case in ('resolve', 'change', 'resolve-existing'):
         tag = DependencyTag.entity('integration', 'Asset', 901)
@@ -259,10 +259,7 @@ def script_metadata() -> Iterator[tuple[_AdminClient, CacheSettings, Incarnation
     flush_roles(settings)
     client = _client(settings.l2.valkey.metadata, settings)
     prefix = settings.l2.valkey.metadata.key_prefix
-    nonce = token_hex(16)
-    counter_key = f'{prefix}:v1:counter:{nonce}'
-    record = f'primary|{nonce}|{counter_key}'.encode('ascii')
-    incarnation = Incarnation('primary', nonce, counter_key, record)
+    incarnation = _new_incarnation(prefix)
     operands = control_create_operands(f'{prefix}:v1:control', incarnation)
     try:
         assert _script_call(
@@ -271,34 +268,34 @@ def script_metadata() -> Iterator[tuple[_AdminClient, CacheSettings, Incarnation
             scripts.CONTROL_CREATE_SCRIPT_SHA,
             operands.keys,
             operands.args,
-        ) == [b'created', record]
+        ) == [b'created', incarnation.record]
         yield client, settings, incarnation
     finally:
         client.close()
 
 
 @pytest.fixture
-def backend_factory() -> Iterator[_BackendFactory]:
+def backend_factory() -> Iterator[BackendFactory]:
     backends: list[CacheBackend] = []
 
-    def create(settings: CacheSettings | None = None) -> _BackendHarness:
+    def create(settings: CacheSettings | None = None) -> BackendHarness:
         limits = None if settings is None else settings.limits
         resolved = _integration_settings(os.environ, limits)
         flush_roles(resolved)
         backend: CacheBackend = ValkeyBackend.from_settings(
             resolved,
             os.environ,
-            _RecordingMetrics(),
+            RecordingMetrics(),
         )
         backends.append(backend)
-        return _BackendHarness(backend, ServerClock(), _RecordingMetrics())
+        return BackendHarness(backend, ServerClock(), RecordingMetrics())
 
     yield create
     for backend in backends:
         backend.close()
 
 
-class TestValkeyBackend(_BackendContractTests):
+class TestValkeyBackend(BackendContractTests):
     pass
 
 
@@ -325,7 +322,7 @@ def test_change_script_keeps_final_signed_token_and_reports_overflow(
 def test_commit_passes_through_no_replicas() -> None:
     settings = _integration_settings(os.environ)
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     client = _client(settings.l2.valkey.result, settings)
     try:
         lease = backend.reserve('script-no-replicas', 30)
@@ -352,7 +349,7 @@ def test_commit_passes_through_no_replicas() -> None:
 def test_commit_passes_through_read_only() -> None:
     settings = _integration_settings(os.environ)
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     client = _client(settings.l2.valkey.result, settings)
     try:
         lease = backend.reserve('script-read-only', 30)
@@ -379,7 +376,7 @@ def test_commit_passes_through_read_only() -> None:
 def test_commit_reports_capacity_and_backend_rejects() -> None:
     settings = _integration_settings(os.environ)
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     client = _client(settings.l2.valkey.result, settings)
     try:
         lease = backend.reserve('script-capacity', 30)
@@ -425,9 +422,11 @@ def test_disposable_roles_have_required_eviction_and_persistence_policies() -> N
 
 
 def test_metadata_backend_passes_through_no_replicas() -> None:
-    settings = _integration_settings(os.environ)
+    # The change must find the tag still materialized, so a slow refused resolve must not let
+    # a short retention expire it; scoped expiry is not under test here.
+    settings = _integration_settings(os.environ, LimitSettings())
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     client = _client(settings.l2.valkey.metadata, settings)
     tag = DependencyTag.entity('integration', 'Asset', 902)
     try:
@@ -446,7 +445,7 @@ def test_metadata_exhaustion_bypasses_then_recovers_after_native_expiry() -> Non
     limits = LimitSettings(scoped_generation_retention_seconds=0.5)
     settings = _integration_settings(os.environ, limits)
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     metadata = _client(settings.l2.valkey.metadata, settings)
     original_maxmemory = _config_value(metadata.config_get('maxmemory'), 'maxmemory')
     used_memory = _used_memory(metadata)
@@ -629,18 +628,19 @@ def test_resolve_script_control_ceiling_and_lifetimes(
 
 
 def test_result_eviction_does_not_change_metadata_generation() -> None:
-    settings = _integration_settings(os.environ)
+    # Scoped expiry is not under test, so normal retention keeps a slow fill from expiring the tag.
+    settings = _integration_settings(os.environ, LimitSettings())
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     result = _client(settings.l2.valkey.result, settings)
     original_maxmemory = _config_value(result.config_get('maxmemory'), 'maxmemory')
     used_memory = _used_memory(result)
     result.config_set('maxmemory', used_memory + 262_144)
-    tag = DependencyTag.type_value('integration', 'Asset')
-    before = backend.resolve((tag,))
-    seed_key = 'eviction-seed'
-    payload = encode_value('x' * 65_536)
     try:
+        tag = DependencyTag.type_value('integration', 'Asset')
+        before = backend.resolve((tag,))
+        seed_key = 'eviction-seed'
+        payload = encode_value('x' * 65_536)
         seed_lease = backend.reserve(seed_key, 5)
         assert seed_lease is not None
         assert backend.commit(seed_lease, payload, 30)
@@ -662,7 +662,7 @@ def test_scoped_change_uses_materialization_and_preserves_bounded_lifetimes() ->
     limits = LimitSettings(scoped_generation_retention_seconds=0.5)
     settings = _integration_settings(os.environ, limits)
     flush_roles(settings)
-    backend = ValkeyBackend.from_settings(settings, os.environ, _RecordingMetrics())
+    backend = ValkeyBackend.from_settings(settings, os.environ, RecordingMetrics())
     metadata = _client(settings.l2.valkey.metadata, settings)
     seed = DependencyTag.entity('integration', 'Asset', 1)
     expiring = DependencyTag.entity('integration', 'Asset', 2)
@@ -765,14 +765,7 @@ def test_scripts_rotate_at_signed_counter_overflow_without_reusing_old_keys(
         next_operands.args,
     ) == [b'rotation-required']
     assert client.get(incarnation.counter_key) == b'9223372036854775807'
-    replacement_nonce = token_hex(16)
-    replacement_counter = f'{prefix}:v1:counter:{replacement_nonce}'
-    replacement = Incarnation(
-        'primary',
-        replacement_nonce,
-        replacement_counter,
-        f'primary|{replacement_nonce}|{replacement_counter}'.encode('ascii'),
-    )
+    replacement = _new_incarnation(prefix)
     rotation = control_rotate_operands(f'{prefix}:v1:control', incarnation.record, replacement)
     assert _script_call(
         client,
@@ -816,12 +809,12 @@ def test_sync_async_wrappers_share_fills_and_observe_both_invalidations(
                 ),
             ),
         )
-        clock = _FakeClock()
-        metrics = _RecordingMetrics()
+        clock = FakeClock()
+        metrics = RecordingMetrics()
         identity = Identity('script', 'integration', 'cross-wrapper')
         context = ClientContext(
-            'https://example.invalid',
-            'integration',
+            site_url='https://example.invalid',
+            site_namespace='integration',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -872,11 +865,11 @@ def test_sync_async_wrappers_share_fills_and_observe_both_invalidations(
             assert calls == [1, 0]
             sync.share_thumbnail([], source_entity={'type': 'Asset', 'id': 7})
             # Separate L1s observe remote changes when their admitted L1 age expires.
-            clock._advance(11)
+            clock.advance(11)
             assert await asynchronous.schema_read() == sync.schema_read() == {'version': 2}
             assert calls == [1, 1]
             await asynchronous.share_thumbnail([], source_entity={'type': 'Asset', 'id': 7})
-            clock._advance(11)
+            clock.advance(11)
             assert sync.schema_read() == await asynchronous.schema_read() == {'version': 3}
             assert calls == [2, 1]
         finally:

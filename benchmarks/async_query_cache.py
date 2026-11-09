@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 # ruff: noqa: INP001
 """Measure native async cache maintenance, codecs, wrapper hits, and fence windows.
 
@@ -48,8 +45,8 @@ from sg_query_cache._config import L1Settings, LimitSettings
 from sg_query_cache._model import DependencyTag, GenerationChange
 
 _CONTEXT = ClientContext(
-    'https://example.shotgrid.autodesk.com',
-    'production',
+    site_url='https://example.shotgrid.autodesk.com',
+    site_namespace='production',
     localized=False,
     convert_datetimes_to_utc=True,
     records_per_page=500,
@@ -63,11 +60,11 @@ class _Clock:
 
     def __init__(self) -> None:
         """Start with all populated records live."""
-        self._now = 1000.0
+        self.now = 1000.0
 
     def __call__(self) -> float:
         """Return the controlled backend time."""
-        return self._now
+        return self.now
 
 
 class _Metrics:
@@ -93,15 +90,24 @@ class _FenceBackend(AsyncLocalBackend):
     def __init__(self, metrics: _Metrics) -> None:
         """Create the native local backend and its controlled fence events."""
         super().__init__(CacheSettings(), perf_counter, metrics)
-        self._entered = asyncio.Event()
-        self._proceed = asyncio.Event()
-        self._fail = False
+        self.entered = asyncio.Event()
+        self.proceed = asyncio.Event()
+        self.fail = False
 
     @override
     async def change(self, changes: tuple[GenerationChange, ...]) -> None:
-        self._entered.set()
-        await self._proceed.wait()
-        if self._fail:
+        """Wait for the benchmark gate, then replace generations in caller order.
+
+        Raises:
+            BackendCapacity: Required global metadata cannot be retained.
+            BackendProtocolError: The ordered change tuple is malformed.
+            BackendUnavailable: Controlled failure is enabled or the backend is
+                unavailable.
+            RuntimeError: The backend belongs to a different event loop.
+        """
+        self.entered.set()
+        await self.proceed.wait()
+        if self.fail:
             raise BackendUnavailable('controlled fence failure')
         await super().change(changes)
 
@@ -112,14 +118,27 @@ class _FenceCache(AsyncQueryCache):
     def __init__(self, settings: CacheSettings, backend: _FenceBackend, metrics: _Metrics) -> None:
         """Create the measured cache and retain its two write-fence outcomes."""
         super().__init__(settings, _IDENTITY, l1=backend, metrics=metrics)
-        self._outcomes: list[bool] = []
+        self.outcomes: list[bool] = []
 
     @override
     async def invalidate_admitted(
         self, changes: tuple[GenerationChange, ...], *, token: OperationToken
     ) -> bool:
+        """Record whether every layer acknowledges the admitted fence attempt.
+
+        Args:
+            changes: Ordered conservative generation changes to apply.
+            token: Live capability from this cache's `admit` context.
+
+        Returns:
+            Whether every configured layer acknowledged this attempt.
+
+        Raises:
+            RuntimeError: The token is foreign or expired, or the cache belongs
+                to another loop.
+        """
         acknowledged = await super().invalidate_admitted(changes, token=token)
-        self._outcomes.append(acknowledged)
+        self.outcomes.append(acknowledged)
         return acknowledged
 
 
@@ -127,11 +146,11 @@ class _RawClient:
     """Supply a complete generated SG schema and controlled native async calls."""
 
     def __init__(self) -> None:
-        """Generate the existing benchmark's 40-type, 80-field schema shape."""
-        self._calls = 0
-        self._schema_reads = 0
-        self._writes = 0
-        self._gate: asyncio.Event | None = None
+        """Generate 40 entity types with an id field and 80 additional fields each."""
+        self.calls = 0
+        self.schema_reads = 0
+        self.writes = 0
+        self.gate: asyncio.Event | None = None
         self._schema = {
             f'CustomEntity{index:02d}': {
                 'id': {'data_type': {'value': 'number'}, 'properties': {}},
@@ -149,21 +168,21 @@ class _RawClient:
     async def find(self, *args: object, **kwargs: object) -> object:
         """Return one result after the optional leader gate opens."""
         _ = args, kwargs
-        self._calls += 1
-        if self._gate is not None:
-            await self._gate.wait()
+        self.calls += 1
+        if self.gate is not None:
+            await self.gate.wait()
         return [{'id': 1, 'type': 'CustomEntity01'}]
 
     async def schema_read(self, project_entity: object = None) -> object:
         """Count schema acquisition independently from parsed memo reuse."""
         _ = project_entity
-        self._schema_reads += 1
+        self.schema_reads += 1
         return self._schema
 
     async def update(self, *args: object, **kwargs: object) -> object:
         """Acknowledge the controlled write used to invalidate a warmed query."""
         _ = args, kwargs
-        self._writes += 1
+        self.writes += 1
         return {'id': 1, 'type': 'CustomEntity01'}
 
 
@@ -171,8 +190,8 @@ class _RawClient:
 class _Samples:
     """Retain latency and ready-callback lag samples in seconds."""
 
-    _latency: list[float]
-    _lag: list[float]
+    latency: list[float]
+    lag: list[float]
 
 
 async def _measure(operation: Callable[[], Awaitable[object]], iterations: int) -> _Samples:
@@ -221,10 +240,10 @@ def _report(name: str, samples: _Samples) -> dict[str, object]:
     """Summarize measured work, excluding population and scheduler setup."""
     return {
         'name': name,
-        'operations': len(samples._latency),
-        'latency_ms': _percentiles(samples._latency),
-        'loop_lag_ms': _percentiles(samples._lag),
-        'throughput_ops_per_second': len(samples._latency) / sum(samples._latency),
+        'operations': len(samples.latency),
+        'latency_ms': _percentiles(samples.latency),
+        'loop_lag_ms': _percentiles(samples.lag),
+        'throughput_ops_per_second': len(samples.latency) / sum(samples.latency),
     }
 
 
@@ -260,10 +279,10 @@ async def _decode(iterations: int) -> list[dict[str, object]]:
             codec_nodes=100_000
             if name == 'node-ceiling'
             else (6 if name == 'byte-ceiling' else 706),
-            encode_ms=_percentiles(encoded._latency),
-            encode_loop_lag_ms=_percentiles(encoded._lag),
-            worker_decode_ms=_percentiles(worker._latency),
-            worker_loop_lag_ms=_percentiles(worker._lag),
+            encode_ms=_percentiles(encoded.latency),
+            encode_loop_lag_ms=_percentiles(encoded.lag),
+            worker_decode_ms=_percentiles(worker.latency),
+            worker_loop_lag_ms=_percentiles(worker.lag),
         )
         reports.append(report)
     return reports
@@ -284,7 +303,7 @@ async def _maintenance(population: int, iterations: int) -> list[dict[str, objec
             await backend.reserve(f'lease-{index}', 30)
             await backend.resolve((DependencyTag.entity('production', 'Asset', index + 1),))
         if name == 'expiry-backlog':
-            clock._now += 8000
+            clock.now += 8000
         counter = 0
 
         async def lookup(
@@ -330,41 +349,41 @@ async def _mixed(iterations: int) -> list[dict[str, object]]:
 
         async with cache:
             await read()
-            backend._fail = failed
+            backend.fail = failed
             started = perf_counter()
             writer = asyncio.create_task(
                 client.update('CustomEntity01', 1, {'sg_field_000': 'new'})
             )
             try:
-                await backend._entered.wait()
+                await backend.entered.wait()
                 if failed:
-                    backend._proceed.set()
+                    backend.proceed.set()
                     await writer
-                before = raw._calls
-                schema_before = raw._schema_reads
+                before = raw.calls
+                schema_before = raw.schema_reads
                 samples = await _measure(read, iterations)
                 await asyncio.sleep(0.005)
                 duration = perf_counter() - started
             finally:
-                backend._proceed.set()
+                backend.proceed.set()
                 await writer
-            if cache._outcomes != [not failed, not failed]:
+            if cache.outcomes != [not failed, not failed]:
                 raise RuntimeError('mixed benchmark left its intended fence outcomes')
-            calls = raw._calls - before
+            calls = raw.calls - before
             if not failed and calls:
                 raise RuntimeError('mixed benchmark left its warmed cache hit window')
             report = _report('failed-retained' if failed else 'successful-in-flight', samples)
             report.update(
                 read_hits=iterations - calls,
                 read_bypasses=calls,
-                sg_calls=calls + raw._schema_reads - schema_before,
+                sg_calls=calls + raw.schema_reads - schema_before,
                 sg_find_calls=calls,
-                sg_schema_calls=raw._schema_reads - schema_before,
+                sg_schema_calls=raw.schema_reads - schema_before,
                 sg_calls_avoided=iterations - calls,
                 writes=1,
                 reads=iterations,
                 mix=f'{iterations}:1 reads:SG-write',
-                sg_writes=raw._writes,
+                sg_writes=raw.writes,
                 cooperative_fence_budget_seconds=120,
                 minimum_fence_delay_ms=5,
                 window_duration_ms=duration * 1000,
@@ -392,35 +411,35 @@ async def _wrapper(iterations: int) -> list[dict[str, object]]:
             return await client.find('CustomEntity01', [], ['id'])
 
         await read()
-        before = raw._calls
+        before = raw.calls
         samples = await _measure(read, iterations)
         report = _report('complete-wrapper-hit', samples)
         report.update(
-            sg_calls=raw._calls - before,
-            sg_calls_avoided=iterations - raw._calls + before,
-            schema_reads=raw._schema_reads,
+            sg_calls=raw.calls - before,
+            sg_calls_avoided=iterations - raw.calls + before,
+            schema_reads=raw.schema_reads,
             schema_entity_types=40,
             fields_per_type=81,
         )
         reports.append(report)
         await client.update('CustomEntity01', 1, {'sg_field_000': 'updated'})
-        raw._gate = asyncio.Event()
-        before = raw._calls
+        raw.gate = asyncio.Event()
+        before = raw.calls
 
         async def burst() -> object:
             tasks = [asyncio.create_task(read()) for _ in range(iterations)]
             await asyncio.sleep(0)
-            if raw._gate is None:
+            if raw.gate is None:
                 raise RuntimeError('missing leader gate')
-            raw._gate.set()
+            raw.gate.set()
             return await asyncio.gather(*tasks)
 
         samples = await _measure(burst, 1)
         report = _report('hot-key-followers', samples)
         report.update(
-            sg_calls=raw._calls - before,
+            sg_calls=raw.calls - before,
             followers=iterations - 1,
-            sg_calls_avoided=iterations - raw._calls + before,
+            sg_calls_avoided=iterations - raw.calls + before,
             requests=iterations,
         )
         reports.append(report)
@@ -454,13 +473,31 @@ async def _run(scenario: str, population: int, iterations: int) -> dict[str, obj
     }
 
 
-def main() -> None:
+def _main() -> None:
     """Run the selected benchmark and emit its measured report."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--scenario', choices=_SCENARIOS, required=True)
-    parser.add_argument('--population', type=int, default=1)
-    parser.add_argument('--iterations', type=int, default=1000)
-    parser.add_argument('--json', action='store_true')
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Scenarios:
+  local-maintenance: local store cleanup and loop lag
+  decode: result decoding by payload size
+  wrapper-hit: complete cached wrapper reads
+  mixed-read-write: reads during pending and failed write fences""",
+    )
+    parser.add_argument(
+        '--scenario',
+        choices=_SCENARIOS,
+        metavar='NAME',
+        required=True,
+        help='async workload to measure; see Scenarios below',
+    )
+    parser.add_argument('--population', type=int, default=1, help='local entries (default: 1)')
+    parser.add_argument('--iterations', type=int, default=1000, help='repetitions (default: 1000)')
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='emit compact JSON instead of the default indented JSON',
+    )
     options = parser.parse_args()
     if options.population < 1 or options.iterations < 1:
         parser.error('population and iterations must be positive')
@@ -469,4 +506,4 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    main()
+    _main()

@@ -8,15 +8,19 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.23
+UV_VERSION := 0.13.6
 CI_PYTHON := 3.11
 CI_EXTRAS := --extra valkey
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
 CI_COMPILE = uv pip compile pyproject.toml - $(CI_EXTRAS) --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
 
-MARKDOWN_FILES := $(wildcard README.md docs/*.md)
+# Every file git tracks or would add, except paths git marks `private`.
+git_files = $(wildcard $(shell git -c core.quotePath=false ls-files --cached --others --exclude-standard -- $(1) ':(exclude,attr:private)'))
+MARKDOWN_FILES = $(call git_files,'*.md')
+PYTHON_FILES = $(call git_files,'*.py' '*.pyi')
+WORKFLOW_FILES := $(wildcard .github/workflows/*.yml)
 
-.PHONY: all benchmark check env-check format format-check install integration lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check
+.PHONY: all benchmark check env-check file-check format format-check install integration lock-check lock-update quality reinstall setup test type-check uv-check venv-check whitespace-check workflow-check
 
 uv-check:
 	@test "$$(uv --version | cut -d ' ' -f 2)" = "$(UV_VERSION)" || \
@@ -41,27 +45,34 @@ env-check: venv-check
 benchmark: env-check
 	$(DEV_PYTHON) benchmarks/query_cache.py --profile local --scenario hot-key-burst --json
 
+# A tool given no files, or a folder, searches folders itself; stop before that can happen.
+file-check:
+	@test -n "$(PYTHON_FILES)" && test -n "$(MARKDOWN_FILES)" || \
+		{ echo 'git listed no files to check; run make from a git checkout.' >&2; exit 1; }
+	@! git ls-files --cached --others --exclude-standard -- '*.py' '*.pyi' '*.md' ':(exclude,attr:private)' | grep -q '[[:space:]]' || \
+		{ echo 'Rename Python and Markdown files whose names contain whitespace.' >&2; exit 1; }
+
 install:
-	uv tool install .
+	uv tool install '.[valkey]'
 
 integration: env-check
 	SG_QUERY_CACHE_REQUIRE_INTEGRATION=1 $(DEV_PYTHON) -m pytest -q -m integration
 
 reinstall:
-	uv tool install --reinstall .
+	uv tool install --reinstall '.[valkey]'
 
-format: env-check
-	$(DEV_PYTHON) -m ruff format .
-	$(DEV_PYTHON) -m ruff check --fix .
+format: env-check file-check
+	$(DEV_PYTHON) -m ruff format $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES) pyproject.toml
 	biome format --write .
-	if [ -n "$(MARKDOWN_FILES)" ]; then $(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES); fi
+	$(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt pyproject.toml
 
-format-check: env-check
-	$(DEV_PYTHON) -m ruff format --check .
-	$(DEV_PYTHON) -m ruff check .
+format-check: env-check file-check
+	$(DEV_PYTHON) -m ruff format --check $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES) pyproject.toml
 	biome format .
-	if [ -n "$(MARKDOWN_FILES)" ]; then $(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES); fi
+	$(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
 
 lock-check: env-check uv-check
@@ -76,18 +87,21 @@ lock-update: venv-check uv-check
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group dev --output-file requirements-ci.txt $(LOCK_FLAGS)
 	$(CI_BUILD_REQUIREMENTS) | $(CI_COMPILE) --group test --constraint requirements-ci.txt --output-file requirements-test.txt
 
-type-check: env-check
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows
+type-check: env-check file-check
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux $(PYTHON_FILES)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin $(PYTHON_FILES)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows $(PYTHON_FILES)
 
 test: env-check
 	if [ -d tests ]; then $(DEV_PYTHON) -m pytest -q $(TEST_FLAGS); fi
 
 whitespace-check:
-	git diff --check $$(git rev-parse --verify HEAD 2>/dev/null || git hash-object -t tree /dev/null)
+	git diff --check "$$(git hash-object -t tree /dev/null)" -- . ':(exclude,attr:private)'
 
-quality: format-check lock-check type-check whitespace-check
+workflow-check: env-check
+	$(VENV_BIN)/zizmor --offline --no-progress --quiet $(WORKFLOW_FILES)
+
+quality: format-check lock-check type-check whitespace-check workflow-check
 
 check: quality test
 

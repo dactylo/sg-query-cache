@@ -13,6 +13,7 @@ from sg_query_cache._backend import (
     BackendCapacity,
     BackendProtocolError,
     BackendUnavailable,
+    FailureClass,
     StaleIncarnation,
 )
 from sg_query_cache._backend_validation import (
@@ -80,13 +81,24 @@ class CircuitBreaker:
         self._state = 'closed'
         self._threshold = threshold
 
-    def _record(self, outcome: str) -> None:
+    def _record(self, outcome: str, failure_class: FailureClass | None = None) -> None:
         """Emit one low-cardinality state transition."""
+        labels = {'backend_operation': self._role, 'outcome': outcome}
+        if failure_class is not None:
+            labels['failure_class'] = failure_class
         with suppress(Exception):
             self._metrics.increment(
                 'backend_failure',
-                {'backend_operation': self._role, 'outcome': outcome},
+                labels,
             )
+
+    def abandon(self) -> None:
+        """Release a half-open probe without a failure or another probe delay."""
+        if self._state != 'half_open':
+            return
+        self._state = 'open'
+        self._opened_at = self._clock() - self._probe_seconds
+        self._record('probe_abandoned')
 
     def admit(self) -> bool:
         """Admit one operation and report whether it must use a fresh pool.
@@ -107,12 +119,12 @@ class CircuitBreaker:
             return True
         raise BackendUnavailable('Valkey circuit breaker is open')
 
-    def fail(self) -> None:
+    def fail(self, failure_class: FailureClass | None = None) -> None:
         """Count one backend failure or reopen a failed probe."""
         if self._state == 'half_open':
             self._state = 'open'
             self._opened_at = self._clock()
-            self._record('reopened')
+            self._record('reopened', failure_class)
             return
         if self._state == 'open':
             return
@@ -120,7 +132,7 @@ class CircuitBreaker:
         if self._failures >= self._threshold:
             self._state = 'open'
             self._opened_at = self._clock()
-            self._record('open')
+            self._record('open', failure_class)
 
     def succeed(self) -> None:
         """Close a successful probe and reset consecutive failures."""
@@ -204,7 +216,7 @@ class ValidationState:
 
 
 @dataclass(frozen=True, slots=True)
-class ScriptOperands:
+class _ScriptOperands:
     """Hold ordered keys and arguments for one atomic script invocation."""
 
     keys: tuple[str, ...]
@@ -402,7 +414,7 @@ def can_publish_validation(snapshot: ValidationState, current: ValidationState) 
     return current.revision == snapshot.revision
 
 
-def commit_operands(prefix: str, lease: FillLease, payload: bytes, ttl: int) -> ScriptOperands:
+def commit_operands(prefix: str, lease: FillLease, payload: bytes, ttl: int) -> _ScriptOperands:
     """Build token-checked commit operands with the lease key before the result key.
 
     Args:
@@ -411,7 +423,7 @@ def commit_operands(prefix: str, lease: FillLease, payload: bytes, ttl: int) -> 
         payload: Encoded result bytes.
         ttl: Positive result lifetime in milliseconds.
     """
-    return ScriptOperands(
+    return _ScriptOperands(
         (_lease_key(prefix, lease.key), _result_key(prefix, lease.key)),
         (lease.token, payload, ttl),
     )
@@ -422,18 +434,18 @@ def control_key(prefix: str) -> str:
     return f'{prefix}:v1:control'
 
 
-def control_create_operands(control_key: str, incarnation: Incarnation) -> ScriptOperands:
+def control_create_operands(control_key: str, incarnation: Incarnation) -> _ScriptOperands:
     """Build create-if-absent operands for a complete fresh incarnation."""
-    return ScriptOperands((control_key, incarnation.counter_key), (incarnation.record,))
+    return _ScriptOperands((control_key, incarnation.counter_key), (incarnation.record,))
 
 
 def control_rotate_operands(
     control_key: str,
     observed: bytes | None,
     incarnation: Incarnation,
-) -> ScriptOperands:
+) -> _ScriptOperands:
     """Build compare-and-swap operands, encoding an absent observed record as empty bytes."""
-    return ScriptOperands(
+    return _ScriptOperands(
         (control_key, incarnation.counter_key),
         (b'' if observed is None else observed, incarnation.record),
     )
@@ -643,9 +655,9 @@ def jittered_interval(seconds: float) -> float:
     return seconds * (0.9 + randbelow(2001) / 10_000)
 
 
-def lookup_operands(prefix: str, key: str) -> ScriptOperands:
+def lookup_operands(prefix: str, key: str) -> _ScriptOperands:
     """Build atomic result lookup operands in the configured namespace."""
-    return ScriptOperands((_result_key(prefix, key),), ())
+    return _ScriptOperands((_result_key(prefix, key),), ())
 
 
 def milliseconds(value: object, owner: str) -> int:
@@ -683,7 +695,7 @@ def metadata_operands(
     incarnation: Incarnation,
     tags: Sequence[DependencyTag],
     retention_seconds: float,
-) -> ScriptOperands:
+) -> _ScriptOperands:
     """Build shared resolve/change operands with ordered tags and global-retention flags.
 
     Args:
@@ -697,7 +709,7 @@ def metadata_operands(
         BackendProtocolError: The retention duration cannot be represented
             within the positive millisecond bound.
     """
-    return ScriptOperands(
+    return _ScriptOperands(
         (
             control_key(prefix),
             incarnation.counter_key,
@@ -825,7 +837,7 @@ def primary_replication_id(raw: object) -> str:
             raise BackendProtocolError('Valkey replication information is malformed')
         role = decoded_role
     if role != 'master':
-        raise BackendUnavailable('Valkey metadata role is not writable')
+        raise BackendUnavailable('Valkey metadata role is not writable', failure_class='replica')
     if isinstance(replid, bytes):
         decoded_replid = None
         with suppress(UnicodeDecodeError):
@@ -850,9 +862,9 @@ def read_validation_time(clock: Callable[[], float]) -> float:
     return normalized
 
 
-def release_operands(prefix: str, lease: FillLease) -> ScriptOperands:
+def release_operands(prefix: str, lease: FillLease) -> _ScriptOperands:
     """Build token-checked release operands in the configured namespace."""
-    return ScriptOperands((_lease_key(prefix, lease.key),), (lease.token,))
+    return _ScriptOperands((_lease_key(prefix, lease.key),), (lease.token,))
 
 
 def require_enabled_l2(settings: object) -> CacheSettings:
@@ -864,7 +876,7 @@ def require_enabled_l2(settings: object) -> CacheSettings:
     """
     if not isinstance(settings, CacheSettings):
         raise TypeError('Valkey backend requires CacheSettings')
-    if not settings.l2.enabled or settings.l2.backend != 'valkey':
+    if not settings.l2.enabled:
         raise ValueError('Valkey backend requires enabled Valkey L2 settings')
     return settings
 
@@ -880,7 +892,7 @@ def require_loaded_digest(loaded: str, expected: str) -> None:
         raise BackendProtocolError('Valkey loaded an unexpected script digest')
 
 
-def reserve_operands(prefix: str, key: str, ttl: int, token: str) -> ScriptOperands:
+def reserve_operands(prefix: str, key: str, ttl: int, token: str) -> _ScriptOperands:
     """Build lease reservation operands with token before expiry.
 
     Args:
@@ -889,10 +901,10 @@ def reserve_operands(prefix: str, key: str, ttl: int, token: str) -> ScriptOpera
         ttl: Positive lease lifetime in milliseconds.
         token: Fresh validated lease ownership token.
     """
-    return ScriptOperands((_lease_key(prefix, key),), (token, ttl))
+    return _ScriptOperands((_lease_key(prefix, key),), (token, ttl))
 
 
-def role_password(role: ValkeyRoleSettings, environ: Mapping[str, object]) -> str:
+def role_password(role: ValkeyRoleSettings, environ: Mapping[str, object], role_name: str) -> str:
     """Resolve a nonempty password from the role's configured environment key.
 
     Raises:
@@ -900,7 +912,10 @@ def role_password(role: ValkeyRoleSettings, environ: Mapping[str, object]) -> st
     """
     password = environ.get(role.password_env)
     if not isinstance(password, str) or not password:
-        raise ValueError('Valkey role password is unset or empty')
+        raise ValueError(
+            f'cache.l2.valkey.{role_name}.password_env variable '
+            f'{role.password_env} is unset or empty'
+        )
     return password
 
 
@@ -952,12 +967,11 @@ def validated_resolve_tags(
 
 
 def validation_interval(
-    key_prefix: str, validation_seconds: float, jitter_factory: Callable[[float], float]
+    validation_seconds: float, jitter_factory: Callable[[float], float]
 ) -> float:
-    """Validate configuration and obtain a finite positive jittered interval.
+    """Obtain a finite positive jittered interval from validated configuration.
 
     Args:
-        key_prefix: Nonempty ASCII metadata namespace.
         validation_seconds: Finite positive non-boolean nominal seconds.
         jitter_factory: Source called with the nominal interval to obtain the
             actual positive interval.
@@ -966,21 +980,9 @@ def validation_interval(
         The finite positive jittered interval in seconds.
 
     Raises:
-        BackendProtocolError: The prefix or nominal interval is invalid.
         BackendUnavailable: The jitter source fails or returns an invalid
             interval.
     """
-    prefix_value = cast('object', key_prefix)
-    if not isinstance(prefix_value, str) or not prefix_value or not prefix_value.isascii():
-        raise BackendProtocolError('Valkey key prefix is invalid')
-    interval_value = cast('object', validation_seconds)
-    if (
-        isinstance(interval_value, bool)
-        or not isinstance(interval_value, int | float)
-        or not isfinite(interval_value)
-        or interval_value <= 0
-    ):
-        raise BackendProtocolError('Valkey validation interval must be positive')
     try:
         interval = float(jitter_factory(float(validation_seconds)))
     except Exception:  # noqa: BLE001 - closed injected-jitter boundary

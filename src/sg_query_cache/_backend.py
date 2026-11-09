@@ -1,6 +1,6 @@
 """Define the backend-neutral synchronous cache storage contract."""
 
-from typing import Protocol
+from typing import Literal, Protocol, TypeAlias
 
 from sg_query_cache._model import (
     CacheHit,
@@ -10,6 +10,10 @@ from sg_query_cache._model import (
     GenerationVector,
     TagKind,
 )
+
+FailureClass: TypeAlias = Literal[
+    'authentication', 'tls', 'connection', 'timeout', 'replica', 'unknown'
+]
 
 GLOBAL_TAG_KINDS = frozenset(
     {TagKind.AUTHORIZATION, TagKind.HUMAN_VISIBILITY, TagKind.SCHEMA, TagKind.SITE}
@@ -25,11 +29,30 @@ class BackendProtocolError(RuntimeError):
 
 
 class BackendUnavailable(RuntimeError):  # noqa: N818 - required backend exception name
-    """Report that a backend operation cannot complete reliably."""
+    """Report an unavailable operation with an optional redacted failure class.
+
+    Attributes:
+        failure_class: Client failure category, or `None` for a local failure.
+    """
+
+    def __init__(self, *args: object, failure_class: FailureClass | None = None) -> None:
+        """Append the client failure category when one is available."""
+        self._failure_class: FailureClass | None = failure_class
+        super().__init__(*args)
+        if failure_class is not None:
+            self.args = (f'{self} ({failure_class})',)
+
+    @property
+    def failure_class(self) -> FailureClass | None:
+        """Return the redacted client failure category, if any."""
+        return self._failure_class
 
 
 class StaleIncarnation(RuntimeError):  # noqa: N818 - required backend exception name
     """Report an operation fenced by a newer backend incarnation."""
+
+
+BACKEND_ERRORS = (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation)
 
 
 class MonotonicClock(Protocol):
@@ -109,6 +132,8 @@ class CacheBackend(Protocol):
             value, or `None` for absence, expiry, or corruption.
 
         Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
             BackendProtocolError: The opaque key is malformed.
             BackendUnavailable: The lookup cannot complete reliably.
             StaleIncarnation: The backend incarnation is no longer current.

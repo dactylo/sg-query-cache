@@ -8,6 +8,7 @@ from typing import cast
 from urllib.parse import parse_qsl, urlsplit
 
 from sg_query_cache._config import CacheSettings
+from sg_query_cache._validation import require_nonempty_string
 
 _AWS_DATE_FORMAT = '%Y%m%dT%H%M%SZ'
 _AWS_DATE_LENGTH = 16
@@ -36,7 +37,7 @@ class AgeDecision:
             ValueError: The cap is not positive or the reason is empty.
         """
         _require_remaining_seconds(self.remaining_seconds)
-        _require_reason(self.reason)
+        require_nonempty_string(self.reason, 'response-age reason')
 
 
 def _casefolded_parameters(url: str) -> dict[str, tuple[str, ...]] | None:
@@ -75,14 +76,6 @@ def _require_aware_datetime(value: object) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise TypeError('response time must be a timezone-aware datetime')
     return value
-
-
-def _require_reason(value: object) -> None:
-    """Require a stable nonempty decision reason."""
-    if not isinstance(value, str):
-        raise TypeError('response-age reason must be a string')
-    if not value:
-        raise ValueError('response-age reason must be nonempty')
 
 
 def _require_remaining_seconds(value: object) -> None:

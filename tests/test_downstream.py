@@ -90,7 +90,7 @@ def test_closable_stdout_restores_the_original_stream() -> None:
     original = sys.stdout
     with closable_stdout() as output:
         assert sys.stdout is output
-        assert not output._closed_by_downstream
+        assert not output.closed_by_downstream
     assert sys.stdout is original
 
 
@@ -109,7 +109,7 @@ def test_closable_stdout_silences_a_closed_descriptor(
 
     with closable_stdout() as output:
         print('discarded')
-        assert output._closed_by_downstream
+        assert output.closed_by_downstream
     assert silenced == [original]
 
 
@@ -124,7 +124,7 @@ def test_flush_latches_windows_einval() -> None:
 
     output.flush()
     output.flush()
-    assert output._closed_by_downstream
+    assert output.closed_by_downstream
 
 
 def test_flush_propagates_unrelated_errno() -> None:
@@ -161,7 +161,7 @@ def test_write_latches_closure_and_discards_later_text(error: OSError, windows: 
 
     assert output.write('first') == len('first')
     assert output.write('second') == len('second')
-    assert output._closed_by_downstream
+    assert output.closed_by_downstream
     assert stream.attempts == 1
 
 
@@ -175,7 +175,7 @@ def test_write_propagates_errors_that_are_not_closure(error: OSError, windows: b
     with pytest.raises(OSError, match=r'closed|bad') as raised:
         output.write('text')
     assert raised.value is error
-    assert not output._closed_by_downstream
+    assert not output.closed_by_downstream
 
 
 class _FakeOs:
@@ -184,15 +184,15 @@ class _FakeOs:
 
     def __init__(self, *, redirect_error: OSError | None) -> None:
         self.events: list[tuple[str, int]] = []
-        self.redirect_error = redirect_error
+        self._redirect_error = redirect_error
 
     def close(self, fd: int) -> None:
         self.events.append(('close', fd))
 
     def dup2(self, source: int, _target: int) -> None:
         self.events.append(('dup2', source))
-        if self.redirect_error is not None:
-            raise self.redirect_error
+        if self._redirect_error is not None:
+            raise self._redirect_error
 
     def open(self, _path: str, _flags: int) -> int:
         return 37

@@ -13,9 +13,9 @@ from sg_query_cache._config import (
     L2Settings,
     LimitSettings,
     TTLContext,
-    TTLRule,
     ValkeyRoleSettings,
     ValkeySettings,
+    _TTLRule,
     parse_sentinel_address,
     select_maximum_age,
 )
@@ -49,11 +49,11 @@ def _precedence_settings() -> CacheSettings:
     return CacheSettings(
         l2=L2Settings(enabled=True),
         ttl_rules=(
-            TTLRule(700, identity_kind='human'),
-            TTLRule(600, query_class='event_aware'),
-            TTLRule(500, entity_type='Asset'),
-            TTLRule(400, method='find'),
-            TTLRule(300, method='find', entity_type='Asset'),
+            _TTLRule(700, identity_kind='human'),
+            _TTLRule(600, query_class='event_aware'),
+            _TTLRule(500, entity_type='Asset'),
+            _TTLRule(400, method='find'),
+            _TTLRule(300, method='find', entity_type='Asset'),
         ),
     )
 
@@ -121,7 +121,7 @@ def test_configuration_accepts_explicit_policy_options(tmp_path: Path) -> None:
     assert settings.enabled_ttl_only_methods == ('work_schedule_read',)
     assert settings.enable_additional_filter_presets
     assert settings.metrics_digest_secret_env == 'METRICS' + '_KEY'
-    assert settings.ttl_rules == (TTLRule(300, method='find', entity_type='Asset'),)
+    assert settings.ttl_rules == (_TTLRule(300, method='find', entity_type='Asset'),)
     assert settings.limits.clock_error_bound_seconds == 0.5
 
 
@@ -165,7 +165,7 @@ def test_configuration_rejects_non_string_method_array_item_with_type_error(
 def test_configured_rule_cannot_lengthen_hierarchical_l1() -> None:
     settings = CacheSettings(
         l2=L2Settings(enabled=True),
-        ttl_rules=(TTLRule(600, method='find'),),
+        ttl_rules=(_TTLRule(600, method='find'),),
     )
 
     assert (
@@ -295,6 +295,20 @@ def test_equivalent_dns_spellings_are_one_endpoint() -> None:
         )
 
 
+def test_identity_policy_must_be_a_string(tmp_path: Path) -> None:
+    path = tmp_path / 'cache.toml'
+    path.write_text(
+        'schema_version = 1\n[cache]\nidentity_policy = 987654321\n',
+        encoding='utf-8',
+    )
+
+    with pytest.raises(TypeError) as error:
+        CacheSettings.from_toml(path)
+
+    assert 'identity_policy' in str(error.value)
+    assert '987654321' not in str(error.value)
+
+
 def test_invalid_valkey_mode_precedes_mode_specific_requirements(tmp_path: Path) -> None:
     path = tmp_path / 'cache.toml'
     path.write_text(
@@ -308,7 +322,7 @@ def test_invalid_valkey_mode_precedes_mode_specific_requirements(tmp_path: Path)
         encoding='utf-8',
     )
 
-    with pytest.raises(ValueError, match='Valkey mode must be'):
+    with pytest.raises(ValueError, match=r'cache\.l2\.valkey\.result\.mode must be'):
         CacheSettings.from_toml(path)
 
 
@@ -385,7 +399,7 @@ def test_sentinel_configuration_requires_three_distinct_addresses_and_service() 
                 '[0000:0000:0000:0000:0000:0000:0000:0001]:26379',
             ),
         )
-    with pytest.raises(ValueError, match='service name'):
+    with pytest.raises(ValueError, match='service_name'):
         replace(base, service_name=None)
 
 
@@ -443,12 +457,12 @@ def test_shared_human_cache_requires_trust_acknowledgement(tmp_path: Path) -> No
         encoding='utf-8',
     )
 
-    with pytest.raises(ValueError, match='mutually trusted clients'):
+    with pytest.raises(ValueError, match='acknowledge_mutually_trusted_clients'):
         CacheSettings.from_toml(path)
 
 
 def test_shared_human_caching_requires_mutual_trust_acknowledgement() -> None:
-    with pytest.raises(ValueError, match='mutually trusted clients'):
+    with pytest.raises(ValueError, match='acknowledge_mutually_trusted_clients'):
         CacheSettings(
             identity_policy='scripts_and_humans',
             l1=L1Settings(enabled=False),
@@ -495,17 +509,17 @@ def test_shared_sentinel_parser_rejects_invalid_addresses(address: str) -> None:
 @pytest.mark.parametrize(
     ('contents', 'match'),
     [
-        ('schema_version = 2\n[cache]\n', 'schema version'),
+        ('schema_version = 2\n[cache]\n', 'schema_version'),
         ('schema_version = 1\nunknown = 1\n[cache]\n', 'unknown key'),
         ('schema_version = 1\n[cache]\nunknown = 1\n', 'unknown key'),
         (
             "schema_version = 1\n[cache]\nidentity_policy = 'everyone'\n",
-            'identity policy',
+            r'cache\.identity_policy',
         ),
-        ("schema_version = 1\n[cache]\nsite_namespace = ''\n", 'site namespace'),
+        ("schema_version = 1\n[cache]\nsite_namespace = ''\n", r'cache\.site_namespace'),
         (
             "schema_version = 1\n[cache]\nsite_namespace = 'prod-\N{SNOWMAN}'\n",
-            'site namespace',
+            r'cache\.site_namespace',
         ),
         (
             "schema_version = 1\n[cache]\nenabled_ttl_only_methods = ['unknown']\n",
@@ -517,7 +531,7 @@ def test_shared_sentinel_parser_rejects_invalid_addresses(address: str) -> None:
         ),
         (
             'schema_version = 1\n[cache.l1]\nenabled = false\n[cache.l2]\nenabled = false\n',
-            'cache layer',
+            r'cache\.l1\.enabled or cache\.l2\.enabled',
         ),
         (
             (
@@ -525,7 +539,7 @@ def test_shared_sentinel_parser_rejects_invalid_addresses(address: str) -> None:
                 'clock_error_bound_seconds = 30\n'
                 'signed_url_safety_margin_seconds = 30\n'
             ),
-            'clock error bound',
+            r'cache\.limits\.clock_error_bound_seconds',
         ),
     ],
 )
@@ -533,8 +547,16 @@ def test_configuration_rejects_unsafe_values(tmp_path: Path, contents: str, matc
     path = tmp_path / 'cache.toml'
     path.write_text(contents, encoding='utf-8')
 
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match=match) as captured:
         CacheSettings.from_toml(path)
+
+    assert type(captured.value) is ValueError
+    assert all(
+        value not in str(captured.value)
+        for value in ('everyone', 'prod-\N{SNOWMAN}', 'EventLogEntry')
+    )
+    if match == 'unknown key':
+        assert 'allowed keys:' in str(captured.value)
 
 
 @pytest.mark.parametrize(
@@ -558,7 +580,7 @@ def test_equivalent_ip_spellings_are_one_endpoint(
 def test_shared_valkey_rejects_dependency_tag_limit_above_v1_ceiling() -> None:
     with pytest.raises(
         ValueError,
-        match='shared Valkey dependency tag limit cannot exceed the v1 ceiling',
+        match=r'cache\.limits\.max_dependency_tags cannot exceed the v1 ceiling',
     ) as captured:
         CacheSettings(
             l1=L1Settings(enabled=False),
@@ -581,12 +603,12 @@ def test_unproven_composite_methods_cannot_be_enabled(method: str) -> None:
 @pytest.mark.parametrize(
     ('rule', 'match'),
     [
-        (lambda: TTLRule(30), 'match field'),
-        (lambda: TTLRule(0, method='find'), 'positive'),
-        (lambda: TTLRule(3601, method='find'), '3,600'),
-        (lambda: TTLRule(30, method='', entity_type='Asset'), 'nonempty'),
+        (lambda: _TTLRule(30), 'match field'),
+        (lambda: _TTLRule(0, method='find'), 'positive'),
+        (lambda: _TTLRule(3601, method='find'), '3,600'),
+        (lambda: _TTLRule(30, method='', entity_type='Asset'), 'nonempty'),
         (
-            lambda: TTLRule(30, method='find', query_class='ttl_only'),
+            lambda: _TTLRule(30, method='find', query_class='ttl_only'),
             'match combination',
         ),
     ],
@@ -594,19 +616,23 @@ def test_unproven_composite_methods_cannot_be_enabled(method: str) -> None:
 def test_ttl_rules_reject_unsafe_or_ambiguous_matches(
     rule: Callable[[], object], match: str
 ) -> None:
-    with pytest.raises((TypeError, ValueError), match=match):
+    with pytest.raises((TypeError, ValueError), match=match) as captured:
         rule()
+
+    assert str(captured.value).startswith('cache.ttl_rule')
+    assert 'Asset' not in str(captured.value)
+    assert 'find' not in str(captured.value)
 
 
 @pytest.mark.parametrize('query_class', ['event-aware', 'EVENT_AWARE', 'bypass', ''])
 def test_ttl_rule_rejects_unknown_query_classes(query_class: str) -> None:
-    with pytest.raises(ValueError, match=r'query class|nonempty'):
-        TTLRule(60, query_class=query_class)
+    with pytest.raises(ValueError, match=r'query_class|nonempty'):
+        _TTLRule(60, query_class=query_class)
 
 
 @pytest.mark.parametrize('query_class', ['event_aware', 'ttl_only', 'schema'])
 def test_ttl_rule_accepts_the_closed_query_class_vocabulary(query_class: str) -> None:
-    assert TTLRule(60, query_class=query_class).query_class == query_class
+    assert _TTLRule(60, query_class=query_class).query_class == query_class
 
 
 @pytest.mark.parametrize(
@@ -616,7 +642,7 @@ def test_ttl_rule_accepts_the_closed_query_class_vocabulary(query_class: str) ->
             enabled_ttl_only_methods=['summarize']  # type: ignore[arg-type]
         ),
         lambda: CacheSettings(
-            ttl_rules=[TTLRule(30, method='find')]  # type: ignore[arg-type]
+            ttl_rules=[_TTLRule(30, method='find')]  # type: ignore[arg-type]
         ),
     ],
 )
@@ -643,7 +669,7 @@ def test_valkey_roles_accept_dns_names_and_raw_ip_literals(host: str) -> None:
     assert role.host == host
 
 
-def test_valkey_roles_must_be_separate_without_programmatic_test_flag() -> None:
+def test_valkey_roles_must_use_separate_endpoints() -> None:
     role = config.ValkeyRoleSettings(
         'cache',
         'PASSWORD',
@@ -653,13 +679,6 @@ def test_valkey_roles_must_be_separate_without_programmatic_test_flag() -> None:
 
     with pytest.raises(ValueError, match='separate endpoints'):
         config.ValkeySettings(result=role, metadata=role)
-
-    settings = config.ValkeySettings(
-        result=role,
-        metadata=role,
-        allow_same_endpoint_for_testing=True,
-    )
-    assert 'allow_same_endpoint_for_testing' not in repr(settings)
 
 
 @pytest.mark.parametrize(
@@ -759,7 +778,7 @@ def test_layer_and_query_class_choose_the_documented_default(
             CacheSettings(
                 global_safety_max_seconds=700,
                 l2=L2Settings(enabled=True),
-                ttl_rules=(TTLRule(900, identity_kind='human'),),
+                ttl_rules=(_TTLRule(900, identity_kind='human'),),
             ),
             _context(),
             700,
@@ -767,7 +786,7 @@ def test_layer_and_query_class_choose_the_documented_default(
         (
             CacheSettings(
                 l2=L2Settings(enabled=True),
-                ttl_rules=(TTLRule(900, identity_kind='human'),),
+                ttl_rules=(_TTLRule(900, identity_kind='human'),),
             ),
             _context(response_deadline_seconds=250),
             250,
@@ -776,8 +795,8 @@ def test_layer_and_query_class_choose_the_documented_default(
             CacheSettings(
                 l2=L2Settings(enabled=True),
                 ttl_rules=(
-                    TTLRule(900, identity_kind='human'),
-                    TTLRule(300, method='find', entity_type='Asset'),
+                    _TTLRule(900, identity_kind='human'),
+                    _TTLRule(300, method='find', entity_type='Asset'),
                 ),
             ),
             _context(remaining_l2_seconds=120),
@@ -786,7 +805,7 @@ def test_layer_and_query_class_choose_the_documented_default(
         (
             CacheSettings(
                 l2=L2Settings(enabled=True),
-                ttl_rules=(TTLRule(100, method='find', entity_type='Asset'),),
+                ttl_rules=(_TTLRule(100, method='find', entity_type='Asset'),),
             ),
             _context(response_deadline_seconds=250, remaining_l2_seconds=200),
             100,
@@ -811,6 +830,245 @@ def test_per_call_override_must_be_finite_and_positive(
             _context(layer='local_l1'),
             per_call_override=per_call_override,
         )
+
+
+@pytest.mark.parametrize(
+    ('contents', 'error_type', 'message'),
+    [
+        ('schema_version = "sensitive-marker"', TypeError, 'schema_version must be an integer'),
+        ('schema_version = 917', ValueError, 'schema_version is unsupported'),
+        pytest.param(
+            '[cache.l1]\nhierarchical_max_age_seconds = ' + '9' * 400,
+            OverflowError,
+            'cache.l1.hierarchical_max_age_seconds must fit a finite number',
+            id='numeric-conversion-overflow',
+        ),
+        (
+            '[cache]\nidentity_policy = "sensitive-marker"',
+            ValueError,
+            'cache.identity_policy must be scripts_only or scripts_and_humans',
+        ),
+        (
+            '[cache]\nsite_namespace = " sensitive-marker "',
+            ValueError,
+            'cache.site_namespace must be nonempty ASCII without outer whitespace',
+        ),
+        (
+            '[cache]\nglobal_safety_max_seconds = -917',
+            ValueError,
+            'cache.global_safety_max_seconds must be positive',
+        ),
+        (
+            '[cache]\nenabled_ttl_only_methods = ["sensitive-marker"]',
+            ValueError,
+            'cache.enabled_ttl_only_methods contains an unknown TTL-only method',
+        ),
+        (
+            '[cache.l1]\nenabled = "sensitive-marker"',
+            TypeError,
+            'cache.l1.enabled must be a boolean',
+        ),
+        (
+            '[cache.l1]\nresult_budget_bytes = -917',
+            ValueError,
+            'cache.l1.result_budget_bytes must be positive',
+        ),
+        (
+            '[cache.l2]\nbackend = "sensitive-marker"',
+            ValueError,
+            'cache.l2.backend must be valkey',
+        ),
+        (
+            '[cache.l2]\nschema_max_age_seconds = -917',
+            ValueError,
+            'cache.l2.schema_max_age_seconds must be positive',
+        ),
+        (
+            '[cache.limits]\nmax_dependency_tags = "sensitive-marker"',
+            TypeError,
+            'cache.limits.max_dependency_tags must be an integer',
+        ),
+        (
+            '[cache.limits]\noperation_timeout_seconds = -917',
+            ValueError,
+            'cache.limits.operation_timeout_seconds must be positive',
+        ),
+        (
+            '[cache.limits]\nclock_error_bound_seconds = 917',
+            ValueError,
+            (
+                'cache.limits.clock_error_bound_seconds must be smaller than '
+                'cache.limits.signed_url_safety_margin_seconds'
+            ),
+        ),
+        (
+            '[cache.l1]\nenabled = false',
+            ValueError,
+            'cache.l1.enabled or cache.l2.enabled must be true',
+        ),
+        (
+            '[[cache.ttl_rule]]\nmethod = "sensitive-marker"',
+            ValueError,
+            'cache.ttl_rule requires maximum_age_seconds',
+        ),
+        (
+            '[[cache.ttl_rule]]\nmaximum_age_seconds = "sensitive-marker"',
+            TypeError,
+            'cache.ttl_rule.maximum_age_seconds must be a number',
+        ),
+        (
+            '[[cache.ttl_rule]]\nmaximum_age_seconds = -917\nmethod = "sensitive-marker"',
+            ValueError,
+            'cache.ttl_rule.maximum_age_seconds must be positive',
+        ),
+        (
+            '[[cache.ttl_rule]]\nmaximum_age_seconds = 1\nquery_class = "sensitive-marker"',
+            ValueError,
+            'cache.ttl_rule.query_class must be event_aware, ttl_only, or schema',
+        ),
+        (
+            '[[cache.ttl_rule]]\nmaximum_age_seconds = 1\nmethod = ""',
+            ValueError,
+            'cache.ttl_rule.method must be nonempty',
+        ),
+    ],
+)
+def test_settings_errors_name_the_toml_path(
+    tmp_path: Path, contents: str, error_type: type[Exception], message: str
+) -> None:
+    path = tmp_path / 'cache.toml'
+    prefix = '' if contents.startswith('schema_version') else 'schema_version = 1\n'
+    path.write_text(prefix + contents, encoding='utf-8')
+
+    with pytest.raises(error_type) as captured:
+        CacheSettings.from_toml(path)
+
+    assert type(captured.value) is error_type
+    assert str(captured.value) == message
+    assert 'sensitive-marker' not in str(captured.value)
+    assert '917' not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ('table', 'allowed'),
+    [
+        ('', 'cache, schema_version'),
+        (
+            'cache.l1',
+            (
+                'enabled, hierarchical_max_age_seconds, '
+                'local_only_max_age_seconds, metadata_budget_bytes, result_budget_bytes'
+            ),
+        ),
+        (
+            'cache.l2',
+            (
+                'acknowledge_mutually_trusted_clients, backend, enabled, '
+                'event_aware_max_age_seconds, metadata_budget_bytes, '
+                'result_budget_bytes, schema_max_age_seconds, ttl_only_max_age_seconds, valkey'
+            ),
+        ),
+        (
+            'cache.l2.valkey.result',
+            (
+                'database, host, key_prefix, mode, password_env, port, '
+                'sentinels, service_name, tls, username'
+            ),
+        ),
+    ],
+)
+def test_unknown_settings_keys_list_the_table_and_allowed_keys(
+    tmp_path: Path, table: str, allowed: str
+) -> None:
+    contents = 'schema_version = 1\n'
+    if table:
+        contents += f'[{table}]\n'
+    contents += 'sensitive-marker = "sensitive-value"\n'
+    if table == 'cache.l2.valkey.result':
+        contents += '[cache.l2.valkey.metadata]\n'
+    path = tmp_path / 'cache.toml'
+    path.write_text(contents, encoding='utf-8')
+
+    with pytest.raises(ValueError, match='cache') as captured:
+        CacheSettings.from_toml(path)
+
+    owner = f'{table} table' if table else 'root table'
+    assert str(captured.value) == f'{owner} contains an unknown key; allowed keys: {allowed}'
+    assert 'sensitive' not in str(captured.value)
+
+
+@pytest.mark.parametrize('role', ['result', 'metadata'])
+@pytest.mark.parametrize(
+    ('fields', 'error_type', 'message'),
+    [
+        (
+            'host = "sensitive-marker@host"',
+            ValueError,
+            'host must be a DNS name or raw IP address',
+        ),
+        ('port = "sensitive-marker"', TypeError, 'port must be an integer'),
+        ('port = 65917', ValueError, 'port must not exceed 65,535'),
+        ('tls = "sensitive-marker"', TypeError, 'tls must be a boolean'),
+        ('mode = "sensitive-marker"', ValueError, 'mode must be standalone, sentinel, or managed'),
+        (
+            'password_env = "sensitive-marker"',
+            ValueError,
+            'password_env must be a portable environment name',
+        ),
+        (
+            (
+                'mode = "sentinel"\nsentinels = '
+                '["sensitive-marker"]\nservice_name = "sensitive-service"'
+            ),
+            ValueError,
+            'sentinels must use host:port',
+        ),
+        (
+            (
+                'mode = "sentinel"\nsentinels = '
+                '["sensitive-marker:26379"]\nservice_name = "sensitive-service"'
+            ),
+            ValueError,
+            'sentinels requires three distinct sentinel addresses in sentinel mode',
+        ),
+        pytest.param(
+            'mode = "sentinel"\nsentinels = ["sensitive-marker:'
+            + '9' * 5000
+            + '"]\nservice_name = "sensitive-service"',
+            ValueError,
+            'sentinels must use host:port',
+            id='sentinel-port-conversion-limit',
+        ),
+        ('mode = "sentinel"', ValueError, 'missing required keys: sentinels, service_name'),
+        ('', ValueError, 'missing required keys: host, password_env'),
+    ],
+)
+def test_role_settings_errors_name_the_toml_path(
+    tmp_path: Path, role: str, fields: str, error_type: type[Exception], message: str
+) -> None:
+    contents = 'schema_version = 1\n'
+    for name in ('result', 'metadata'):
+        contents += f'[cache.l2.valkey.{name}]\n'
+        if name == role:
+            if fields:
+                if not fields.startswith('host ='):
+                    contents += f'host = "{name}-host"\n'
+                if not fields.startswith('password_env ='):
+                    contents += 'password_env = "PASSWORD"\n'
+            contents += fields + '\n'
+        else:
+            contents += f'host = "{name}-host"\npassword_env = "PASSWORD"\n'
+    path = tmp_path / 'cache.toml'
+    path.write_text(contents, encoding='utf-8')
+
+    with pytest.raises(error_type) as captured:
+        CacheSettings.from_toml(path)
+
+    separator = ' ' if message.startswith('missing') else '.'
+    assert str(captured.value) == f'cache.l2.valkey.{role}{separator}{message}'
+    assert type(captured.value) is error_type
+    assert 'sensitive' not in str(captured.value)
+    assert '65917' not in str(captured.value)
 
 
 def test_work_schedule_read_is_the_only_enablable_composite_method() -> None:

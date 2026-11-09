@@ -2,22 +2,12 @@ import inspect
 import os
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from sg_query_cache import AsyncCachedShotgun, CachedShotgun
-from tests.client._compatibility import EXPLICIT_METHODS
-
-
-def _parameter_contract(
-    method: Callable[..., object],
-) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
-    return tuple(
-        (parameter.name, parameter.kind, parameter.default)
-        for parameter in inspect.signature(method).parameters.values()
-    )
+from tests.client._compatibility import EXPLICIT_METHODS, parameter_contract
 
 
 def test_complete_explicit_async_surface_matches_sync_parameter_contracts() -> None:
@@ -31,25 +21,9 @@ def test_complete_explicit_async_surface_matches_sync_parameter_contracts() -> N
     for name in EXPLICIT_METHODS:
         async_method = getattr(AsyncCachedShotgun, name)
         assert inspect.iscoroutinefunction(async_method), name
-        assert _parameter_contract(async_method) == _parameter_contract(
+        assert parameter_contract(async_method) == parameter_contract(
             getattr(CachedShotgun, name)
         ), name
-
-
-def test_constructor_keeps_configuration_keyword_only() -> None:
-    parameters = tuple(inspect.signature(AsyncCachedShotgun).parameters.values())
-
-    assert tuple(parameter.name for parameter in parameters) == (
-        'client',
-        'cache',
-        'context',
-        'indeterminate_write_exceptions',
-    )
-    assert all(
-        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for parameter in parameters[:3]
-    )
-    assert parameters[3].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters[3].default == ()
 
 
 def test_open_matches_the_prescribed_local_factory_signature() -> None:

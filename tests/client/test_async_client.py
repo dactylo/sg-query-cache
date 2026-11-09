@@ -33,7 +33,8 @@ from sg_query_cache._model import (
     GenerationVector,
 )
 from sg_query_cache.valkey_async import AsyncValkeyBackend
-from tests._async_fakes import _RecordingMetrics
+from tests._async_fakes import RecordingMetrics
+from tests._fakes import FakeClock
 
 _BATCH_REQUESTS: list[dict[str, object]] = [
     {'request_type': 'create', 'entity_type': 'Asset', 'data': {}},
@@ -41,8 +42,8 @@ _BATCH_REQUESTS: list[dict[str, object]] = [
 ]
 _BATCH_RESULT: list[dict[str, object] | bool] = [{'id': 8, 'type': 'Asset'}, True]
 _CONTEXT = ClientContext(
-    'https://example.shotgrid.autodesk.com',
-    'production',
+    site_url='https://example.shotgrid.autodesk.com',
+    site_namespace='production',
     localized=False,
     convert_datetimes_to_utc=True,
     records_per_page=500,
@@ -58,19 +59,19 @@ _USER = {'type': 'HumanUser', 'id': 3}
 class _GateBackend:
     def __init__(self, backend: AsyncCacheBackend) -> None:
         self._backend = backend
-        self._block_call: int | None = None
-        self._change_calls: list[tuple[GenerationChange, ...]] = []
-        self._entered = asyncio.Event()
-        self._failure: Exception | None = None
-        self._proceed = asyncio.Event()
+        self.block_call: int | None = None
+        self.change_calls: list[tuple[GenerationChange, ...]] = []
+        self.entered = asyncio.Event()
+        self.failure: Exception | None = None
+        self.proceed = asyncio.Event()
 
     async def change(self, changes: tuple[GenerationChange, ...]) -> None:
-        self._change_calls.append(changes)
-        if len(self._change_calls) == self._block_call:
-            self._entered.set()
-            await self._proceed.wait()
-        if self._failure is not None:
-            raise self._failure
+        self.change_calls.append(changes)
+        if len(self.change_calls) == self.block_call:
+            self.entered.set()
+            await self.proceed.wait()
+        if self.failure is not None:
+            raise self.failure
         await self._backend.change(changes)
 
     async def close(self) -> None:
@@ -97,22 +98,22 @@ class _GateBackend:
 
 class _RawClient:
     def __init__(self, results: Mapping[str, object] | None = None) -> None:
-        self._cancellations: list[asyncio.CancelledError] = []
-        self._calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
-        self._gates: dict[str, tuple[asyncio.Event, asyncio.Event]] = {}
-        self._results = dict(results or {})
+        self.cancellations: list[asyncio.CancelledError] = []
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.gates: dict[str, tuple[asyncio.Event, asyncio.Event]] = {}
+        self.results = dict(results or {})
 
     def __getattr__(self, name: str) -> object:
         async def invoke(*args: object, **kwargs: object) -> object:
-            self._calls.append((name, args, kwargs))
-            if gate := self._gates.get(name):
+            self.calls.append((name, args, kwargs))
+            if gate := self.gates.get(name):
                 gate[0].set()
                 try:
                     await gate[1].wait()
                 except asyncio.CancelledError as error:
-                    self._cancellations.append(error)
+                    self.cancellations.append(error)
                     raise
-            result = self._results.get(name)
+            result = self.results.get(name)
             if isinstance(result, BaseException):
                 raise result
             return result
@@ -122,17 +123,17 @@ class _RawClient:
 
 class _RecordingCache:
     def __init__(self, *, bypass: bool = False) -> None:
-        self._identity = _IDENTITY
-        self._settings = CacheSettings()
-        self._admissions = 0
+        self.identity = _IDENTITY
+        self.settings = CacheSettings()
+        self.admissions = 0
         self.bypass_active = bypass
-        self._closed = 0
-        self._invalidations: list[tuple[GenerationChange, ...]] = []
-        self._reads: list[tuple[ExactCall, DependencyPlan, Mapping[str, object], object]] = []
+        self.closed = 0
+        self.invalidations: list[tuple[GenerationChange, ...]] = []
+        self.reads: list[tuple[ExactCall, DependencyPlan, Mapping[str, object], object]] = []
 
     @contextmanager
     def admit(self) -> Generator[object]:
-        self._admissions += 1
+        self.admissions += 1
         yield object()
 
     @contextmanager
@@ -145,13 +146,13 @@ class _RecordingCache:
             self.bypass_active = previous
 
     async def close(self) -> None:
-        self._closed += 1
+        self.closed += 1
 
     async def invalidate_admitted(
         self, changes: tuple[GenerationChange, ...], *, token: object
     ) -> bool:
         _ = token
-        self._invalidations.append(changes)
+        self.invalidations.append(changes)
         return True
 
     async def read_admitted(
@@ -166,7 +167,7 @@ class _RecordingCache:
         _population_decision: PopulationCallback | None = None,
     ) -> object:
         _ = _population_decision
-        self._reads.append((call, plan, client_options, token))
+        self.reads.append((call, plan, client_options, token))
         return await fetch()
 
     async def read_parsed_admitted(
@@ -181,18 +182,18 @@ class _RecordingCache:
         token: object,
     ) -> object:
         call, plan, fetch, client_options, parse = arguments
-        self._reads.append((call, plan, client_options, token))
+        self.reads.append((call, plan, client_options, token))
         return parse(await fetch())
 
 
 @dataclass(frozen=True)
 class _ForwardCase:
-    _name: str
-    _args: tuple[object, ...]
-    _kwargs: Mapping[str, object]
-    _forwarded_args: tuple[object, ...]
-    _forwarded_kwargs: Mapping[str, object]
-    _result: object
+    name: str
+    args: tuple[object, ...]
+    kwargs: Mapping[str, object]
+    forwarded_args: tuple[object, ...]
+    forwarded_kwargs: Mapping[str, object]
+    result: object
 
 
 def _forward_cases() -> tuple[_ForwardCase, ...]:
@@ -221,7 +222,7 @@ def _forward_cases() -> tuple[_ForwardCase, ...]:
             {},
             {'type': 'Asset', 'id': 8},
         ),
-        _ForwardCase('delete', ('Asset', 7), {}, ('Asset', 7), {}, _result=True),
+        _ForwardCase('delete', ('Asset', 7), {}, ('Asset', 7), {}, result=True),
         _ForwardCase(
             'find',
             ('EventLogEntry', []),
@@ -241,7 +242,7 @@ def _forward_cases() -> tuple[_ForwardCase, ...]:
         _ForwardCase('follow', (_USER, _ENTITY), {}, (_USER, _ENTITY), {}, {}),
         _ForwardCase('note_thread_read', (7,), {}, (7, None), {}, []),
         _ForwardCase('preferences_read', (), {}, (None,), {}, {}),
-        _ForwardCase('revive', ('Asset', 7), {}, ('Asset', 7), {}, _result=True),
+        _ForwardCase('revive', ('Asset', 7), {}, ('Asset', 7), {}, result=True),
         _ForwardCase('schema_entity_read', (), {}, (None,), {}, {}),
         _ForwardCase(
             'schema_field_create',
@@ -257,7 +258,7 @@ def _forward_cases() -> tuple[_ForwardCase, ...]:
             {},
             ('Asset', 'sg_label'),
             {},
-            _result=True,
+            result=True,
         ),
         _ForwardCase('schema_field_read', ('Asset',), {}, ('Asset', None, None), {}, {}),
         _ForwardCase(
@@ -266,7 +267,7 @@ def _forward_cases() -> tuple[_ForwardCase, ...]:
             {},
             ('Asset', 'sg_label', {'name': 'Label'}, None),
             {},
-            _result=True,
+            result=True,
         ),
         _ForwardCase('schema_read', (), {}, (None,), {}, {}),
         _ForwardCase(
@@ -327,7 +328,7 @@ def _forward_cases() -> tuple[_ForwardCase, ...]:
             {'foo': 'bar'},
             9,
         ),
-        _ForwardCase('user_subscriptions_create', ([_USER],), {}, ([_USER],), {}, _result=True),
+        _ForwardCase('user_subscriptions_create', ([_USER],), {}, ([_USER],), {}, result=True),
         _ForwardCase(
             'work_schedule_read',
             ('2026-01-01', '2026-01-02'),
@@ -360,6 +361,67 @@ def _write_failure(method_name: str, scenario_name: str) -> BaseException:
     if method_name == 'update':
         return RuntimeError('composite definite failure')
     return OSError('indeterminate')
+
+
+@pytest.mark.parametrize('explicit_none_alias', [False, True])
+def test_cache_policy_accepts_maximum_age_seconds(explicit_none_alias: bool) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        settings = CacheSettings()
+        metrics = RecordingMetrics()
+        backend = AsyncLocalBackend(settings, clock, metrics)
+        cache = AsyncQueryCache(settings, _IDENTITY, l1=backend, metrics=metrics)
+        raw = _RawClient({'schema_read': {}})
+        wrapper = AsyncCachedShotgun(raw, cache, _CONTEXT)
+        try:
+            policy = (
+                wrapper.cache_policy(maximum_age=None, maximum_age_seconds=5)
+                if explicit_none_alias
+                else wrapper.cache_policy(maximum_age_seconds=5)
+            )
+            with policy:
+                await wrapper.schema_read()
+                await wrapper.schema_read()
+                clock.advance(6)
+                await wrapper.schema_read()
+            assert [name for name, _args, _kwargs in raw.calls].count('schema_read') == 2
+        finally:
+            await cache.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('as_keyword', [False, True])
+def test_cache_policy_preserves_positional_maximum_age(as_keyword: bool) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        settings = CacheSettings()
+        metrics = RecordingMetrics()
+        backend = AsyncLocalBackend(settings, clock, metrics)
+        cache = AsyncQueryCache(settings, _IDENTITY, l1=backend, metrics=metrics)
+        raw = _RawClient({'schema_read': {}})
+        wrapper = AsyncCachedShotgun(raw, cache, _CONTEXT)
+        policy = (
+            wrapper.cache_policy(maximum_age=5) if as_keyword else wrapper.cache_policy(None, 5)
+        )
+        try:
+            with policy:
+                await wrapper.schema_read()
+                await wrapper.schema_read()
+                clock.advance(6)
+                await wrapper.schema_read()
+            assert [name for name, _args, _kwargs in raw.calls].count('schema_read') == 2
+        finally:
+            await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_cache_policy_rejects_both_age_spellings() -> None:
+    wrapper, _cache = _recording_wrapper(_RawClient())
+
+    with pytest.raises(TypeError, match=r'maximum_age.*maximum_age_seconds'):
+        wrapper.cache_policy(maximum_age=4, maximum_age_seconds=5)
 
 
 def test_configured_open_settles_backend_close_cancelled_before_entry(
@@ -406,33 +468,56 @@ def test_configured_open_settles_backend_close_cancelled_before_entry(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('case', _forward_cases(), ids=lambda case: case._name)
+def test_construction_and_factory_cleanup_metrics_carry_failure_class() -> None:
+    async def scenario() -> None:
+        class _FailingClose:
+            async def close(self) -> None:
+                raise BackendUnavailable('redacted', failure_class='connection')
+
+        metrics = RecordingMetrics()
+        await client_module._close_partial(
+            (cast('AsyncCacheBackend', _FailingClose()),), ValueError('construction'), metrics
+        )
+        assert (
+            'backend_failure',
+            None,
+            {
+                'backend_operation': 'factory_close',
+                'outcome': 'failure',
+                'failure_class': 'connection',
+            },
+        ) in metrics.events
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('case', _forward_cases(), ids=lambda case: case.name)
 def test_explicit_methods_forward_raw_arguments_exactly(case: _ForwardCase) -> None:
     async def scenario() -> None:
-        raw = _RawClient({case._name: case._result})
+        raw = _RawClient({case.name: case.result})
         wrapper, cache = _recording_wrapper(raw)
 
-        result = await getattr(wrapper, case._name)(*case._args, **case._kwargs)
+        result = await getattr(wrapper, case.name)(*case.args, **case.kwargs)
 
-        assert result == case._result
-        assert raw._calls == [
-            (case._name, case._forwarded_args, dict(case._forwarded_kwargs)),
+        assert result == case.result
+        assert raw.calls == [
+            (case.name, case.forwarded_args, dict(case.forwarded_kwargs)),
         ]
-        assert cache._admissions == 1
+        assert cache.admissions == 1
 
     asyncio.run(scenario())
 
 
 @dataclass(frozen=True)
 class _WriteCase:
-    _name: str
-    _args: tuple[object, ...]
-    _result: object
+    name: str
+    args: tuple[object, ...]
+    result: object
 
 
 def _expected_dispatch(case: _WriteCase) -> tuple[object, ...]:
-    if case._name == 'share_thumbnail':
-        return (*case._args, None, None, False)
+    if case.name == 'share_thumbnail':
+        return (*case.args, None, None, False)
     omitted_count = {
         'create': 1,
         'schema_field_create': 1,
@@ -441,8 +526,8 @@ def _expected_dispatch(case: _WriteCase) -> tuple[object, ...]:
         'update_project_last_accessed': 1,
         'upload': 4,
         'work_schedule_update': 4,
-    }.get(case._name, 0)
-    return (*case._args, *((None,) * omitted_count))
+    }.get(case.name, 0)
+    return (*case.args, *((None,) * omitted_count))
 
 
 def _expected_pre_changes(case: _WriteCase) -> tuple[GenerationChange, ...]:
@@ -450,22 +535,22 @@ def _expected_pre_changes(case: _WriteCase) -> tuple[GenerationChange, ...]:
     membership = GenerationChange(DependencyTag.type_membership('production', 'Asset'))
     type_value = GenerationChange(DependencyTag.type_value('production', 'Asset'))
     field = GenerationChange(DependencyTag.type_field('production', 'Asset', 'code'))
-    if case._name == 'batch':
+    if case.name == 'batch':
         return (membership, type_value, entity)
-    if case._name == 'create':
+    if case.name == 'create':
         return (membership, type_value, field)
-    if case._name in {'delete', 'revive'}:
+    if case.name in {'delete', 'revive'}:
         return (entity, membership, type_value)
-    if case._name.startswith('schema_field_'):
+    if case.name.startswith('schema_field_'):
         return (GenerationChange(DependencyTag.schema('production')),)
-    if case._name == 'update':
+    if case.name == 'update':
         return (entity, type_value, field, membership)
     return _SITE_CHANGE
 
 
 def _expected_last_changes(case: _WriteCase, phase: str) -> tuple[GenerationChange, ...]:
     changes = _expected_pre_changes(case)
-    if case._name not in {'batch', 'create'} or phase == 'pre':
+    if case.name not in {'batch', 'create'} or phase == 'pre':
         return changes
     if phase == 'dispatch':
         return _SITE_CHANGE
@@ -475,9 +560,9 @@ def _expected_last_changes(case: _WriteCase, phase: str) -> tuple[GenerationChan
 
 def _write_cases() -> tuple[_WriteCase, ...]:
     return tuple(
-        _WriteCase(case._name, case._args, case._result)
+        _WriteCase(case.name, case.args, case.result)
         for case in _forward_cases()
-        if case._name
+        if case.name
         in {
             'batch',
             'create',
@@ -510,16 +595,16 @@ def _write_fixture(
     _GateBackend,
 ]:
     settings = CacheSettings(l1=L1Settings(), l2=L2Settings(enabled=True))
-    metrics = _RecordingMetrics()
+    metrics = RecordingMetrics()
     l1 = _GateBackend(AsyncLocalBackend(settings, monotonic, metrics))
     l2 = _GateBackend(AsyncLocalBackend(settings, monotonic, metrics))
     cache = AsyncQueryCache(settings, _IDENTITY, l1=l1, l2=l2, metrics=metrics)
-    raw = _RawClient({case._name: case._result})
+    raw = _RawClient({case.name: case.result})
     wrapper = AsyncCachedShotgun(raw, cache, _CONTEXT)
     return wrapper, raw, cache, l1, l2
 
 
-@pytest.mark.parametrize('case', _write_cases(), ids=lambda case: case._name)
+@pytest.mark.parametrize('case', _write_cases(), ids=lambda case: case.name)
 @pytest.mark.parametrize('phase', ['pre', 'dispatch', 'post'])
 def test_every_write_cancellation_settles_both_layers_without_retry(
     case: _WriteCase, phase: str
@@ -529,41 +614,39 @@ def test_every_write_cancellation_settles_both_layers_without_retry(
         raw_entered = asyncio.Event()
         raw_proceed = asyncio.Event()
         if phase == 'pre':
-            l2._block_call = 1
+            l2.block_call = 1
         elif phase == 'dispatch':
-            raw._gates[case._name] = (raw_entered, raw_proceed)
+            raw.gates[case.name] = (raw_entered, raw_proceed)
         else:
-            l2._block_call = 2
+            l2.block_call = 2
 
-        task = asyncio.create_task(getattr(wrapper, case._name)(*case._args))
+        task = asyncio.create_task(getattr(wrapper, case.name)(*case.args))
         if phase == 'dispatch':
             await raw_entered.wait()
         else:
-            await l2._entered.wait()
+            await l2.entered.wait()
         task.cancel()
         if phase == 'dispatch':
             raw_proceed.set()
         else:
-            l2._proceed.set()
+            l2.proceed.set()
         with pytest.raises(asyncio.CancelledError) as captured:
             await task
 
         expected_dispatches = 0 if phase == 'pre' else 1
         expected_fences = 1 if phase == 'pre' else 2
-        assert [name for name, _args, _kwargs in raw._calls].count(
-            case._name
-        ) == expected_dispatches
+        assert [name for name, _args, _kwargs in raw.calls].count(case.name) == expected_dispatches
         if expected_dispatches:
-            assert raw._calls == [(case._name, _expected_dispatch(case), {})]
+            assert raw.calls == [(case.name, _expected_dispatch(case), {})]
         if phase == 'dispatch':
-            assert captured.value is raw._cancellations[0]
-        assert len(l2._change_calls) == expected_fences
-        assert len(l1._change_calls) == expected_fences
-        assert l2._change_calls == l1._change_calls
-        assert l2._change_calls[0] == _expected_pre_changes(case)
-        assert l2._change_calls[-1] == _expected_last_changes(case, phase)
-        assert cache._fences['l2']._retained == ()
-        assert cache._fences['l1']._retained == ()
+            assert captured.value is raw.cancellations[0]
+        assert len(l2.change_calls) == expected_fences
+        assert len(l1.change_calls) == expected_fences
+        assert l2.change_calls == l1.change_calls
+        assert l2.change_calls[0] == _expected_pre_changes(case)
+        assert l2.change_calls[-1] == _expected_last_changes(case, phase)
+        assert cache._fences['l2'].retained == ()
+        assert cache._fences['l1'].retained == ()
         await cache.close()
 
     asyncio.run(scenario())
@@ -571,18 +654,18 @@ def test_every_write_cancellation_settles_both_layers_without_retry(
 
 def test_failed_l2_fence_is_retained_before_acknowledged_l1_dispatch() -> None:
     async def scenario() -> None:
-        case = next(case for case in _write_cases() if case._name == 'delete')
+        case = next(case for case in _write_cases() if case.name == 'delete')
         wrapper, raw, cache, l1, l2 = _write_fixture(case)
-        l2._failure = BackendUnavailable('shared cache unavailable')
+        l2.failure = BackendUnavailable('shared cache unavailable')
 
         assert await wrapper.delete('Asset', 7)
 
         expected = _expected_pre_changes(case)
-        assert raw._calls == [('delete', ('Asset', 7), {})]
-        assert l2._change_calls == [expected, expected]
-        assert l1._change_calls == [expected, expected]
-        assert cache._fences['l2']._retained == expected
-        assert cache._fences['l1']._retained == ()
+        assert raw.calls == [('delete', ('Asset', 7), {})]
+        assert l2.change_calls == [expected, expected]
+        assert l1.change_calls == [expected, expected]
+        assert cache._fences['l2'].retained == expected
+        assert cache._fences['l1'].retained == ()
         await cache.close()
 
     asyncio.run(scenario())
@@ -595,17 +678,17 @@ def test_find_forwards_every_omitted_default_and_keeps_paged_key_options() -> No
 
         assert await wrapper.find('EventLogEntry', [], page=2) == [{'id': 7}]
 
-        call = cache._reads[-1][0]
+        call = cache.reads[-1][0]
         assert call.arguments[-2:] == (
             ('additional_filter_presets', None),
             ('site_url', 'https://example.shotgrid.autodesk.com'),
         )
-        assert cache._reads[-1][2] == {
+        assert cache.reads[-1][2] == {
             'localized': False,
             'convert_datetimes_to_utc': True,
             'records_per_page': 500,
         }
-        assert raw._calls == [
+        assert raw.calls == [
             ('find', ('EventLogEntry', [], None, None, None, 0, False, 2, True, None), {}),
         ]
 
@@ -621,7 +704,7 @@ def test_injected_cache_and_raw_client_remain_caller_owned() -> None:
             assert entered is wrapper
 
         assert wrapper.raw_client is raw
-        assert cache._closed == 0
+        assert cache.closed == 0
 
     asyncio.run(scenario())
 
@@ -685,7 +768,7 @@ def test_open_cleanup_cancellation_precedes_body_exception(
 def test_open_constructs_configured_l2_and_owns_its_close(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         settings = CacheSettings(l1=L1Settings(), l2=L2Settings(enabled=True))
-        shared = AsyncLocalBackend(settings, monotonic, _RecordingMetrics())
+        shared = AsyncLocalBackend(settings, monotonic, RecordingMetrics())
         constructed: list[object] = []
 
         async def create(supplied: object, environ: object, metrics: object) -> AsyncLocalBackend:
@@ -705,7 +788,7 @@ def test_open_constructs_configured_l2_and_owns_its_close(monkeypatch: pytest.Mo
 
 def test_open_exceptional_exit_preserves_direct_admission_owner_guard() -> None:
     async def scenario() -> None:
-        metrics = _RecordingMetrics()
+        metrics = RecordingMetrics()
         manager = AsyncCachedShotgun.open(
             _RawClient(), CacheSettings(), _IDENTITY, _CONTEXT, metrics=metrics
         )
@@ -722,7 +805,7 @@ def test_open_exceptional_exit_preserves_direct_admission_owner_guard() -> None:
                 'backend_failure',
                 None,
                 {'backend_operation': 'factory_close', 'outcome': 'failure'},
-            ) in metrics._events
+            ) in metrics.events
         finally:
             await wrapper._cache.close()
         assert wrapper._cache._admission.closed
@@ -791,10 +874,10 @@ def test_partial_factory_construction_joins_backend_close_and_preserves_error(
 
         class _PartialBackend:
             def __init__(self, *_args: object, **_kwargs: object) -> None:
-                self._closed = False
+                self.closed = False
 
             async def close(self) -> None:
-                self._closed = True
+                self.closed = True
                 raise ValueError('lower-priority close failure')
 
         backend = _PartialBackend()
@@ -814,7 +897,7 @@ def test_partial_factory_construction_joins_backend_close_and_preserves_error(
                 raise AssertionError('partial factory entered')
 
         assert captured.value is construction_failure
-        assert backend._closed
+        assert backend.closed
 
     asyncio.run(scenario())
 
@@ -844,7 +927,7 @@ def test_prestart_cleanup_failure_retains_both_fences(
 
     async def scenario() -> None:
         method_name = 'update' if scenario_name.endswith('repeat') else 'delete'
-        case = next(case for case in _write_cases() if case._name == method_name)
+        case = next(case for case in _write_cases() if case.name == method_name)
         wrapper, _raw, cache, l1, l2 = _write_fixture(case)
         arguments: tuple[object, ...] = (
             ('Asset', 7, {'image': '/fixtures/image.jpg'})
@@ -854,11 +937,11 @@ def test_prestart_cleanup_failure_retains_both_fences(
         failure = _write_failure(method_name, scenario_name)
 
         class _Raw:
-            _calls = 0
+            calls = 0
 
             def __getattr__(self, _name: str) -> object:
                 async def invoke(*_args: object, **_kwargs: object) -> object:
-                    self._calls += 1
+                    self.calls += 1
                     cancel_next_cleanup_task()
                     raise failure
 
@@ -876,11 +959,11 @@ def test_prestart_cleanup_failure_retains_both_fences(
 
         expected = _SITE_CHANGE if method_name == 'update' else _expected_pre_changes(case)
         assert captured.value is failure
-        assert prestart_raw._calls == 1
-        assert l2._change_calls == [expected]
-        assert l1._change_calls == [expected]
-        assert cache._fences['l2']._retained == expected
-        assert cache._fences['l1']._retained == expected
+        assert prestart_raw.calls == 1
+        assert l2.change_calls == [expected]
+        assert l1.change_calls == [expected]
+        assert cache._fences['l2'].retained == expected
+        assert cache._fences['l1'].retained == expected
         await cache.close()
 
     asyncio.run(scenario())
@@ -893,7 +976,7 @@ def test_partial_cleanup_preserves_cancellation_provenance(cancel_mode: str) -> 
         assert caller is not None
         attempts: list[str] = []
         original = ValueError('original body')
-        metrics = _RecordingMetrics()
+        metrics = RecordingMetrics()
         if cancel_mode in {'stale', 'pending'}:
             caller.cancel(cancel_mode)
             if cancel_mode == 'stale':
@@ -938,7 +1021,32 @@ def test_partial_cleanup_preserves_cancellation_provenance(cancel_mode: str) -> 
             'backend_failure',
             None,
             {'backend_operation': 'factory_close', 'outcome': 'failure'},
-        ) in metrics._events
+        ) in metrics.events
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ('method_name', 'arguments'),
+    [
+        ('activity_stream_read', ('Asset', 7, {'Asset': {'unfreezable'}})),
+        ('note_thread_read', (7, {'Note': {'unfreezable'}})),
+        ('preferences_read', ([{'unfreezable'}],)),
+        ('summarize', ('Asset', [['id', 'in', {7}]], [{'field': 'id', 'type': 'count'}])),
+        ('text_search', ('hero', {'Asset': {7}})),
+    ],
+)
+def test_composite_reads_report_their_reason_for_unfreezable_arguments(
+    method_name: str, arguments: tuple[object, ...]
+) -> None:
+    async def scenario() -> None:
+        raw = _RawClient()
+        wrapper, cache = _recording_wrapper(raw)
+
+        await getattr(wrapper, method_name)(*arguments)
+
+        assert [name for name, _args, _kwargs in raw.calls] == [method_name]
+        assert [item[1].reason for item in cache.reads] == ['composite_url_unproven']
 
     asyncio.run(scenario())
 
@@ -948,7 +1056,7 @@ def test_read_captures_context_before_schema_acquisition() -> None:
         entered = asyncio.Event()
         proceed = asyncio.Event()
         raw = _RawClient({'schema_read': {}, 'find': [{'id': 7}]})
-        raw._gates['schema_read'] = (entered, proceed)
+        raw.gates['schema_read'] = (entered, proceed)
         wrapper, cache = _recording_wrapper(raw)
         replacement = replace(_CONTEXT, site_url='https://replacement.invalid')
 
@@ -959,12 +1067,12 @@ def test_read_captures_context_before_schema_acquisition() -> None:
         assert await read == [{'id': 7}]
 
         assert wrapper.context == replacement
-        entity_call = cache._reads[-1][0]
+        entity_call = cache.reads[-1][0]
         assert entity_call.arguments[-1] == (
             'site_url',
             'https://example.shotgrid.autodesk.com',
         )
-        assert cache._invalidations == [_SITE_CHANGE]
+        assert cache.invalidations == [_SITE_CHANGE]
 
     asyncio.run(scenario())
 
@@ -979,7 +1087,7 @@ def test_schema_failure_is_a_read_bypass_but_raw_read_failure_is_preserved() -> 
             await wrapper.find('Asset', [], ['id'])
 
         assert captured.value is failure
-        assert [name for name, _args, _kwargs in raw._calls] == ['schema_read', 'find']
+        assert [name for name, _args, _kwargs in raw.calls] == ['schema_read', 'find']
 
     asyncio.run(scenario())
 
@@ -993,8 +1101,8 @@ def test_scoped_and_unnormalizable_bypass_avoid_schema_acquisition() -> None:
             assert await wrapper.find('Asset', [], ['id']) == [{'id': 7}]
         assert await wrapper.find('Asset', object(), ['id']) == [{'id': 7}]
 
-        assert [name for name, _args, _kwargs in raw._calls] == ['find', 'find']
-        assert [item[1].reason for item in cache._reads] == [
+        assert [name for name, _args, _kwargs in raw.calls] == ['find', 'find']
+        assert [item[1].reason for item in cache.reads] == [
             'scoped_bypass',
             'unsupported_argument',
         ]
@@ -1005,7 +1113,7 @@ def test_scoped_and_unnormalizable_bypass_avoid_schema_acquisition() -> None:
 def test_scoped_schema_and_schedule_hit_local_cache() -> None:
     async def scenario() -> None:
         settings = CacheSettings(enabled_ttl_only_methods=('work_schedule_read',))
-        metrics = _RecordingMetrics()
+        metrics = RecordingMetrics()
         backend = AsyncLocalBackend(settings, monotonic, metrics)
         cache = AsyncQueryCache(settings, _IDENTITY, l1=backend, metrics=metrics)
         raw = _RawClient({'schema_read': {}, 'work_schedule_read': {'working': True}})
@@ -1017,11 +1125,41 @@ def test_scoped_schema_and_schedule_hit_local_cache() -> None:
             assert await wrapper.work_schedule_read(
                 '2026-09-01', '2026-09-07', project, user
             ) == await wrapper.work_schedule_read('2026-09-01', '2026-09-07', project, user)
-            names = [name for name, _args, _kwargs in raw._calls]
+            names = [name for name, _args, _kwargs in raw.calls]
             assert names.count('schema_read') == 1
             assert names.count('work_schedule_read') == 1
         finally:
             await cache.close()
+
+    asyncio.run(scenario())
+
+
+def test_transient_image_age_is_applied_at_the_wrapper_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(cache_module, 'monotonic', clock)
+        settings = CacheSettings()
+        raw = _RawClient(
+            {
+                'schema_read': {
+                    'Asset': {'image': {'data_type': {'value': 'image'}, 'properties': {}}}
+                },
+                'find': [{'image': 'https://cdn.example/images/status/transient/pending'}],
+            }
+        )
+        backend = AsyncLocalBackend(settings, clock, RecordingMetrics())
+        async with AsyncQueryCache(settings, _IDENTITY, l1=backend) as cache:
+            wrapper = AsyncCachedShotgun(raw, cache, _CONTEXT)
+            expected = raw.results['find']
+            assert await wrapper.find('Asset', [], ['image']) == expected
+            clock.advance(4)
+            assert await wrapper.find('Asset', [], ['image']) == expected
+            assert [name for name, _args, _kwargs in raw.calls].count('find') == 1
+            clock.advance(1)
+            assert await wrapper.find('Asset', [], ['image']) == expected
+            assert [name for name, _args, _kwargs in raw.calls].count('find') == 2
 
     asyncio.run(scenario())
 
@@ -1045,8 +1183,8 @@ def test_write_exception_classification_preserves_original_failure(indeterminate
             await wrapper.update('Asset', 7, {'code': 'oak'})
 
         assert captured.value is failure
-        assert len(recording_cache._invalidations) == (2 if indeterminate else 1)
-        assert len(raw._calls) == 1
+        assert len(recording_cache.invalidations) == (2 if indeterminate else 1)
+        assert len(raw.calls) == 1
 
     asyncio.run(scenario())
 
@@ -1065,10 +1203,10 @@ def test_later_cleanup_cancellation_preserves_dispatched_write(scenario_name: st
         )
         failure = _write_failure(method_name, scenario_name)
         indeterminate_exceptions = (OSError,) if isinstance(failure, OSError) else ()
-        case = next(item for item in _write_cases() if item._name == method_name)
+        case = next(item for item in _write_cases() if item.name == method_name)
         _unused, raw, cache, l1, l2 = _write_fixture(case)
-        raw._results[method_name] = failure
-        l2._block_call = 2
+        raw.results[method_name] = failure
+        l2.block_call = 2
         wrapper = AsyncCachedShotgun(
             raw,
             cache,
@@ -1077,19 +1215,19 @@ def test_later_cleanup_cancellation_preserves_dispatched_write(scenario_name: st
         )
 
         task = asyncio.create_task(getattr(wrapper, method_name)(*arguments))
-        await l2._entered.wait()
+        await l2.entered.wait()
         task.cancel()
-        l2._proceed.set()
+        l2.proceed.set()
         with pytest.raises(asyncio.CancelledError) as captured:
             await task
 
         if isinstance(failure, asyncio.CancelledError):
             assert captured.value is failure
-        assert len(raw._calls) == 1
-        assert len(l2._change_calls) == 2
-        assert len(l1._change_calls) == 2
-        assert cache._fences['l2']._retained == ()
-        assert cache._fences['l1']._retained == ()
+        assert len(raw.calls) == 1
+        assert len(l2.change_calls) == 2
+        assert len(l1.change_calls) == 2
+        assert cache._fences['l2'].retained == ()
+        assert cache._fences['l1'].retained == ()
         await cache.close()
 
     asyncio.run(scenario())
@@ -1099,7 +1237,7 @@ def test_later_cleanup_cancellation_preserves_dispatched_write(scenario_name: st
 def test_close_waits_for_each_whole_admitted_wrapper_operation(operation_name: str) -> None:
     async def scenario() -> None:
         settings = CacheSettings()
-        metrics = _RecordingMetrics()
+        metrics = RecordingMetrics()
         backend = AsyncLocalBackend(settings, monotonic, metrics)
         cache = AsyncQueryCache(settings, _IDENTITY, l1=backend, metrics=metrics)
         results: dict[str, object] = {
@@ -1114,7 +1252,7 @@ def test_close_waits_for_each_whole_admitted_wrapper_operation(operation_name: s
         gated_method = {'direct': 'preferences_read', 'schema': 'schema_read', 'write': 'update'}[
             operation_name
         ]
-        raw._gates[gated_method] = (entered, proceed)
+        raw.gates[gated_method] = (entered, proceed)
         wrapper = AsyncCachedShotgun(raw, cache, _CONTEXT)
 
         if operation_name == 'direct':
@@ -1145,8 +1283,8 @@ def test_human_read_plans_preserve_visibility_tags_and_identity_policy(
         schema = {'Asset': {'id': {'data_type': {'value': 'number'}, 'properties': {}}}}
         raw = _RawClient({'schema_read': schema, 'find': [], 'work_schedule_read': {}})
         cache = _RecordingCache()
-        cache._identity = Identity('human', 'tests', 'human-42', entity_id=42)
-        cache._settings = CacheSettings(
+        cache.identity = Identity('human', 'tests', 'human-42', entity_id=42)
+        cache.settings = CacheSettings(
             identity_policy='scripts_and_humans' if humans_enabled else 'scripts_only',
             enabled_ttl_only_methods=('work_schedule_read',),
         )
@@ -1166,7 +1304,7 @@ def test_human_read_plans_preserve_visibility_tags_and_identity_policy(
         schema_tags = (universal[0], DependencyTag.schema('production'), *universal[1:])
         if humans_enabled:
             assert [
-                (call.method, plan.classification, plan.tags) for call, plan, _, _ in cache._reads
+                (call.method, plan.classification, plan.tags) for call, plan, _, _ in cache.reads
             ] == [
                 ('schema_read', 'schema', schema_tags),
                 ('schema_view', 'schema', schema_tags),
@@ -1180,15 +1318,13 @@ def test_human_read_plans_preserve_visibility_tags_and_identity_policy(
                 ('work_schedule_read', 'ttl_only', universal),
             ]
         else:
-            assert [
-                (call.method, plan.reason, plan.tags) for call, plan, _, _ in cache._reads
-            ] == [
+            assert [(call.method, plan.reason, plan.tags) for call, plan, _, _ in cache.reads] == [
                 ('schema_read', 'human_caching_disabled', ()),
                 ('find', 'human_caching_disabled', ()),
                 ('find', 'human_caching_disabled', ()),
                 ('work_schedule_read', 'human_caching_disabled', ()),
             ]
-            assert [name for name, _, _ in raw._calls] == [
+            assert [name for name, _, _ in raw.calls] == [
                 'schema_read',
                 'find',
                 'find',

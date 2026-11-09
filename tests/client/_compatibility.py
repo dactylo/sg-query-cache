@@ -1,3 +1,6 @@
+import inspect
+from collections.abc import Callable
+
 EXPLICIT_METHODS = (
     'activity_stream_read',
     'batch',
@@ -28,3 +31,12 @@ EXPLICIT_METHODS = (
     'work_schedule_read',
     'work_schedule_update',
 )
+
+
+def parameter_contract(
+    method: Callable[..., object],
+) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
+    return tuple(
+        (parameter.name, parameter.kind, parameter.default)
+        for parameter in inspect.signature(method).parameters.values()
+    )

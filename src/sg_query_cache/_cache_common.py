@@ -15,7 +15,7 @@ from sg_query_cache._model import (
 )
 
 PolicyMode: TypeAlias = Literal['bypass', 'event_aware', 'ttl_only']
-PopulationCallback: TypeAlias = Callable[[object], 'PopulationDecision']
+PopulationCallback: TypeAlias = Callable[[object], '_PopulationDecision']
 WaitCategory: TypeAlias = Literal['local', 'distributed']
 WaitOutcome: TypeAlias = Literal['completed', 'takeover', 'timeout', 'failure', 'cancelled']
 
@@ -64,7 +64,7 @@ class PolicyFrame:
     mode: PolicyMode | None
 
 
-class PopulationDecision(Protocol):
+class _PopulationDecision(Protocol):
     """Expose only the optional safe lifetime selected after a fetch."""
 
     @property
@@ -74,13 +74,8 @@ class PopulationDecision(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class PopulationLimit:
-    """Carry a validated lifetime cap and optional metric reasons.
-
-    `seconds` is absent when population must decline. `reason` is the
-    callback's optional observation label; `bypass_reason` distinguishes
-    refusal from invalid callback output.
-    """
+class _PopulationLimit:
+    """Carry a validated lifetime cap and optional metric reasons."""
 
     seconds: float | None
     reason: str | None = None
@@ -359,7 +354,7 @@ def policy_frame(
     return PolicyFrame(validated_age, validated_mode)
 
 
-def population_limit(value: object, callback: PopulationCallback) -> PopulationLimit:
+def population_limit(value: object, callback: PopulationCallback) -> _PopulationLimit:
     """Validate one callback result without choosing a layer deadline.
 
     Callback exceptions and invalid lifetimes decline population. A callback
@@ -369,10 +364,10 @@ def population_limit(value: object, callback: PopulationCallback) -> PopulationL
         decision = callback(value)
         remaining = decision.remaining_seconds
     except Exception:  # noqa: BLE001 - callback failure must decline population
-        return PopulationLimit(None, bypass_reason='population_decision_failure')
+        return _PopulationLimit(None, bypass_reason='population_decision_failure')
     if remaining is None:
         reason = getattr(decision, 'reason', None)
-        return PopulationLimit(
+        return _PopulationLimit(
             None, reason if isinstance(reason, str) else None, 'population_declined'
         )
     seconds = cast('object', remaining)
@@ -382,6 +377,6 @@ def population_limit(value: object, callback: PopulationCallback) -> PopulationL
         or not isfinite(seconds)
         or seconds <= 0
     ):
-        return PopulationLimit(None, bypass_reason='population_decision_failure')
+        return _PopulationLimit(None, bypass_reason='population_decision_failure')
     reason = getattr(decision, 'reason', None)
-    return PopulationLimit(float(seconds), reason if isinstance(reason, str) else None)
+    return _PopulationLimit(float(seconds), reason if isinstance(reason, str) else None)

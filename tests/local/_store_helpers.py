@@ -10,10 +10,10 @@ _K = TypeVar('_K')
 class CountedQueue(OrderedDict[_K, None]):
     def __init__(self, entries: OrderedDict[_K, None]) -> None:
         super().__init__(entries)
-        self._visits = 0
+        self.visits = 0
 
     @override
     def __iter__(self) -> Iterator[_K]:
         for key in super().__iter__():
-            self._visits += 1
+            self.visits += 1
             yield key

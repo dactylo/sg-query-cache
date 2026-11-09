@@ -1,69 +1,96 @@
 # Benchmarks
 
-The benchmark drivers estimate how much the cache could save for a workload like yours and what it
-costs per read. Repeated exact calls, the number of identities, payload size, concurrency, and SG
-latency all affect the savings. The drivers report synthetic measurements: they do not certify
-throughput for a production site or establish compatibility with a managed Valkey provider. To try
-the cache itself, start with the [README quick start](../README.md#quick-start).
+Use the benchmark drivers to estimate cache savings for a workload like yours. Repeated exact
+calls, identity count, payload size, concurrency, and SG latency all affect the result. The drivers
+use synthetic workloads; compare their assumptions with your application before sizing a
+deployment. To try the cache itself, start with the [README quick start](../README.md#quick-start).
 
-The drivers live in the repository's `benchmarks/` directory and are not installed with the
-package. Run them from the root of a checkout, with a Python 3.11 or newer environment that has the
-project's dependencies; the development environment from `make setup` works, through
-`.venv/bin/python`. The shared and hierarchical profiles and the `failure-recovery` scenario also
-need the `valkey` extra. In the commands below, `python` is that environment's interpreter.
+The drivers live in `benchmarks/` and are not installed with the package. Run them from the root of
+a development checkout with Python 3.11 or newer and the project's dependencies. The environment
+created by `make setup` works: use `.venv/bin/python` as `python` in the examples below. Shared and
+hierarchical profiles, and the `failure-recovery` scenario, also require the `valkey` extra.
 
 ## Run without external services
 
-The synchronous driver simulates SG with a fixed latency and runs a bounded workload against a
-local cache:
+The synchronous driver simulates a fixed SG latency and runs a bounded workload against a local
+cache:
 
 ```sh
 python benchmarks/query_cache.py --profile local --scenario hot-key-burst --json
 ```
 
-It prints one JSON report. Start with these fields:
+It prints one compact JSON report. Check `sg_calls_avoided` for savings and
+`correctness_violations`, which should be 0. See [Read the report](#read-the-report) for the fields
+and exit statuses.
 
-- `sg_calls_avoided` and `cache_operations.hits`: how many reads the cache answered.
-- `complete_hit_latency_ms`: percentiles for a full cache hit.
-- `sg_latency_model`: the simulated SG latency the savings are measured against.
-- `correctness_violations`: stale, malformed, or over-age results observed. It should be 0; the
-  driver exits 1 otherwise, and 2 for invalid options or setup errors.
-
-`--profile` also accepts `shared` and `hierarchical`, which need Valkey services as described
-below. Other scenarios cover identity cardinality, one-hit scans, dependency broadening, event
-storms, metadata churn, mixed values, failure recovery, fanout, and schema reads. Some scenarios
-support only some profiles, and the driver rejects combinations that need controlled local capacity
-or failure behavior. `--operations` accepts up to 10,000 and `--workers` up to 64. Run
-`python benchmarks/query_cache.py --help` for the scenario names and options.
-
-Each report also includes a separately measured warmed hit, `normal_hit_backend_phases`, which
-counts the backend steps in one normal hit. A normal shared hit resolves metadata and then looks up
-the result. This probe does not count toward the scenario's throughput.
-
-The native async driver measures local store maintenance, decoding cost, complete wrapper hits, and
-reads around writes:
+The native async driver covers local maintenance, decoding, complete wrapper hits, and reads around
+writes:
 
 ```sh
-python benchmarks/async_query_cache.py --scenario local-maintenance --population 50000 --iterations 10000 --json
+python benchmarks/async_query_cache.py --scenario local-maintenance --population 50000 --iterations 10000
 python benchmarks/async_query_cache.py --scenario decode --iterations 1000 --json
 python benchmarks/async_query_cache.py --scenario wrapper-hit --iterations 1000 --json
 python benchmarks/async_query_cache.py --scenario mixed-read-write --iterations 1000 --json
 ```
 
+It prints indented JSON by default; `--json` selects compact JSON.
+
+## Read the report
+
+### Synchronous reports
+
+| Field                       | Meaning                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------- |
+| `sg_calls_avoided`          | Reads answered without an SG call                                                     |
+| `cache_operations.hits`     | Cache hits                                                                            |
+| `complete_hit_latency_ms`   | Latency percentiles for a complete cache hit                                          |
+| `sg_latency_model`          | Simulated SG latency used to calculate savings                                        |
+| `correctness_violations`    | Stale, malformed, or over-age results; should be 0                                    |
+| `normal_hit_backend_phases` | Backend steps for a separately measured warmed hit, excluded from scenario throughput |
+
+A normal shared hit resolves metadata and then looks up the result. The driver requires `--json`;
+it exits 1 for correctness violations and 2 for invalid options or setup errors.
+
+`--profile` accepts `local`, `shared`, or `hierarchical`. Scenarios cover hot-key bursts, identity
+cardinality, one-hit scans, dependency broadening, event storms, metadata churn, mixed values,
+failure recovery, fanout, and schema reads. Some require controlled local capacity or failure
+behavior, so the driver rejects incompatible profile/scenario combinations. `--operations` accepts
+up to 10,000 and `--workers` up to 64. Run `python benchmarks/query_cache.py --help` for the
+complete scenario names and options.
+
+### Async reports
+
 Async reports separate operation latency, event-loop scheduling gaps, and accounted local storage.
-They use controlled stand-ins for the native async SG client and for fences. The `decode` scenario
-includes representative and size-limit payloads, and `mixed-read-write` distinguishes fences that
-are still pending from failed fences whose changes are retained. Timings vary with payload shape,
-scheduling, and host load. Local maintenance visits at most 64 entries per queue, or 192 for a
-fully populated operation; that is a bound on work, not on milliseconds.
+They use controlled stand-ins for the native async SG client and fences.
+
+| Scenario            | What to compare                                                                 |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `local-maintenance` | Maintenance latency, scheduling gaps, and accounted storage as population grows |
+| `decode`            | Decoding cost for representative and size-limit payloads                        |
+| `wrapper-hit`       | Complete wrapper-hit cost                                                       |
+| `mixed-read-write`  | Reads with pending fences versus failed fences whose changes are retained       |
+
+Timings depend on payload shape, scheduling, and host load. Local maintenance visits at most 64
+entries per queue, or 192 for a fully populated operation. That bounds work, not milliseconds.
 
 ## Measure with disposable Valkey services
 
-The `shared` and `hierarchical` profiles need two separate, disposable Valkey services, one for
-results and one for metadata. The driver runs them only when `SG_QUERY_CACHE_REQUIRE_INTEGRATION=1`
-is set, as your confirmation that the services are disposable. For both `RESULT` and `METADATA`,
-set `SG_QUERY_CACHE_TEST_<ROLE>_HOST`, `_PORT`, `_DATABASE`, `_TLS`, and `_PASSWORD`; `_USERNAME`
-is optional. `_TLS` accepts `true` or `false` in any letter case. For example:
+Use two separate, disposable Valkey services: one for results and one for metadata. Never point
+benchmarks at production services. Setting `SG_QUERY_CACHE_REQUIRE_INTEGRATION=1` confirms that the
+services are disposable and enables the `shared` and `hierarchical` profiles.
+
+For both roles, set these variables; replace `<ROLE>` with `RESULT` or `METADATA`:
+
+| Variable                              | Value                                 |
+| ------------------------------------- | ------------------------------------- |
+| `SG_QUERY_CACHE_TEST_<ROLE>_HOST`     | Service host                          |
+| `SG_QUERY_CACHE_TEST_<ROLE>_PORT`     | TCP port                              |
+| `SG_QUERY_CACHE_TEST_<ROLE>_DATABASE` | Database number                       |
+| `SG_QUERY_CACHE_TEST_<ROLE>_TLS`      | `true` or `false`, in any letter case |
+| `SG_QUERY_CACHE_TEST_<ROLE>_PASSWORD` | Role password                         |
+| `SG_QUERY_CACHE_TEST_<ROLE>_USERNAME` | Optional ACL username                 |
+
+For example:
 
 ```sh
 export SG_QUERY_CACHE_REQUIRE_INTEGRATION=1
@@ -80,10 +107,20 @@ export SG_QUERY_CACHE_TEST_METADATA_PASSWORD='<disposable-metadata-password>'
 python benchmarks/query_cache.py --profile shared --scenario hot-key-burst --json
 ```
 
-Never point benchmarks at production services. Each shared or hierarchical run writes under its own
-key prefix, built from the scenario name and a fresh random token, so runs do not reuse each
-other's data. The driver cannot measure the services' total memory use; use the services' own
-telemetry for capacity decisions.
+The driver connects in standalone mode. Each run uses a separate key prefix built from the scenario
+name and a fresh random token, so runs do not reuse data. The driver does not measure total service
+memory; use Valkey telemetry for capacity decisions. See
+[supported deployments](operations.md#supported-deployments) for production topology requirements.
 
-These runs connect in standalone mode only, so they do not establish Sentinel failover or
-managed-provider behavior; see [supported deployments](operations.md#supported-deployments).
+## Connection setup measurements
+
+The following TLS connection setup measurements use an ElastiCache `cache.t4g.micro` node:
+
+| Concurrent connections | Timeout setting  | Result                                 |
+| ---------------------- | ---------------- | -------------------------------------- |
+| 1                      | Long timeouts    | About 15 ms to connect                 |
+| 50                     | Long timeouts    | 0.25 to 0.4 seconds total              |
+| 50 cache clients       | Default timeouts | One client reported Valkey unavailable |
+
+These figures illustrate connection bursts, not steady-state read latency. Reuse backends and
+stagger startup as described in [connection recovery](operations.md#connection-recovery).

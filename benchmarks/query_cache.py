@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 # ruff: noqa: INP001
 """Run deterministic bounded synthetic workloads against supported cache topologies.
 
@@ -25,7 +22,7 @@ from math import ceil
 from secrets import token_hex
 from threading import Lock
 from time import monotonic, sleep
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, assert_never, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -69,32 +66,6 @@ _BREAKER_FAILURES = 5
 _CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _COMMIT_ARGUMENTS = 5
 _COMMIT_KEYS = 2
-_DEFAULT_OPERATIONS: Mapping[str, int] = {
-    'hot-key-burst': 96,
-    'identity-cardinality': 1_001,
-    'one-hit-scan': 256,
-    'dependency-broadening': 96,
-    'event-storm': 10_000,
-    'metadata-churn': 192,
-    'mixed-values': 24,
-    'failure-recovery': 48,
-    'hierarchical-fanout': 96,
-    'link-fanout-events': 256,
-    'wrapper-schema': 64,
-}
-_DEFAULT_WORKERS: Mapping[str, int] = {
-    'hot-key-burst': 16,
-    'identity-cardinality': 16,
-    'one-hit-scan': 8,
-    'dependency-broadening': 8,
-    'event-storm': 16,
-    'metadata-churn': 1,
-    'mixed-values': 8,
-    'failure-recovery': 8,
-    'hierarchical-fanout': 16,
-    'link-fanout-events': 8,
-    'wrapper-schema': 4,
-}
 _FANOUT_EVENT_INTERVAL = 4
 _FANOUT_TARGETS = (
     'Shot',
@@ -116,45 +87,132 @@ _NAMESPACE_TOKEN_BYTES = 16
 _NEAR_CAP_PAYLOAD_BYTES = 780_000
 _RELEASE_ARGUMENTS = 2
 _RESERVE_ARGUMENTS = 3
-_SCENARIOS = (
-    'hot-key-burst',
-    'identity-cardinality',
-    'one-hit-scan',
-    'dependency-broadening',
-    'event-storm',
-    'metadata-churn',
-    'mixed-values',
-    'failure-recovery',
-    'hierarchical-fanout',
-    'link-fanout-events',
-    'wrapper-schema',
-)
-# Values are minimum operations, fixed operations, minimum workers, fixed workers,
-# and operations completed before any trailing parallel work.
-_SCENARIO_CONTRACTS: Mapping[str, tuple[int, int | None, int, int | None, int | None]] = {
-    'hot-key-burst': (2, None, 2, None, 0),
-    'identity-cardinality': (1_001, None, 1, None, 0),
-    'one-hit-scan': (96, None, 1, None, 0),
-    'dependency-broadening': (2, None, 1, None, 0),
-    'event-storm': (10_000, 10_000, 1, None, 0),
-    'metadata-churn': (160, None, 1, 1, None),
-    'mixed-values': (4, None, 1, None, 4),
-    'failure-recovery': (_BREAKER_FAILURES + 3, None, 1, None, _BREAKER_FAILURES + 3),
-    'hierarchical-fanout': (2, None, 2, None, 0),
-    'link-fanout-events': (8, None, 1, None, 0),
-    'wrapper-schema': (4, None, 1, None, 0),
+_SCENARIO_SPECS: Mapping[str, _ScenarioSpec] = {
+    'hot-key-burst': {
+        'operations': 96,
+        'workers': 16,
+        'minimum_operations': 2,
+        'fixed_operations': None,
+        'minimum_workers': 2,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': True,
+        'workload': 'hot_key',
+    },
+    'identity-cardinality': {
+        'operations': 1_001,
+        'workers': 16,
+        'minimum_operations': 1_001,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': False,
+        'workload': 'uniform',
+    },
+    'one-hit-scan': {
+        'operations': 256,
+        'workers': 8,
+        'minimum_operations': 96,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': False,
+        'workload': 'scan',
+    },
+    'dependency-broadening': {
+        'operations': 96,
+        'workers': 8,
+        'minimum_operations': 2,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': True,
+        'workload': 'uniform',
+    },
+    'event-storm': {
+        'operations': 10_000,
+        'workers': 16,
+        'minimum_operations': 10_000,
+        'fixed_operations': 10_000,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': True,
+        'workload': 'uniform',
+    },
+    'metadata-churn': {
+        'operations': 192,
+        'workers': 1,
+        'minimum_operations': 160,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': 1,
+        'parallel_offset': None,
+        'shared_profiles': False,
+        'workload': 'uniform',
+    },
+    'mixed-values': {
+        'operations': 24,
+        'workers': 8,
+        'minimum_operations': 4,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 4,
+        'shared_profiles': True,
+        'workload': 'mixed',
+    },
+    'failure-recovery': {
+        'operations': 48,
+        'workers': 8,
+        'minimum_operations': _BREAKER_FAILURES + 3,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': _BREAKER_FAILURES + 3,
+        'shared_profiles': False,
+        'workload': 'uniform',
+    },
+    'hierarchical-fanout': {
+        'operations': 96,
+        'workers': 16,
+        'minimum_operations': 2,
+        'fixed_operations': None,
+        'minimum_workers': 2,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': True,
+        'workload': 'fanout',
+    },
+    'link-fanout-events': {
+        'operations': 256,
+        'workers': 8,
+        'minimum_operations': 8,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': True,
+        'workload': 'uniform',
+    },
+    'wrapper-schema': {
+        'operations': 64,
+        'workers': 4,
+        'minimum_operations': 4,
+        'fixed_operations': None,
+        'minimum_workers': 1,
+        'fixed_workers': None,
+        'parallel_offset': 0,
+        'shared_profiles': False,
+        'workload': 'uniform',
+    },
 }
+_SCENARIOS = tuple(_SCENARIO_SPECS)
 _SHARED_NORMAL_HIT_PHASES = 2
 _SITE = 'benchmark'
-_UNSUPPORTED_SHARED_SCENARIOS = frozenset(
-    {
-        'failure-recovery',
-        'identity-cardinality',
-        'metadata-churn',
-        'one-hit-scan',
-        'wrapper-schema',
-    }
-)
 
 
 class _Arguments(argparse.Namespace):
@@ -183,7 +241,7 @@ class _Clock:
         with self._lock:
             return self._value
 
-    def _advance(self, seconds: float) -> None:
+    def advance(self, seconds: float) -> None:
         """Advance the synthetic clock by a positive duration."""
         with self._lock:
             self._value += seconds
@@ -206,7 +264,7 @@ class _Deterministic:
         """Seed one repeatable integer generator."""
         self._state = seed & 0xFFFFFFFF
 
-    def _range(self, start: int, stop: int) -> int:
+    def range(self, start: int, stop: int) -> int:
         """Return one deterministic integer in `[start, stop)`."""
         if stop <= start:
             raise ValueError('deterministic range requires an increasing bound')
@@ -227,29 +285,6 @@ class _MeasuredBackend:
         '_operations',
         '_vector_latencies_ms',
     )
-
-    def _committed_payload_sizes(self) -> list[int]:
-        """Return complete encoded byte sizes accepted by the delegated owner."""
-        with self._lock:
-            return list(self._committed_sizes)
-
-    def _memory_estimates(self) -> dict[str, int]:
-        """Return actual current and observed peak `LocalBackend` owner bytes."""
-        with self._lock:
-            result_current, metadata_current = self._memory_current
-            result_peak, metadata_peak = self._memory_peak
-        return {
-            'measured': int(self._memory_probe is not None),
-            'metadata_current': metadata_current,
-            'metadata_peak': metadata_peak,
-            'result_current': result_current,
-            'result_peak': result_peak,
-        }
-
-    def _operation_counts(self) -> dict[str, int]:
-        """Return a detached operation counter mapping."""
-        with self._lock:
-            return dict(self._operations)
 
     def _record(self, name: str) -> None:
         """Increment one backend-operation counter."""
@@ -292,13 +327,17 @@ class _MeasuredBackend:
         self._vector_latencies_ms: list[float] = []
         self._sample_memory()
 
-    def _vector_latencies(self) -> list[float]:
-        """Return detached vector-resolution timings in milliseconds."""
-        with self._lock:
-            return list(self._vector_latencies_ms)
-
     def change(self, changes: tuple[GenerationChange, ...]) -> None:
-        """Delegate one ordered generation change."""
+        """Delegate one ordered generation change and sample backend memory.
+
+        Args:
+            changes: Ordered generation replacements passed unchanged to the
+                backend.
+
+        Raises:
+            Exception: The backend change or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         self._record('change')
         try:
             self._backend.change(changes)
@@ -306,11 +345,29 @@ class _MeasuredBackend:
             self._sample_memory()
 
     def close(self) -> None:
-        """Close the delegated backend."""
+        """Close the delegated backend.
+
+        Raises:
+            Exception: The delegated backend fails to close.
+        """
         self._backend.close()
 
     def commit(self, lease: FillLease, payload: bytes, remaining_seconds: float) -> bool:
-        """Delegate a token-checked commit and sample actual backend bytes."""
+        """Delegate a token-checked commit and sample actual backend bytes.
+
+        Args:
+            lease: Exact key and ownership token returned by the backend.
+            payload: Encoded result bytes passed unchanged to the backend.
+            remaining_seconds: Positive authoritative remaining lifetime.
+
+        Returns:
+            Whether the backend admitted the result. Successful commits append
+            the encoded payload size to the recorded measurements.
+
+        Raises:
+            Exception: The backend commit or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         self._record('commit')
         try:
             committed = self._backend.commit(lease, payload, remaining_seconds)
@@ -321,23 +378,77 @@ class _MeasuredBackend:
         finally:
             self._sample_memory()
 
+    def committed_payload_sizes(self) -> list[int]:
+        """Return complete encoded byte sizes accepted by the delegated owner."""
+        with self._lock:
+            return list(self._committed_sizes)
+
     def flush_site(self, site_namespace: str, reason: str) -> None:
-        """Delegate one explicit site-generation flush."""
+        """Delegate one explicit site-generation flush and sample backend memory.
+
+        Args:
+            site_namespace: Configured site namespace to invalidate.
+            reason: Operator-facing reason passed unchanged to the backend.
+
+        Raises:
+            Exception: The backend flush or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         try:
             self._backend.flush_site(site_namespace, reason)
         finally:
             self._sample_memory()
 
     def lookup(self, key: str) -> CacheHit | None:
-        """Delegate one result lookup."""
+        """Delegate one result lookup and sample backend memory.
+
+        Args:
+            key: Opaque generation-qualified result key.
+
+        Returns:
+            The backend's isolated hit, or `None` for a cache miss.
+
+        Raises:
+            Exception: The backend lookup or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         self._record('lookup')
         try:
             return self._backend.lookup(key)
         finally:
             self._sample_memory()
 
+    def memory_estimates(self) -> dict[str, int]:
+        """Return actual current and observed peak `LocalBackend` owner bytes."""
+        with self._lock:
+            result_current, metadata_current = self._memory_current
+            result_peak, metadata_peak = self._memory_peak
+        return {
+            'measured': int(self._memory_probe is not None),
+            'metadata_current': metadata_current,
+            'metadata_peak': metadata_peak,
+            'result_current': result_current,
+            'result_peak': result_peak,
+        }
+
+    def operation_counts(self) -> dict[str, int]:
+        """Return a detached operation counter mapping."""
+        with self._lock:
+            return dict(self._operations)
+
     def release(self, lease: FillLease) -> bool:
-        """Delegate one token-checked lease release."""
+        """Delegate one token-checked lease release and sample backend memory.
+
+        Args:
+            lease: Exact key and ownership token returned by the backend.
+
+        Returns:
+            Whether the backend removed the current matching lease.
+
+        Raises:
+            Exception: The backend release or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         self._record('release')
         try:
             return self._backend.release(lease)
@@ -345,7 +456,19 @@ class _MeasuredBackend:
             self._sample_memory()
 
     def reserve(self, key: str, lease_seconds: float) -> FillLease | None:
-        """Delegate one fill-lease reservation."""
+        """Delegate one fill-lease reservation and sample backend memory.
+
+        Args:
+            key: Opaque generation-qualified result key.
+            lease_seconds: Positive ownership duration in seconds.
+
+        Returns:
+            A fresh lease, or `None` while another lease remains current.
+
+        Raises:
+            Exception: The backend reservation or optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         self._record('reserve')
         try:
             return self._backend.reserve(key, lease_seconds)
@@ -353,7 +476,21 @@ class _MeasuredBackend:
             self._sample_memory()
 
     def resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
-        """Time one complete vector resolution through the delegated backend."""
+        """Time one complete vector resolution through the delegated backend.
+
+        Resolution attempts are counted and timed even when they fail.
+
+        Args:
+            tags: Ordered unique dependency tags passed to the backend.
+
+        Returns:
+            Every requested tag and its token under one backend incarnation,
+            preserving request order.
+
+        Raises:
+            Exception: Backend resolution or the optional memory probe fails.
+                A probe failure takes precedence over a backend failure.
+        """
         started_at = monotonic()
         try:
             return self._backend.resolve(tags)
@@ -363,6 +500,11 @@ class _MeasuredBackend:
                 self._operations['resolve'] += 1
                 self._vector_latencies_ms.append(elapsed_ms)
             self._sample_memory()
+
+    def vector_latencies(self) -> list[float]:
+        """Return detached vector-resolution timings in milliseconds."""
+        with self._lock:
+            return list(self._vector_latencies_ms)
 
 
 class _Metrics:
@@ -376,27 +518,13 @@ class _Metrics:
         self._lock = Lock()
         self._observations: dict[tuple[str, tuple[tuple[str, str], ...]], list[float]] = {}
 
-    def _count(self, name: str, labels: Mapping[str, str] | None = None) -> int:
+    def count(self, name: str, labels: Mapping[str, str] | None = None) -> int:
         """Return the number of matching counter events."""
         selected = None if labels is None else tuple(labels.items())
         with self._lock:
             return sum(
                 count
                 for (metric_name, metric_labels), count in self._increments.items()
-                if metric_name == name and (selected is None or metric_labels == selected)
-            )
-
-    def _observation_count(
-        self,
-        name: str,
-        labels: Mapping[str, str] | None = None,
-    ) -> int:
-        """Return the number of matching observations."""
-        selected = None if labels is None else tuple(labels.items())
-        with self._lock:
-            return sum(
-                len(values)
-                for (metric_name, metric_labels), values in self._observations.items()
                 if metric_name == name and (selected is None or metric_labels == selected)
             )
 
@@ -410,6 +538,20 @@ class _Metrics:
         key = name, tuple(labels.items())
         with self._lock:
             self._increments[key] = self._increments.get(key, 0) + 1
+
+    def observation_count(
+        self,
+        name: str,
+        labels: Mapping[str, str] | None = None,
+    ) -> int:
+        """Return the number of matching observations."""
+        selected = None if labels is None else tuple(labels.items())
+        with self._lock:
+            return sum(
+                len(values)
+                for (metric_name, metric_labels), values in self._observations.items()
+                if metric_name == name and (selected is None or metric_labels == selected)
+            )
 
     def observe(self, name: str, value: float, labels: Mapping[str, str]) -> None:
         """Record one numeric observation.
@@ -427,24 +569,40 @@ class _Metrics:
 class _ResultProtocolClient:
     """Drive actual `ValkeyBackend` scripts through a bounded result protocol seam."""
 
-    __slots__ = ('_closed', '_failure', '_lookup_attempts', '_stored')
+    __slots__ = ('_failure', '_stored', 'closed', 'lookup_attempts')
 
     def __init__(self, failure: BaseException | None = None) -> None:
         """Initialize the controlled script replies and optional lookup failure."""
-        self._closed = False
+        self.closed = False
         self._failure = failure
-        self._lookup_attempts = 0
+        self.lookup_attempts = 0
         self._stored: bytes | None = None
 
     def close(self) -> None:
         """Record production backend resource closure."""
-        self._closed = True
+        self.closed = True
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
-        """Return server-shaped lookup/reserve/commit/release replies."""
+        """Return server-shaped replies for the benchmark's result operations.
+
+        Args:
+            sha: Script digest, intentionally ignored.
+            numkeys: Number of leading key operands in a supported benchmark
+                command.
+            *keys_and_args: Ordered operands for lookup, reserve, commit, or
+                release using the production script layouts.
+
+        Returns:
+            A list beginning with `b'miss'`, `b'hit'`, `b'reserved'`,
+            `b'committed'`, or `b'released'`. A hit also contains the retained
+            payload and a remaining lifetime of 30000 milliseconds.
+
+        Raises:
+            BaseException: The configured lookup failure is raised unchanged.
+        """
         _ = sha
         if numkeys == 1 and len(keys_and_args) == 1:
-            self._lookup_attempts += 1
+            self.lookup_attempts += 1
             if self._failure is not None:
                 raise self._failure
             if self._stored is None:
@@ -466,7 +624,17 @@ class _ResultProtocolClient:
         """Retain the controlled protocol client."""
 
     def run_operation(self, operation: Callable[[_ResultProtocolClient], _T]) -> _T:
-        """Run result work against the prepared deterministic client."""
+        """Run result work against the prepared deterministic client.
+
+        Args:
+            operation: Callback invoked once with this client.
+
+        Returns:
+            The callback's result without transformation.
+
+        Raises:
+            Exception: The supplied operation fails.
+        """
         return operation(self)
 
     def script_load(self, script: bytes | str) -> object:
@@ -480,10 +648,65 @@ class _ResultProtocolClient:
         raise RuntimeError('benchmark scripts must already be loaded')
 
 
+class _ScenarioSpec(TypedDict):
+    """Describe one benchmark scenario's defaults, size bounds, and workload shape."""
+
+    operations: int
+    workers: int
+    minimum_operations: int
+    fixed_operations: int | None
+    minimum_workers: int
+    fixed_workers: int | None
+    parallel_offset: int | None
+    shared_profiles: bool
+    workload: Literal['fanout', 'hot_key', 'mixed', 'scan', 'uniform']
+
+
+@dataclass(slots=True)
+class _ReadState:
+    """Collect synchronized SG calls, hit timings, and correctness violations."""
+
+    complete_hit_latencies_ms: list[float]
+    correctness_violations: int
+    evidence: dict[str, int]
+    _lock: Lock
+    _sg_calls: int
+
+    def add_hit(self, milliseconds: float) -> None:
+        """Record one complete cache hit."""
+        with self._lock:
+            self.complete_hit_latencies_ms.append(milliseconds)
+
+    def add_sg_call(self) -> None:
+        """Record one modeled SG call."""
+        with self._lock:
+            self._sg_calls += 1
+
+    @classmethod
+    def create(cls) -> _ReadState:
+        """Create empty synchronized read measurements."""
+        return cls([], 0, {}, Lock(), 0)
+
+    def record(self, name: str, value: int) -> None:
+        """Record one scenario-owned integer observation."""
+        with self._lock:
+            self.evidence[name] = value
+
+    def sg_call_count(self) -> int:
+        """Return the synchronized number of direct SG fetches."""
+        with self._lock:
+            return self._sg_calls
+
+    def violation(self) -> None:
+        """Record one stale, malformed, or over-age result."""
+        with self._lock:
+            self.correctness_violations += 1
+
+
 class _SchemaClient:
     """Answer schema and find calls for the wrapper-schema scenario."""
 
-    __slots__ = ('_lock', '_schema', '_schema_reads')
+    __slots__ = ('_lock', '_schema', 'schema_reads')
 
     def __init__(self, entity_types: int, fields_per_type: int) -> None:
         """Generate the requested schema and initialize its read counter."""
@@ -501,7 +724,7 @@ class _SchemaClient:
             }
             for index in range(entity_types)
         }
-        self._schema_reads = 0
+        self.schema_reads = 0
 
     def find(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
         """Return one deterministic entity result."""
@@ -512,7 +735,7 @@ class _SchemaClient:
         """Return the generated schema and record its acquisition."""
         _ = project_entity
         with self._lock:
-            self._schema_reads += 1
+            self.schema_reads += 1
         return self._schema
 
 
@@ -537,74 +760,27 @@ class _StaticMetadata:
         return GenerationVector('f' * 32, tuple((tag, 1) for tag in tags))
 
 
-class _ValkeyBackendConstructor(Protocol):
-    """Construct the maintained backend around controlled protocol seams."""
-
-    def __call__(
-        self,
-        result_client: object,
-        metadata: object,
-        settings: CacheSettings,
-        metrics: _Metrics,
-    ) -> CacheBackend:
-        """Construct one production breaker owner."""
-        ...
-
-
-@dataclass(slots=True)
-class _ReadState:
-    """Collect synchronized SG calls, hit timings, and correctness violations."""
-
-    _complete_hit_latencies_ms: list[float]
-    _correctness_violations: int
-    _evidence: dict[str, int]
-    _lock: Lock
-    _sg_calls: int
-
-    def _add_hit(self, milliseconds: float) -> None:
-        """Record one complete cache hit."""
-        with self._lock:
-            self._complete_hit_latencies_ms.append(milliseconds)
-
-    def _add_sg_call(self) -> None:
-        """Record one modeled SG call."""
-        with self._lock:
-            self._sg_calls += 1
-
-    @classmethod
-    def _create(cls) -> _ReadState:
-        """Create empty synchronized read measurements."""
-        return cls([], 0, {}, Lock(), 0)
-
-    def _record(self, name: str, value: int) -> None:
-        """Record one scenario-owned integer observation."""
-        with self._lock:
-            self._evidence[name] = value
-
-    def _sg_call_count(self) -> int:
-        """Return the synchronized number of direct SG fetches."""
-        with self._lock:
-            return self._sg_calls
-
-    def _violation(self) -> None:
-        """Record one stale, malformed, or over-age result."""
-        with self._lock:
-            self._correctness_violations += 1
-
-
 @dataclass(slots=True)
 class _Topology:
     """Own one benchmark topology and every closeable backend resource."""
 
-    _cache: QueryCache
-    _measured: list[_MeasuredBackend]
-    _metrics: _Metrics
-    _resources: list[_Closable]
-    _settings: CacheSettings
+    cache: QueryCache
+    measured: list[_MeasuredBackend]
+    metrics: _Metrics
+    resources: list[_Closable]
+    settings: CacheSettings
 
-    def _close(self) -> None:
-        """Close each backend exactly once in reverse construction order."""
-        for resource in reversed(self._resources):
+    def close(self) -> None:
+        """Close resources in reverse construction order until a close fails.
+
+        Each call visits the retained resource list again; this method does not
+        track prior close attempts.
+
+        Raises:
+            Exception: A resource close fails, leaving earlier-constructed
+                resources unattempted by this call.
+        """
+        for resource in reversed(self.resources):
             resource.close()
 
 
@@ -612,12 +788,12 @@ class _Topology:
 class _Workload:
     """Describe one deterministic bounded synthetic workload."""
 
-    _keys: tuple[int, ...]
-    _operations: int
-    _payload_sizes: tuple[int, ...]
-    _scenario: str
-    _seed: int
-    _workers: int
+    keys: tuple[int, ...]
+    operations: int
+    payload_sizes: tuple[int, ...]
+    scenario: str
+    seed: int
+    workers: int
 
 
 def _aggregate_memory(backends: Sequence[_MeasuredBackend]) -> dict[str, int]:
@@ -631,7 +807,7 @@ def _aggregate_memory(backends: Sequence[_MeasuredBackend]) -> dict[str, int]:
         'result_peak': 0,
     }
     for backend in backends:
-        estimate = backend._memory_estimates()
+        estimate = backend.memory_estimates()
         if estimate['measured']:
             result['measured_backends'] += 1
         else:
@@ -651,21 +827,21 @@ def _aggregate_operations(
     aggregate = {
         'change': 0,
         'commit': 0,
-        'evictions': metrics._observation_count(
+        'evictions': metrics.observation_count(
             'cache_serialized_bytes',
             {'layer': 'local_l1', 'outcome': 'evicted'},
         ),
-        'fills': metrics._count('cache_fill'),
-        'hits': metrics._count('cache_hit'),
+        'fills': metrics.count('cache_fill'),
+        'hits': metrics.count('cache_hit'),
         'lookup': 0,
         'metadata_capacity_rejections': capacity_rejections
-        + metrics._count('cache_metadata_write_rejection'),
+        + metrics.count('cache_metadata_write_rejection'),
         'release': 0,
         'reserve': 0,
         'resolve': 0,
     }
     for backend in backends:
-        for name, count in backend._operation_counts().items():
+        for name, count in backend.operation_counts().items():
             aggregate[name] += count
     aggregate.update(evidence)
     return aggregate
@@ -747,30 +923,30 @@ def _broadening_plans(limits: LimitSettings) -> tuple[DependencyPlan, Dependency
 
 def _cache_for_identity(topology: _Topology, identity: Identity) -> QueryCache:
     """Bind one exact identity to the already measured topology backends."""
-    settings = topology._settings
+    settings = topology.settings
     if settings.l2.enabled and settings.l1.enabled:
         return QueryCache(
             settings,
             identity,
-            KeyBuilder(),
-            l1=topology._measured[0],
-            l2=topology._measured[-1],
-            metrics=topology._metrics,
+            key_builder=KeyBuilder(),
+            l1=topology.measured[0],
+            l2=topology.measured[-1],
+            metrics=topology.metrics,
         )
     if settings.l2.enabled:
         return QueryCache(
             settings,
             identity,
-            KeyBuilder(),
-            l2=topology._measured[-1],
-            metrics=topology._metrics,
+            key_builder=KeyBuilder(),
+            l2=topology.measured[-1],
+            metrics=topology.metrics,
         )
     return QueryCache(
         settings,
         identity,
-        KeyBuilder(),
-        l1=topology._measured[0],
-        metrics=topology._metrics,
+        key_builder=KeyBuilder(),
+        l1=topology.measured[0],
+        metrics=topology.metrics,
     )
 
 
@@ -858,7 +1034,7 @@ def _required(name: str, environ: Mapping[str, str]) -> str:
     """Return one explicit disposable-service setting or reject the profile."""
     value = environ.get(name)
     if not value:
-        raise ValueError('shared profiles require explicitly configured disposable Valkey roles')
+        raise ValueError(f'{name} is required for shared profiles')
     return value
 
 
@@ -869,7 +1045,7 @@ def _boolean(name: str, environ: Mapping[str, str]) -> bool:
         return True
     if value == 'false':
         return False
-    raise ValueError('shared profiles require explicitly configured disposable Valkey roles')
+    raise ValueError(f'{name} must be true or false')
 
 
 def _integer(name: str, environ: Mapping[str, str]) -> int:
@@ -877,23 +1053,27 @@ def _integer(name: str, environ: Mapping[str, str]) -> int:
     try:
         return int(_required(name, environ))
     except ValueError:
-        raise ValueError(
-            'shared profiles require explicitly configured disposable Valkey roles'
-        ) from None
+        raise ValueError(f'{name} must be an integer') from None
 
 
 def _role(role: str, environ: Mapping[str, str], namespace: str) -> ValkeyRoleSettings:
     """Build one standalone role from the disposable integration environment."""
     prefix = f'SG_QUERY_CACHE_TEST_{role.upper()}'
-    return ValkeyRoleSettings(
-        _required(f'{prefix}_HOST', environ),
-        f'{prefix}_PASSWORD',
-        port=_integer(f'{prefix}_PORT', environ),
-        database=_integer(f'{prefix}_DATABASE', environ),
-        tls=_boolean(f'{prefix}_TLS', environ),
-        username=environ.get(f'{prefix}_USERNAME') or None,
-        key_prefix=namespace,
-    )
+    try:
+        return ValkeyRoleSettings(
+            _required(f'{prefix}_HOST', environ),
+            f'{prefix}_PASSWORD',
+            port=_integer(f'{prefix}_PORT', environ),
+            database=_integer(f'{prefix}_DATABASE', environ),
+            tls=_boolean(f'{prefix}_TLS', environ),
+            username=environ.get(f'{prefix}_USERNAME') or None,
+            key_prefix=namespace,
+        )
+    except (TypeError, ValueError) as error:
+        field = str(error).split(' ', 1)[0].upper()
+        if field in {'HOST', 'PORT', 'DATABASE', 'USERNAME'}:
+            raise ValueError(f'{prefix}_{field} is invalid') from None
+        raise
 
 
 def _run_metadata_churn(
@@ -922,13 +1102,13 @@ def _run_metadata_churn(
     cache = QueryCache(
         settings,
         Identity('script', 'benchmark', 'synthetic'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=measured,
         metrics=metrics,
     )
     topology = _Topology(cache, [measured], metrics, [measured], settings)
     tags = tuple(
-        DependencyTag.entity(_SITE, 'Asset', index + 1) for index in range(workload._operations)
+        DependencyTag.entity(_SITE, 'Asset', index + 1) for index in range(workload.operations)
     )
     first = measured.resolve((tags[0],)).entries[0][1]
     capacity_rejections = 0
@@ -938,10 +1118,10 @@ def _run_metadata_churn(
         except BackendCapacity:
             capacity_rejections += 1
             break
-    clock._advance(0.2)
+    clock.advance(0.2)
     recreated = measured.resolve((tags[0],)).entries[0][1]
     if recreated == first:
-        state._violation()
+        state.violation()
     return topology, capacity_rejections
 
 
@@ -950,10 +1130,10 @@ def _run_wrapper_schema(topology: _Topology, workload: _Workload, state: _ReadSt
     client = _SchemaClient(120, 100)
     wrapper = CachedShotgun(
         client,
-        topology._cache,
+        topology.cache,
         ClientContext(
-            'https://benchmark.example',
-            _SITE,
+            site_url='https://benchmark.example',
+            site_namespace=_SITE,
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -974,20 +1154,23 @@ def _run_wrapper_schema(topology: _Topology, workload: _Workload, state: _ReadSt
             [['sg_field_001', 'is', f'x{index % 4}']],
             ['sg_field_002'],
         )
-        state._add_hit((monotonic() - started) * 1000)
+        state.add_hit((monotonic() - started) * 1000)
 
-    with ThreadPoolExecutor(max_workers=workload._workers) as executor:
-        list(executor.map(read, range(workload._operations)))
-    state._record('complete_hit_samples', len(state._complete_hit_latencies_ms))
-    state._record('schema_reads', client._schema_reads)
+    with ThreadPoolExecutor(max_workers=workload.workers) as executor:
+        list(executor.map(read, range(workload.operations)))
+    state.record('complete_hit_samples', len(state.complete_hit_latencies_ms))
+    state.record('schema_reads', client.schema_reads)
 
 
 def _settings(profile: str, scenario: str, environ: Mapping[str, str]) -> CacheSettings:
     """Build bounded settings for one local or explicitly gated Valkey profile."""
     vector_bytes = 4_096 if scenario == 'link-fanout-events' else 2_048
+    # These scenarios run on the real clock, so retention must outlast any scheduling delay
+    # between a fill and its reuse; metadata-churn exercises expiry on its own fake clock.
+    # A short retention still keeps disposable Valkey servers from accumulating old tags.
     limits = LimitSettings(
         max_dependency_vector_bytes=vector_bytes,
-        scoped_generation_retention_seconds=0.1,
+        scoped_generation_retention_seconds=5.0,
     )
     l1 = L1Settings(
         enabled=profile != 'shared',
@@ -997,17 +1180,25 @@ def _settings(profile: str, scenario: str, environ: Mapping[str, str]) -> CacheS
     if profile == 'local':
         return CacheSettings(site_namespace=_SITE, l1=l1, limits=limits)
     if environ.get('SG_QUERY_CACHE_REQUIRE_INTEGRATION') != '1':
-        raise ValueError('shared profiles require explicitly configured disposable Valkey roles')
+        raise ValueError('SG_QUERY_CACHE_REQUIRE_INTEGRATION must be 1 for shared profiles')
     namespace = _next_namespace(scenario)
+    result = _role('result', environ, namespace)
+    metadata = _role('metadata', environ, namespace)
+    try:
+        valkey = ValkeySettings(result=result, metadata=metadata)
+    except ValueError:
+        raise ValueError(
+            'SG_QUERY_CACHE_TEST_RESULT_HOST, SG_QUERY_CACHE_TEST_RESULT_PORT, '
+            'SG_QUERY_CACHE_TEST_RESULT_DATABASE, SG_QUERY_CACHE_TEST_METADATA_HOST, '
+            'SG_QUERY_CACHE_TEST_METADATA_PORT, and SG_QUERY_CACHE_TEST_METADATA_DATABASE '
+            'must identify separate endpoints'
+        ) from None
     return CacheSettings(
         site_namespace=_SITE,
         l1=l1,
         l2=L2Settings(
             enabled=True,
-            valkey=ValkeySettings(
-                result=_role('result', environ, namespace),
-                metadata=_role('metadata', environ, namespace),
-            ),
+            valkey=valkey,
         ),
         limits=limits,
     )
@@ -1025,7 +1216,9 @@ def _topology(
     if profile == 'local':
         backend = LocalBackend(settings, monotonic, metrics)
         measured = _MeasuredBackend(backend, memory_probe=lambda: _local_memory(backend))
-        cache = QueryCache(settings, identity, KeyBuilder(), l1=measured, metrics=metrics)
+        cache = QueryCache(
+            settings, identity, key_builder=KeyBuilder(), l1=measured, metrics=metrics
+        )
         return _Topology(cache, [measured], metrics, [measured], settings)
 
     valkey_module = import_module('sg_query_cache.valkey')
@@ -1033,14 +1226,18 @@ def _topology(
 
     shared = _MeasuredBackend(valkey_backend.from_settings(settings, environ, metrics))
     if profile == 'shared':
-        cache = QueryCache(settings, identity, KeyBuilder(), l2=shared, metrics=metrics)
+        cache = QueryCache(
+            settings, identity, key_builder=KeyBuilder(), l2=shared, metrics=metrics
+        )
         return _Topology(cache, [shared], metrics, [shared], settings)
     local_backend = LocalBackend(settings, monotonic, metrics)
     local = _MeasuredBackend(
         local_backend,
         memory_probe=lambda: _local_memory(local_backend),
     )
-    cache = QueryCache(settings, identity, KeyBuilder(), l1=local, l2=shared, metrics=metrics)
+    cache = QueryCache(
+        settings, identity, key_builder=KeyBuilder(), l1=local, l2=shared, metrics=metrics
+    )
     return _Topology(cache, [local, shared], metrics, [local, shared], settings)
 
 
@@ -1052,13 +1249,12 @@ def _validate_workload_size(scenario: str, operations: int, workers: int) -> Non
         raise ValueError('benchmark operations must not exceed 10,000')
     if workers > _MAX_WORKERS:
         raise ValueError('benchmark workers must not exceed 64')
-    (
-        minimum_operations,
-        fixed_operations,
-        minimum_workers,
-        fixed_workers,
-        parallel_offset,
-    ) = _SCENARIO_CONTRACTS[scenario]
+    spec = _SCENARIO_SPECS[scenario]
+    minimum_operations = spec['minimum_operations']
+    fixed_operations = spec['fixed_operations']
+    minimum_workers = spec['minimum_workers']
+    fixed_workers = spec['fixed_workers']
+    parallel_offset = spec['parallel_offset']
     if fixed_operations is not None and operations != fixed_operations:
         raise ValueError(f'{scenario} requires exactly {fixed_operations:,} operations')
     if operations < minimum_operations:
@@ -1084,23 +1280,25 @@ def _build_workload(
     workers: int | None = None,
 ) -> _Workload:
     """Build one deterministic scenario plan from a local random generator."""
-    if scenario not in _SCENARIOS:
+    spec = _SCENARIO_SPECS.get(scenario)
+    if spec is None:
         raise ValueError('unknown benchmark scenario')
-    operation_count = _DEFAULT_OPERATIONS[scenario] if operations is None else operations
-    worker_count = _DEFAULT_WORKERS[scenario] if workers is None else workers
+    operation_count = spec['operations'] if operations is None else operations
+    worker_count = spec['workers'] if workers is None else workers
     _validate_workload_size(scenario, operation_count, worker_count)
     generator = _Deterministic(seed)
-    if scenario == 'hot-key-burst':
+    workload = spec['workload']
+    if workload == 'hot_key':
         keys = (0,) * operation_count
         payload_sizes = (512,) * operation_count
-    elif scenario == 'one-hit-scan':
+    elif workload == 'scan':
         keys = tuple(range(operation_count))
         payload_sizes = (16_384,) * operation_count
-    elif scenario == 'mixed-values':
+    elif workload == 'mixed':
         trailing_operations = operation_count - 4
-        keys = (0, 0, 1, 1, *(generator._range(2, 8) for _ in range(trailing_operations)))
+        keys = (0, 0, 1, 1, *(generator.range(2, 8) for _ in range(trailing_operations)))
         trailing_sizes = tuple(
-            _NEAR_CAP_PAYLOAD_BYTES if generator._range(0, 4) == 0 else generator._range(32, 513)
+            _NEAR_CAP_PAYLOAD_BYTES if generator.range(0, 4) == 0 else generator.range(32, 513)
             for _ in range(trailing_operations)
         )
         payload_sizes = (
@@ -1110,24 +1308,55 @@ def _build_workload(
             64,
             *trailing_sizes,
         )
-    elif scenario == 'hierarchical-fanout':
-        keys = tuple(
-            generator._range(0, max(2, worker_count // 2)) for _ in range(operation_count)
-        )
-        payload_sizes = tuple(generator._range(128, 1_025) for _ in range(operation_count))
-    else:
+    elif workload == 'fanout':
+        keys = tuple(generator.range(0, max(2, worker_count // 2)) for _ in range(operation_count))
+        payload_sizes = tuple(generator.range(128, 1_025) for _ in range(operation_count))
+    elif workload == 'uniform':
         keys = tuple(range(operation_count))
-        payload_sizes = tuple(generator._range(64, 513) for _ in range(operation_count))
+        payload_sizes = tuple(generator.range(64, 513) for _ in range(operation_count))
+    else:
+        assert_never(workload)
     return _Workload(keys, operation_count, payload_sizes, scenario, seed, worker_count)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> _Arguments:
     """Parse one closed benchmark command without opening a backend."""
-    parser = argparse.ArgumentParser(prog='query_cache.py')
-    parser.add_argument('--profile', choices=('local', 'shared', 'hierarchical'), required=True)
-    parser.add_argument('--scenario', choices=_SCENARIOS, required=True)
-    parser.add_argument('--json', action='store_true', required=True)
-    parser.add_argument('--seed', type=int, default=1729)
+    parser = argparse.ArgumentParser(
+        prog='query_cache.py',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Scenarios:
+  hot-key-burst: concurrent reads of one hot key
+  identity-cardinality: distinct identity metadata growth
+  one-hit-scan: cost of keys read once
+  dependency-broadening: dependency vector broadening
+  event-storm: invalidation throughput under many events
+  metadata-churn: metadata expiry and capacity churn
+  mixed-values: reads across varied payload sizes
+  failure-recovery: local backend failure and recovery
+  hierarchical-fanout: concurrent reads through two cache layers
+  link-fanout-events: invalidation across linked entities
+  wrapper-schema: schema reads through the client wrapper""",
+    )
+    parser.add_argument(
+        '--profile',
+        choices=('local', 'shared', 'hierarchical'),
+        required=True,
+        help='cache layout; shared and hierarchical need disposable Valkey roles',
+    )
+    parser.add_argument(
+        '--scenario',
+        choices=_SCENARIOS,
+        metavar='NAME',
+        required=True,
+        help='workload to measure; see Scenarios below',
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        required=True,
+        help='required; always emit one compact JSON report',
+    )
+    parser.add_argument('--seed', type=int, default=1729, help='workload seed (default: 1729)')
     parser.add_argument('--operations', type=int, help='positive count up to 10,000')
     parser.add_argument('--workers', type=int, help='positive count up to 64')
     return parser.parse_args(argv, namespace=_Arguments())
@@ -1137,10 +1366,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> _Arguments:
 class _ReadOptions:
     """Configure one synthetic SG fetch and correctness check."""
 
-    _payload_size: int = 128
-    _per_call_age: float | None = None
-    _sg_latency_seconds: float = 0.0
-    _version: int = 1
+    payload_size: int = 128
+    per_call_age: float | None = None
+    sg_latency_seconds: float = 0.0
+    version: int = 1
 
 
 def _read_once(
@@ -1156,12 +1385,12 @@ def _read_once(
     def fetch() -> dict[str, object]:
         nonlocal fetched
         fetched = True
-        state._add_sg_call()
-        if options._sg_latency_seconds > 0:
-            sleep(options._sg_latency_seconds)
+        state.add_sg_call()
+        if options.sg_latency_seconds > 0:
+            sleep(options.sg_latency_seconds)
         return {
-            'payload': bytes(options._payload_size),
-            'version': options._version,
+            'payload': bytes(options.payload_size),
+            'version': options.version,
         }
 
     started_at = monotonic()
@@ -1170,44 +1399,44 @@ def _read_once(
         plan,
         fetch,
         _CLIENT_OPTIONS,
-        per_call_age=options._per_call_age,
+        per_call_age=options.per_call_age,
     )
     elapsed_ms = (monotonic() - started_at) * 1_000
     if not fetched:
-        state._add_hit(elapsed_ms)
+        state.add_hit(elapsed_ms)
     if not isinstance(value, dict):
-        state._violation()
+        state.violation()
         return
     result = cast('dict[str, object]', value)
     observed_version = result.get('version')
-    if observed_version != options._version:
-        state._violation()
+    if observed_version != options.version:
+        state.violation()
 
 
 def _normal_hit_backend_phases(profile: str, environ: Mapping[str, str]) -> int:
     """Measure one warmed hit on an independent backend topology."""
     metrics = _Metrics()
-    state = _ReadState._create()
+    state = _ReadState.create()
     topology: _Topology | None = None
     try:
         topology = _topology(profile, 'normal-hit', metrics, environ)
         call = _call(0)
         plan = _default_plan(0)
         options = _ReadOptions()
-        _read_once(topology._cache, call, plan, state, options)
-        before = tuple(backend._operation_counts() for backend in topology._measured)
-        fetched_before_hit = state._sg_call_count()
-        _read_once(topology._cache, call, plan, state, options)
+        _read_once(topology.cache, call, plan, state, options)
+        before = tuple(backend.operation_counts() for backend in topology.measured)
+        fetched_before_hit = state.sg_call_count()
+        _read_once(topology.cache, call, plan, state, options)
         phases = sum(
             count - owner_before[name]
-            for backend, owner_before in zip(topology._measured, before, strict=True)
-            for name, count in backend._operation_counts().items()
+            for backend, owner_before in zip(topology.measured, before, strict=True)
+            for name, count in backend.operation_counts().items()
         )
         if (
             fetched_before_hit != 1
-            or state._sg_call_count() != fetched_before_hit
-            or len(state._complete_hit_latencies_ms) != 1
-            or state._correctness_violations != 0
+            or state.sg_call_count() != fetched_before_hit
+            or len(state.complete_hit_latencies_ms) != 1
+            or state.correctness_violations != 0
             or phases <= 0
             or (profile == 'shared' and phases != _SHARED_NORMAL_HIT_PHASES)
         ):
@@ -1219,7 +1448,7 @@ def _normal_hit_backend_phases(profile: str, environ: Mapping[str, str]) -> int:
     finally:
         if topology is not None:
             try:
-                topology._close()
+                topology.close()
             except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
                 raise ValueError('normal-hit backend phase measurement failed') from None
 
@@ -1234,17 +1463,17 @@ def _parallel_reads(
     """Run one deterministic read sequence through a bounded worker pool."""
     planner: Callable[[int], DependencyPlan] = plan_for_index or _default_plan
     selected_options = options or _ReadOptions()
-    with ThreadPoolExecutor(max_workers=workload._workers) as executor:
+    with ThreadPoolExecutor(max_workers=workload.workers) as executor:
         futures = [
             executor.submit(
                 _read_once,
                 cache_for_index(index),
-                _call(workload._keys[index]),
+                _call(workload.keys[index]),
                 planner(index),
                 state,
-                replace(selected_options, _payload_size=workload._payload_sizes[index]),
+                replace(selected_options, payload_size=workload.payload_sizes[index]),
             )
-            for index in range(workload._operations)
+            for index in range(workload.operations)
         ]
         for future in futures:
             future.result()
@@ -1254,9 +1483,9 @@ def _parallel_reads(
 class _BenchmarkOptions:
     """Hold optional benchmark sizing and deterministic seed inputs."""
 
-    _operations: int | None = None
-    _seed: int = 1729
-    _workers: int | None = None
+    operations: int | None = None
+    seed: int = 1729
+    workers: int | None = None
 
 
 def _run_dependency_broadening(
@@ -1265,13 +1494,13 @@ def _run_dependency_broadening(
     state: _ReadState,
 ) -> None:
     """Analyze real over-bound calls and exercise their bounded production plans."""
-    plans = _broadening_plans(topology._settings.limits)
+    plans = _broadening_plans(topology.settings.limits)
     for plan in plans:
         for step in plan.broadening_steps:
-            state._record(f'broadening:{step}', state._evidence.get(f'broadening:{step}', 0) + 1)
-    state._record('analyzer_max_output_tags', max(len(plan.tags) for plan in plans))
+            state.record(f'broadening:{step}', state.evidence.get(f'broadening:{step}', 0) + 1)
+    state.record('analyzer_max_output_tags', max(len(plan.tags) for plan in plans))
     _parallel_reads(
-        lambda _index: topology._cache,
+        lambda _index: topology.cache,
         workload,
         state,
         plan_for_index=lambda index: plans[index % len(plans)],
@@ -1280,30 +1509,30 @@ def _run_dependency_broadening(
 
 def _run_event_storm(topology: _Topology, workload: _Workload, state: _ReadState) -> None:
     """Apply 10,000 mostly unmaterialized scoped changes through the real backend."""
-    backend = topology._measured[-1]
+    backend = topology.measured[-1]
 
     def change(index: int) -> None:
         backend.change(
-            (GenerationChange(DependencyTag.entity(_SITE, 'Asset', workload._keys[index] + 1)),)
+            (GenerationChange(DependencyTag.entity(_SITE, 'Asset', workload.keys[index] + 1)),)
         )
 
-    with ThreadPoolExecutor(max_workers=workload._workers) as executor:
-        list(executor.map(change, range(workload._operations)))
+    with ThreadPoolExecutor(max_workers=workload.workers) as executor:
+        list(executor.map(change, range(workload.operations)))
 
     _read_once(
-        topology._cache,
+        topology.cache,
         _call(0),
         _plan(),
         state,
         _ReadOptions(),
     )
-    topology._cache.invalidate((GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),))
+    topology.cache.invalidate((GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),))
     _read_once(
-        topology._cache,
+        topology.cache,
         _call(0),
         _plan(),
         state,
-        _ReadOptions(_version=2),
+        _ReadOptions(version=2),
     )
 
 
@@ -1316,7 +1545,7 @@ def _run_failure_recovery(
     _ = workload
     valkey_module = import_module('sg_query_cache.valkey')
     exception_module = import_module('valkey.exceptions')
-    constructor = cast('_ValkeyBackendConstructor', vars(valkey_module)['ValkeyBackend'])
+    constructor = cast('type[ValkeyBackend]', vars(valkey_module)['ValkeyBackend'])
     timeout_type = vars(exception_module)['TimeoutError']
     if not isinstance(timeout_type, type) or not issubclass(timeout_type, BaseException):
         raise TypeError('Valkey timeout exception is unavailable')
@@ -1332,25 +1561,25 @@ def _run_failure_recovery(
         failing_client,
         _StaticMetadata(),
         settings,
-        topology._metrics,
+        topology.metrics,
     )
     failing_cache = QueryCache(
         settings,
         Identity('script', 'benchmark', 'failure-recovery'),
         l2=failing_backend,
-        metrics=topology._metrics,
+        metrics=topology.metrics,
     )
     failure_key = 91_001
     call = _call(failure_key)
-    options = _ReadOptions(_payload_size=128)
+    options = _ReadOptions(payload_size=128)
     for _index in range(_BREAKER_FAILURES):
         _read_once(failing_cache, call, _plan(), state, options)
-    before_open = state._sg_call_count()
-    attempts_before_open = failing_client._lookup_attempts
+    before_open = state.sg_call_count()
+    attempts_before_open = failing_client.lookup_attempts
     _read_once(failing_cache, call, _plan(), state, options)
     breaker_bypasses = int(
-        state._sg_call_count() - before_open == 1
-        and failing_client._lookup_attempts == attempts_before_open
+        state.sg_call_count() - before_open == 1
+        and failing_client.lookup_attempts == attempts_before_open
     )
     failing_cache.close()
 
@@ -1359,42 +1588,42 @@ def _run_failure_recovery(
         healthy_client,
         _StaticMetadata(),
         settings,
-        topology._metrics,
+        topology.metrics,
     )
     healthy_cache = QueryCache(
         settings,
         Identity('script', 'benchmark', 'failure-recovery'),
         l2=healthy_backend,
-        metrics=topology._metrics,
+        metrics=topology.metrics,
     )
-    before_recovery = state._sg_call_count()
+    before_recovery = state.sg_call_count()
     try:
         _read_once(healthy_cache, call, _plan(), state, options)
         _read_once(healthy_cache, call, _plan(), state, options)
-        recovery_hits = int(state._sg_call_count() - before_recovery == 1)
-        remaining = workload._operations - (_BREAKER_FAILURES + 3)
+        recovery_hits = int(state.sg_call_count() - before_recovery == 1)
+        remaining = workload.operations - (_BREAKER_FAILURES + 3)
         if remaining > 0:
             recovered_workload = replace(
                 workload,
-                _operations=remaining,
-                _keys=(failure_key,) * remaining,
-                _payload_sizes=(options._payload_size,) * remaining,
+                operations=remaining,
+                keys=(failure_key,) * remaining,
+                payload_sizes=(options.payload_size,) * remaining,
             )
             _parallel_reads(lambda _index: healthy_cache, recovered_workload, state, options)
     finally:
         healthy_cache.close()
 
-    state._record('failure_timeouts', failing_client._lookup_attempts)
-    state._record('breaker_open_bypasses', breaker_bypasses)
-    state._record('backend_restarts', int(failing_client._closed))
-    state._record('recovery_hits', recovery_hits)
+    state.record('failure_timeouts', failing_client.lookup_attempts)
+    state.record('breaker_open_bypasses', breaker_bypasses)
+    state.record('backend_restarts', int(failing_client.closed))
+    state.record('recovery_hits', recovery_hits)
     if (
-        failing_client._lookup_attempts != _BREAKER_FAILURES
+        failing_client.lookup_attempts != _BREAKER_FAILURES
         or breaker_bypasses != 1
-        or not failing_client._closed
+        or not failing_client.closed
         or recovery_hits != 1
     ):
-        state._violation()
+        state.violation()
 
 
 def _run_hierarchical_fanout(
@@ -1404,12 +1633,12 @@ def _run_hierarchical_fanout(
     metrics: _Metrics,
 ) -> None:
     """Run many independent L1s against one actual shared L2 backend."""
-    if topology._settings.l2.enabled:
-        shared = topology._measured[-1]
+    if topology.settings.l2.enabled:
+        shared = topology.measured[-1]
         settings = CacheSettings(
             site_namespace=_SITE,
-            l2=topology._settings.l2,
-            limits=topology._settings.limits,
+            l2=topology.settings.l2,
+            limits=topology.settings.limits,
         )
     else:
         settings = CacheSettings(site_namespace=_SITE, l2=L2Settings(enabled=True))
@@ -1418,37 +1647,48 @@ def _run_hierarchical_fanout(
             raw_shared,
             memory_probe=lambda: _local_memory(raw_shared),
         )
-        topology._measured.append(shared)
-        topology._resources.append(shared)
+        topology.measured.append(shared)
+        topology.resources.append(shared)
     caches: list[QueryCache] = []
     local_owners: list[_MeasuredBackend] = []
-    for _index in range(workload._workers):
+    for _index in range(workload.workers):
         local_backend = LocalBackend(settings, monotonic, metrics)
         local = _MeasuredBackend(
             local_backend,
             memory_probe=lambda backend=local_backend: _local_memory(backend),
         )
-        topology._measured.append(local)
-        topology._resources.append(local)
+        topology.measured.append(local)
+        topology.resources.append(local)
         local_owners.append(local)
         caches.append(
             QueryCache(
                 settings,
                 Identity('script', 'benchmark', 'fanout'),
-                KeyBuilder(),
+                key_builder=KeyBuilder(),
                 l1=local,
                 l2=shared,
                 metrics=metrics,
             )
         )
     _parallel_reads(lambda index: caches[index % len(caches)], workload, state)
-    participating_l1s = sum(owner._operation_counts()['resolve'] > 0 for owner in local_owners)
-    shared_operations = sum(shared._operation_counts().values())
-    state._record('fanout_participating_l1s', participating_l1s)
-    state._record('fanout_shared_l2_instances', 1)
-    state._record('fanout_shared_l2_operations', shared_operations)
+    participating_l1s = sum(owner.operation_counts()['resolve'] > 0 for owner in local_owners)
+    shared_operations = sum(shared.operation_counts().values())
+    state.record('fanout_participating_l1s', participating_l1s)
+    state.record('fanout_shared_l2_instances', 1)
+    state.record('fanout_shared_l2_operations', shared_operations)
     if participating_l1s != len(local_owners) or shared_operations <= 0:
-        state._violation()
+        state.violation()
+
+
+def _run_hot_key_burst(topology: _Topology, workload: _Workload, state: _ReadState) -> None:
+    """Read one hot key from every worker against the fixed synthetic SG latency."""
+    sg_latency_seconds, _model = _latency_model(workload.scenario)
+    _parallel_reads(
+        lambda _index: topology.cache,
+        workload,
+        state,
+        _ReadOptions(sg_latency_seconds=sg_latency_seconds),
+    )
 
 
 def _run_identity_cardinality(
@@ -1462,10 +1702,10 @@ def _run_identity_cardinality(
             topology,
             Identity('script', 'benchmark', f'identity-{index}'),
         )
-        for index in range(workload._operations)
+        for index in range(workload.operations)
     ]
-    state._record('backend_instances', len(topology._measured))
-    state._record('identity_count', len(caches))
+    state.record('backend_instances', len(topology.measured))
+    state.record('identity_count', len(caches))
     _parallel_reads(caches.__getitem__, workload, state)
 
 
@@ -1476,31 +1716,29 @@ def _run_link_fanout_events(
     metrics: _Metrics,
 ) -> None:
     """Read one link-returning plan while every target type churns in turn."""
-    plan = _fanout_plan(topology._settings.limits)
-    state._record('analyzer_max_output_tags', len(plan.tags))
-    state._record(
+    plan = _fanout_plan(topology.settings.limits)
+    state.record('analyzer_max_output_tags', len(plan.tags))
+    state.record(
         'max_dependency_vector_bytes',
-        topology._settings.limits.max_dependency_vector_bytes,
+        topology.settings.limits.max_dependency_vector_bytes,
     )
     bumps = 0
     hits = 0
 
-    for index in range(workload._operations):
-        before = metrics._count('cache_hit')
-        _read_once(topology._cache, _call(0), plan, state, _ReadOptions(_version=bumps + 1))
-        hits += metrics._count('cache_hit') - before
+    for index in range(workload.operations):
+        before = metrics.count('cache_hit')
+        _read_once(topology.cache, _call(0), plan, state, _ReadOptions(version=bumps + 1))
+        hits += metrics.count('cache_hit') - before
         if (index + 1) % _FANOUT_EVENT_INTERVAL == 0:
             target = _FANOUT_TARGETS[bumps % len(_FANOUT_TARGETS)]
-            topology._cache.invalidate(
-                (GenerationChange(DependencyTag.type_value(_SITE, target)),)
-            )
+            topology.cache.invalidate((GenerationChange(DependencyTag.type_value(_SITE, target)),))
             bumps += 1
 
-    state._record('link_fanout_reads', workload._operations)
-    state._record('link_fanout_hits', hits)
-    state._record(
+    state.record('link_fanout_reads', workload.operations)
+    state.record('link_fanout_hits', hits)
+    state.record(
         'type_value_invalidations',
-        metrics._count('cache_invalidation', {'tag_kind': 'type_value'}),
+        metrics.count('cache_invalidation', {'tag_kind': 'type_value'}),
     )
 
 
@@ -1515,20 +1753,20 @@ def _run_maximum_age_check(state: _ReadState, metrics: _Metrics) -> None:
         l1=backend,
         metrics=metrics,
     )
-    options = _ReadOptions(_payload_size=64, _per_call_age=0.05)
-    before = state._sg_call_count()
+    options = _ReadOptions(payload_size=64, per_call_age=0.05)
+    before = state.sg_call_count()
     try:
         _read_once(cache, _call(90_001), _plan(), state, options)
         _read_once(cache, _call(90_001), _plan(), state, options)
-        clock._advance(0.051)
-        _read_once(cache, _call(90_001), _plan(), state, replace(options, _version=2))
+        clock.advance(0.051)
+        _read_once(cache, _call(90_001), _plan(), state, replace(options, version=2))
     finally:
         cache.close()
-    refetches = state._sg_call_count() - before - 1
-    state._record('maximum_age_milliseconds', 50)
-    state._record('maximum_age_refetches', refetches)
+    refetches = state.sg_call_count() - before - 1
+    state.record('maximum_age_milliseconds', 50)
+    state.record('maximum_age_refetches', refetches)
     if refetches != 1:
-        state._violation()
+        state.violation()
 
 
 def _run_mixed_values(topology: _Topology, workload: _Workload, state: _ReadState) -> None:
@@ -1536,86 +1774,74 @@ def _run_mixed_values(topology: _Topology, workload: _Workload, state: _ReadStat
 
     def exercise_pair(label: str, start: int) -> None:
         starting_commits = [
-            len(backend._committed_payload_sizes()) for backend in topology._measured
+            len(backend.committed_payload_sizes()) for backend in topology.measured
         ]
-        starting_hits = topology._metrics._count('cache_hit')
-        starting_sg_calls = state._sg_call_count()
+        starting_hits = topology.metrics.count('cache_hit')
+        starting_sg_calls = state.sg_call_count()
         for index in range(start, start + 2):
             _read_once(
-                topology._cache,
-                _call(workload._keys[index]),
+                topology.cache,
+                _call(workload.keys[index]),
                 _plan(),
                 state,
-                _ReadOptions(_payload_size=workload._payload_sizes[index]),
+                _ReadOptions(payload_size=workload.payload_sizes[index]),
             )
         committed_sizes = [
             size
-            for backend, offset in zip(topology._measured, starting_commits, strict=True)
-            for size in backend._committed_payload_sizes()[offset:]
+            for backend, offset in zip(topology.measured, starting_commits, strict=True)
+            for size in backend.committed_payload_sizes()[offset:]
         ]
         commits = len(committed_sizes)
-        hits = topology._metrics._count('cache_hit') - starting_hits
-        sg_calls = state._sg_call_count() - starting_sg_calls
+        hits = topology.metrics.count('cache_hit') - starting_hits
+        sg_calls = state.sg_call_count() - starting_sg_calls
         encoded_bytes = max(committed_sizes, default=0)
-        state._record(f'mixed_{label}_commits', commits)
-        state._record(f'mixed_{label}_encoded_bytes', encoded_bytes)
-        state._record(f'mixed_{label}_hits', hits)
+        state.record(f'mixed_{label}_commits', commits)
+        state.record(f'mixed_{label}_encoded_bytes', encoded_bytes)
+        state.record(f'mixed_{label}_hits', hits)
         if commits < 1 or hits != 1 or sg_calls != 1:
-            state._violation()
+            state.violation()
 
     exercise_pair('near_cap', 0)
     exercise_pair('small', 2)
-    near_cap_bytes = state._evidence['mixed_near_cap_encoded_bytes']
-    small_bytes = state._evidence['mixed_small_encoded_bytes']
+    near_cap_bytes = state.evidence['mixed_near_cap_encoded_bytes']
+    small_bytes = state.evidence['mixed_small_encoded_bytes']
     if (
         near_cap_bytes < _MIN_NEAR_CAP_ENCODED_BYTES
-        or near_cap_bytes > topology._settings.limits.max_serialized_result_bytes
+        or near_cap_bytes > topology.settings.limits.max_serialized_result_bytes
         or small_bytes <= 0
         or small_bytes >= _MAX_SMALL_ENCODED_BYTES
     ):
-        state._violation()
+        state.violation()
 
-    remaining = workload._operations - 4
+    remaining = workload.operations - 4
     if remaining > 0:
         trailing = replace(
             workload,
-            _keys=workload._keys[4:],
-            _operations=remaining,
-            _payload_sizes=workload._payload_sizes[4:],
+            keys=workload.keys[4:],
+            operations=remaining,
+            payload_sizes=workload.payload_sizes[4:],
         )
-        _parallel_reads(lambda _index: topology._cache, trailing, state)
+        _parallel_reads(lambda _index: topology.cache, trailing, state)
 
 
 def _run_one_hit_scan(topology: _Topology, workload: _Workload, state: _ReadState) -> None:
     """Warm one key, scan unique keys, then prove eviction causes a safe refetch."""
     for _index in range(2):
-        _read_once(topology._cache, _call(0), _plan(), state, _ReadOptions(_payload_size=512))
-    _parallel_reads(lambda _index: topology._cache, workload, state)
-    before = state._sg_call_count()
+        _read_once(topology.cache, _call(0), _plan(), state, _ReadOptions(payload_size=512))
+    _parallel_reads(lambda _index: topology.cache, workload, state)
+    before = state.sg_call_count()
     _read_once(
-        topology._cache,
+        topology.cache,
         _call(0),
         _plan(),
         state,
-        _ReadOptions(_payload_size=512),
+        _ReadOptions(payload_size=512),
     )
-    refetches = state._sg_call_count() - before
-    state._record('hot_key_refetches', refetches)
+    refetches = state.sg_call_count() - before
+    state.record('hot_key_refetches', refetches)
     if refetches != 1:
-        state._violation()
-    _run_maximum_age_check(state, topology._metrics)
-
-
-def _run_identity_or_scan(
-    topology: _Topology,
-    workload: _Workload,
-    state: _ReadState,
-) -> None:
-    """Dispatch one existing cardinality or scan scenario."""
-    if workload._scenario == 'identity-cardinality':
-        _run_identity_cardinality(topology, workload, state)
-    else:
-        _run_one_hit_scan(topology, workload, state)
+        state.violation()
+    _run_maximum_age_check(state, topology.metrics)
 
 
 def _execute_scenario(
@@ -1626,34 +1852,27 @@ def _execute_scenario(
     environ: Mapping[str, str],
 ) -> tuple[_Topology, int]:
     """Dispatch one closed scenario to its actual cache/backend workload."""
-    if workload._scenario == 'metadata-churn':
+    if workload.scenario == 'metadata-churn':
         return _run_metadata_churn(profile, metrics, workload, state, environ)
-    topology = _topology(profile, workload._scenario, metrics, environ)
-    scenario = workload._scenario
-    if scenario in {'identity-cardinality', 'one-hit-scan'}:
-        _run_identity_or_scan(topology, workload, state)
-    elif scenario == 'dependency-broadening':
-        _run_dependency_broadening(topology, workload, state)
-    elif scenario == 'event-storm':
-        _run_event_storm(topology, workload, state)
-    elif scenario == 'failure-recovery':
-        _run_failure_recovery(topology, workload, state)
-    elif scenario == 'hierarchical-fanout':
-        _run_hierarchical_fanout(topology, workload, state, metrics)
-    elif scenario == 'link-fanout-events':
-        _run_link_fanout_events(topology, workload, state, metrics)
-    elif scenario == 'mixed-values':
-        _run_mixed_values(topology, workload, state)
-    elif scenario == 'wrapper-schema':
-        _run_wrapper_schema(topology, workload, state)
-    else:
-        sg_latency_seconds, _model = _latency_model(scenario)
-        _parallel_reads(
-            lambda _index: topology._cache,
-            workload,
-            state,
-            _ReadOptions(_sg_latency_seconds=sg_latency_seconds),
-        )
+    topology = _topology(profile, workload.scenario, metrics, environ)
+    runners: dict[str, Callable[[], None]] = {
+        'dependency-broadening': lambda: _run_dependency_broadening(topology, workload, state),
+        'event-storm': lambda: _run_event_storm(topology, workload, state),
+        'failure-recovery': lambda: _run_failure_recovery(topology, workload, state),
+        'hierarchical-fanout': lambda: _run_hierarchical_fanout(
+            topology, workload, state, metrics
+        ),
+        'hot-key-burst': lambda: _run_hot_key_burst(topology, workload, state),
+        'identity-cardinality': lambda: _run_identity_cardinality(topology, workload, state),
+        'link-fanout-events': lambda: _run_link_fanout_events(topology, workload, state, metrics),
+        'mixed-values': lambda: _run_mixed_values(topology, workload, state),
+        'one-hit-scan': lambda: _run_one_hit_scan(topology, workload, state),
+        'wrapper-schema': lambda: _run_wrapper_schema(topology, workload, state),
+    }
+    runner = runners.get(workload.scenario)
+    if runner is None:
+        raise ValueError('unknown benchmark scenario')
+    runner()
     return topology, 0
 
 
@@ -1667,18 +1886,19 @@ def _run_benchmark(
     """Run one scenario and return its complete JSON-compatible report."""
     if profile not in {'hierarchical', 'local', 'shared'}:
         raise ValueError('unknown benchmark profile')
-    if profile != 'local' and scenario in _UNSUPPORTED_SHARED_SCENARIOS:
+    spec = _SCENARIO_SPECS.get(scenario)
+    if profile != 'local' and spec is not None and not spec['shared_profiles']:
         raise ValueError(f'{scenario} does not support the {profile} profile')
     selected_options = options or _BenchmarkOptions()
     workload = _build_workload(
         scenario,
-        seed=selected_options._seed,
-        operations=selected_options._operations,
-        workers=selected_options._workers,
+        seed=selected_options.seed,
+        operations=selected_options.operations,
+        workers=selected_options.workers,
     )
     selected_environ = os.environ if environ is None else environ
     metrics = _Metrics()
-    state = _ReadState._create()
+    state = _ReadState.create()
     started_at = monotonic()
     topology: _Topology | None = None
     _sg_latency_seconds, latency_model = _latency_model(scenario)
@@ -1691,62 +1911,53 @@ def _run_benchmark(
             selected_environ,
         )
         elapsed = monotonic() - started_at
-        avoided = metrics._count('cache_sg_avoided_calls')
+        avoided = metrics.count('cache_sg_avoided_calls')
         return {
             'profile': profile,
             'scenario': scenario,
-            'seed': selected_options._seed,
-            'workers': workload._workers,
-            'operations': workload._operations,
-            'payload_bytes': sum(workload._payload_sizes),
-            'tag_count': state._evidence.get('analyzer_max_output_tags', 3),
+            'seed': selected_options.seed,
+            'workers': workload.workers,
+            'operations': workload.operations,
+            'payload_bytes': sum(workload.payload_sizes),
+            'tag_count': state.evidence.get('analyzer_max_output_tags', 3),
             'sg_latency_model': latency_model,
             'cache_operations': _aggregate_operations(
-                topology._measured,
+                topology.measured,
                 metrics,
                 capacity_rejections,
-                state._evidence,
+                state.evidence,
             ),
             'sg_calls_avoided': avoided,
-            'throughput_ops_per_second': round(workload._operations / max(elapsed, 1e-9), 6),
-            'complete_hit_latency_ms': _percentiles(state._complete_hit_latencies_ms),
+            'throughput_ops_per_second': round(workload.operations / max(elapsed, 1e-9), 6),
+            'complete_hit_latency_ms': _percentiles(state.complete_hit_latencies_ms),
             'vector_resolution_latency_ms': _percentiles(
                 [
                     latency
-                    for backend in topology._measured
-                    for latency in backend._vector_latencies()
+                    for backend in topology.measured
+                    for latency in backend.vector_latencies()
                 ]
             ),
-            'memory_estimates_bytes': _aggregate_memory(topology._measured),
+            'memory_estimates_bytes': _aggregate_memory(topology.measured),
             'normal_hit_backend_phases': _normal_hit_backend_phases(profile, selected_environ),
-            'lease_rejections': metrics._count('cache_lease_rejection'),
-            'correctness_violations': state._correctness_violations,
+            'lease_rejections': metrics.count('cache_lease_rejection'),
+            'correctness_violations': state.correctness_violations,
         }
     finally:
         if topology is not None:
-            topology._close()
+            topology.close()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the selected benchmark and return a correctness-sensitive status.
-
-    Args:
-        argv: Arguments excluding the executable, or `None` for process
-            arguments.
-
-    Returns:
-        Zero for a correct run, one for correctness violations, or two for
-        invalid setup.
-    """
+def _main(argv: Sequence[str] | None = None) -> int:
+    """Run the selected benchmark and return a correctness-sensitive status."""
     arguments = _parse_args(argv)
     try:
         report = _run_benchmark(
             arguments.profile,
             arguments.scenario,
             options=_BenchmarkOptions(
-                _operations=arguments.operations,
-                _seed=arguments.seed,
-                _workers=arguments.workers,
+                operations=arguments.operations,
+                seed=arguments.seed,
+                workers=arguments.workers,
             ),
         )
     except (ImportError, OSError, TypeError, ValueError) as error:
@@ -1758,4 +1969,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

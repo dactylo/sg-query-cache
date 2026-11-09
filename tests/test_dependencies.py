@@ -1,4 +1,5 @@
 import json
+import sys
 import zlib
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 
 from sg_query_cache._codec import MAX_BYTES, encode_value, encoded_size
 from sg_query_cache._config import LimitSettings
-from sg_query_cache._dependencies import DependencyAnalyzer, SchemaView
+from sg_query_cache._dependencies import DependencyAnalyzer, SchemaView, _derive_event_tags
 from sg_query_cache._keys import KeyBuilder
 from sg_query_cache._model import (
     DependencyPlan,
@@ -16,7 +17,7 @@ from sg_query_cache._model import (
     Identity,
     TagKind,
 )
-from sg_query_cache._policy import FieldSchema
+from sg_query_cache._policy import FieldSchema, classify_query
 
 _FIXTURE = Path(__file__).parent / 'fixtures' / 'schema.json'
 _LIMITS = LimitSettings()
@@ -111,6 +112,26 @@ def test_archived_project_exclusion_uses_broad_project_state() -> None:
     assert plan.tags[-2:] == (
         DependencyTag.type_membership(_SITE, 'Project'),
         DependencyTag.type_value(_SITE, 'Project'),
+    )
+
+
+def test_calculated_field_filter_plan_is_unchanged() -> None:
+    schema = SchemaView.from_api_response(
+        {
+            'Asset': {
+                'id': {'data_type': {'value': 'number'}, 'properties': {}},
+                'workload': {'data_type': {'value': 'calculated'}, 'properties': {}},
+            }
+        }
+    )
+
+    plan = _plan(_call(filters=(('workload', 'is', 2400),)), schema=schema)
+
+    assert plan.classification == 'ttl_only'
+    assert plan.reason == 'unknown_field_type'
+    assert plan.tags == (
+        DependencyTag.site(_SITE),
+        DependencyTag.authorization(_SITE),
     )
 
 
@@ -355,6 +376,45 @@ def test_name_filters_cover_all_link_target_values(operator: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ('filters', 'fields', 'limits'),
+    [
+        ((('id', 'in', tuple(range(1, 34))),), ('id',), LimitSettings()),
+        (
+            (('id', 'in', tuple(range(1, 10))), ('code', 'is', 'hero')),
+            ('id', 'code'),
+            LimitSettings(max_dependency_tags=5),
+        ),
+        (
+            (('id', 'in', tuple(range(1, 10))), ('code', 'is', 'hero')),
+            ('id', 'code'),
+            LimitSettings(max_dependency_tags=3),
+        ),
+    ],
+)
+def test_large_id_shortcut_matches_full_entity_broadening(
+    filters: tuple[ExactValue, ...],
+    fields: tuple[ExactValue, ...],
+    limits: LimitSettings,
+) -> None:
+    call = _call(filters=filters, fields=fields)
+    identity = Identity('script', 'studio-sso', 'render-farm')
+    schema = _schema()
+    analyzer = DependencyAnalyzer()
+    every_entity_tag = _derive_event_tags(call, identity, _SITE, schema, sys.maxsize)
+    assert not isinstance(every_entity_tag, str)
+    assert every_entity_tag.steps == ()
+    full = analyzer._bounded_event_plan(
+        every_entity_tag,
+        classify_query(call, schema),
+        identity,
+        _SITE,
+        limits,
+    )
+
+    assert _plan(call, identity=identity, limits=limits, schema=schema) == full
+
+
 def test_schema_lookup_does_not_change_value_identity_or_compact_form() -> None:
     view = _schema()
     equal_view = SchemaView.from_compact(view.to_compact())
@@ -545,6 +605,55 @@ def test_compact_schema_view_rejects_malformed_bytes(data: bytes) -> None:
         SchemaView.from_compact(data)
 
 
+@pytest.mark.parametrize(
+    ('fields', 'order'),
+    [
+        (('id', 'open_notes_count'), ()),
+        (('id',), ((('field_name', 'open_notes_count'), ('direction', 'asc')),)),
+        (('id', 'task.Task.open_notes_count'), ()),
+    ],
+    ids=('selected', 'ordered', 'dotted'),
+)
+def test_summary_field_results_are_ttl_only(
+    fields: tuple[ExactValue, ...],
+    order: tuple[ExactValue, ...],
+) -> None:
+    schema = SchemaView.from_api_response(
+        {
+            'Asset': {
+                'id': {'data_type': {'value': 'number'}, 'properties': {}},
+                'code': {'data_type': {'value': 'text'}, 'properties': {}},
+                'open_notes_count': {
+                    'data_type': {'value': 'summary'},
+                    'properties': {},
+                },
+                'task': {
+                    'data_type': {'value': 'entity'},
+                    'properties': {'valid_types': {'value': ['Task']}},
+                },
+            },
+            'Task': {
+                'open_notes_count': {
+                    'data_type': {'value': 'summary'},
+                    'properties': {},
+                },
+            },
+        }
+    )
+
+    plan = _plan(
+        _call(filters=(('code', 'is', 'hero'),), fields=fields, order=order),
+        schema=schema,
+    )
+
+    assert plan.classification == 'ttl_only'
+    assert plan.reason == 'uncertain_field_dependencies'
+    assert plan.tags == (
+        DependencyTag.site(_SITE),
+        DependencyTag.authorization(_SITE),
+    )
+
+
 def test_type_filter_covers_link_field_and_target_membership() -> None:
     plan = _plan(_call(filters=(('linked', 'type_is', 'Shot'),)))
 
@@ -558,11 +667,10 @@ def test_type_filter_covers_link_field_and_target_membership() -> None:
     )
 
 
-def test_unbounded_plan_bypasses_when_ttl_only_is_not_allowed() -> None:
+def test_unbounded_plan_bypasses_when_ttl_only_does_not_fit() -> None:
     plan = _plan(
         _call(fields=('id', 'code')),
-        analyzer=DependencyAnalyzer(allow_ttl_only=False),
-        limits=LimitSettings(max_dependency_tags=2),
+        limits=LimitSettings(max_dependency_tags=1),
     )
 
     assert plan.classification == 'bypass'
@@ -645,7 +753,7 @@ def test_unknown_schema_falls_back_to_ttl_only_or_bypass() -> None:
     call = _call(filters=(('permission_hidden', 'is', 7),))
 
     ttl_only = _plan(call)
-    bypass = _plan(call, analyzer=DependencyAnalyzer(allow_ttl_only=False))
+    bypass = _plan(call, limits=LimitSettings(max_dependency_tags=1))
 
     assert ttl_only.classification == 'ttl_only'
     assert ttl_only.reason == 'unknown_field'

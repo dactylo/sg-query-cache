@@ -9,9 +9,8 @@ from sg_query_cache._keys import KeyBuilder
 from sg_query_cache._local import LocalBackend
 from sg_query_cache._metrics import NullMetrics, SafeMetrics
 from sg_query_cache._model import DependencyPlan, DependencyTag, ExactCall, Identity
-from tests._fakes import _FakeClock, _RecordingMetrics
+from tests._fakes import CLIENT_OPTIONS, FakeClock, RecordingMetrics, ThrowingMetrics
 
-_CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _CORRELATION_ERROR = 'configured metrics correlation secret is unavailable or invalid'
 _ENV_NAME = 'SGQC_TEST_METRICS_SECRET'
 _IDENTITY = Identity('script', 'studio', 'render')
@@ -33,16 +32,6 @@ class _DeclinePopulation:
     reason: str = 'test_decline'
 
 
-class _ThrowingMetrics:
-    def increment(self, name: str, labels: Mapping[str, str]) -> None:
-        _ = name, labels
-        raise RuntimeError('metrics unavailable')
-
-    def observe(self, name: str, value: float, labels: Mapping[str, str]) -> None:
-        _ = name, value, labels
-        raise RuntimeError('metrics unavailable')
-
-
 def _correlated_cache(
     settings: CacheSettings,
     environ: Mapping[str, object],
@@ -51,7 +40,7 @@ def _correlated_cache(
     backend: LocalBackend | None = None,
 ) -> tuple[QueryCache, LocalBackend]:
     metrics = QueryCache.build_metrics(settings, environ, sink)
-    selected_backend = backend or LocalBackend(settings, _FakeClock(), NullMetrics())
+    selected_backend = backend or LocalBackend(settings, FakeClock(), NullMetrics())
     return (
         QueryCache(settings, _IDENTITY, l1=selected_backend, metrics=metrics),
         selected_backend,
@@ -59,23 +48,23 @@ def _correlated_cache(
 
 
 def _read(cache: QueryCache, call: ExactCall, fetch: Callable[[], object]) -> object:
-    return cache.read(call, _PLAN, fetch, _CLIENT_OPTIONS)
+    return cache.read(call, _PLAN, fetch, CLIENT_OPTIONS)
 
 
 def test_backend_metrics_outside_query_cache_have_no_exact_call_digest() -> None:
     settings = CacheSettings(metrics_digest_secret_env=_ENV_NAME)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = QueryCache.build_metrics(
         settings,
         {_ENV_NAME: _METRICS_KEY_TEXT},
         recording,
     )
-    backend = LocalBackend(settings, _FakeClock(), metrics)
+    backend = LocalBackend(settings, FakeClock(), metrics)
 
     backend.resolve(_PLAN.tags)
 
-    labels = [event_labels for _name, event_labels in recording._increments] + [
-        event_labels for _name, _value, event_labels in recording._observations
+    labels = [event_labels for _name, event_labels in recording.increments] + [
+        event_labels for _name, _value, event_labels in recording.observations
     ]
     assert labels
     assert all('exact_call_digest' not in event_labels for event_labels in labels)
@@ -83,7 +72,7 @@ def test_backend_metrics_outside_query_cache_have_no_exact_call_digest() -> None
 
 def test_configured_metrics_correlate_one_exact_miss_and_hit() -> None:
     settings = CacheSettings(metrics_digest_secret_env=_ENV_NAME)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     cache, _backend = _correlated_cache(
         settings,
         {_ENV_NAME: _METRICS_KEY_TEXT},
@@ -100,17 +89,17 @@ def test_configured_metrics_correlate_one_exact_miss_and_hit() -> None:
     assert _read(cache, call, fetch) == [{'id': 7}]
     assert _read(cache, call, fetch) == [{'id': 7}]
 
-    base_key = KeyBuilder.base_key('production', _IDENTITY, _CLIENT_OPTIONS, call)
+    base_key = KeyBuilder.base_key('production', _IDENTITY, CLIENT_OPTIONS, call)
     expected = KeyBuilder.metrics_digest(base_key, _METRICS_KEY_TEXT.encode())
     exact_events = [
         (name, labels)
-        for name, labels in recording._increments
+        for name, labels in recording.increments
         if name in {'cache_fill', 'cache_hit'}
     ]
     assert fetches == 1
     assert {name for name, _labels in exact_events} == {'cache_fill', 'cache_hit'}
     assert all(labels['exact_call_digest'] == expected for _name, labels in exact_events)
-    emitted = repr((recording._increments, recording._observations))
+    emitted = repr((recording.increments, recording.observations))
     assert _METRICS_KEY_TEXT not in emitted
     assert _ENV_NAME not in emitted
     assert 'oak-tree' not in emitted
@@ -121,7 +110,7 @@ def test_correlated_throwing_metrics_remain_best_effort() -> None:
     cache, _backend = _correlated_cache(
         settings,
         {_ENV_NAME: _METRICS_KEY_TEXT},
-        _ThrowingMetrics(),
+        ThrowingMetrics(),
     )
     call = ExactCall('find', (('entity_type', 'Asset'), ('filters', ())))
 
@@ -130,7 +119,7 @@ def test_correlated_throwing_metrics_remain_best_effort() -> None:
 
 def test_disabled_metrics_correlation_omits_the_exact_call_label() -> None:
     settings = CacheSettings()
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     cache, _backend = _correlated_cache(settings, {_ENV_NAME: 'unused-secret'}, recording)
     call = ExactCall('find', (('entity_type', 'Asset'), ('filters', ())))
 
@@ -138,10 +127,27 @@ def test_disabled_metrics_correlation_omits_the_exact_call_label() -> None:
     _read(cache, call, lambda: pytest.fail('cache hit refetched'))
 
     events = [
-        labels for name, labels in recording._increments if name in {'cache_fill', 'cache_hit'}
+        labels for name, labels in recording.increments if name in {'cache_fill', 'cache_hit'}
     ]
     assert events
     assert all('exact_call_digest' not in labels for labels in events)
+
+
+def test_failure_class_label_is_allowed_only_from_vocabulary() -> None:
+    recording = RecordingMetrics()
+    metrics = SafeMetrics(recording)
+    for failure_class in ('authentication', 'tls', 'connection', 'timeout', 'replica', 'unknown'):
+        metrics.increment('backend_failure', {'failure_class': failure_class})
+    assert [labels['failure_class'] for _, labels in recording.increments] == [
+        'authentication',
+        'tls',
+        'connection',
+        'timeout',
+        'replica',
+        'unknown',
+    ]
+    with pytest.raises(ValueError, match='failure class is not in the safe vocabulary'):
+        metrics.increment('backend_failure', {'failure_class': 'credential-secret'})
 
 
 @pytest.mark.parametrize(
@@ -154,7 +160,7 @@ def test_metrics_construction_rejects_unusable_secrets_without_disclosure(
     settings = CacheSettings(metrics_digest_secret_env=_ENV_NAME)
 
     with pytest.raises(ValueError, match=_CORRELATION_ERROR) as captured:
-        QueryCache.build_metrics(settings, environ, _RecordingMetrics())
+        QueryCache.build_metrics(settings, environ, RecordingMetrics())
 
     message = str(captured.value)
     assert message == _CORRELATION_ERROR
@@ -164,17 +170,17 @@ def test_metrics_construction_rejects_unusable_secrets_without_disclosure(
 
 def test_metrics_keys_do_not_change_backend_keys_or_split_results() -> None:
     settings = CacheSettings(metrics_digest_secret_env=_ENV_NAME)
-    backend = LocalBackend(settings, _FakeClock(), NullMetrics())
+    backend = LocalBackend(settings, FakeClock(), NullMetrics())
     first, _backend = _correlated_cache(
         settings,
         {_ENV_NAME: 'a' * 32},
-        _RecordingMetrics(),
+        RecordingMetrics(),
         backend=backend,
     )
     second, _backend = _correlated_cache(
         settings,
         {_ENV_NAME: 'b' * 32},
-        _RecordingMetrics(),
+        RecordingMetrics(),
         backend=backend,
     )
     call = ExactCall('find', (('entity_type', 'Asset'), ('filters', ())))
@@ -188,7 +194,7 @@ def test_metrics_keys_do_not_change_backend_keys_or_split_results() -> None:
 
 def test_nested_reads_restore_the_enclosing_exact_call_digest() -> None:
     settings = CacheSettings(metrics_digest_secret_env=_ENV_NAME)
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     cache, _backend = _correlated_cache(
         settings,
         {_ENV_NAME: _METRICS_KEY_TEXT},
@@ -205,22 +211,22 @@ def test_nested_reads_restore_the_enclosing_exact_call_digest() -> None:
         outer,
         _PLAN,
         fetch_outer,
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         _population_decision=lambda _value: _DeclinePopulation(),
     ) == [{'id': 7}]
 
-    outer_base = KeyBuilder.base_key('production', _IDENTITY, _CLIENT_OPTIONS, outer)
-    inner_base = KeyBuilder.base_key('production', _IDENTITY, _CLIENT_OPTIONS, inner)
+    outer_base = KeyBuilder.base_key('production', _IDENTITY, CLIENT_OPTIONS, outer)
+    inner_base = KeyBuilder.base_key('production', _IDENTITY, CLIENT_OPTIONS, inner)
     outer_digest = KeyBuilder.metrics_digest(outer_base, _METRICS_KEY_TEXT.encode())
     inner_digest = KeyBuilder.metrics_digest(inner_base, _METRICS_KEY_TEXT.encode())
     fill_digests = [
         labels['exact_call_digest']
-        for name, labels in recording._increments
+        for name, labels in recording.increments
         if name == 'cache_fill'
     ]
     declined = [
         labels['exact_call_digest']
-        for name, labels in recording._increments
+        for name, labels in recording.increments
         if name == 'cache_bypass' and labels.get('reason') == 'population_declined'
     ]
     assert fill_digests == [outer_digest, inner_digest]
@@ -235,7 +241,7 @@ def test_null_metrics_discards_valid_events() -> None:
 
 
 def test_safe_metrics_forwards_documented_names_and_labels() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
 
     metrics.increment('cache_hit', {'layer': 'l2', 'method': 'find'})
@@ -245,8 +251,8 @@ def test_safe_metrics_forwards_documented_names_and_labels() -> None:
         {'backend_operation': 'lookup', 'outcome': 'success'},
     )
 
-    assert recording._increments == [('cache_hit', {'layer': 'l2', 'method': 'find'})]
-    assert recording._observations == [
+    assert recording.increments == [('cache_hit', {'layer': 'l2', 'method': 'find'})]
+    assert recording.observations == [
         (
             'backend_latency_seconds',
             0.25,
@@ -256,7 +262,7 @@ def test_safe_metrics_forwards_documented_names_and_labels() -> None:
 
 
 def test_safe_metrics_forwards_only_a_keyed_exact_call_digest() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording, metrics_key=b'k' * 32)
 
     metrics.increment(
@@ -264,11 +270,11 @@ def test_safe_metrics_forwards_only_a_keyed_exact_call_digest() -> None:
         {'layer': 'l1', 'exact_call_digest': 'a' * 64},
     )
 
-    assert recording._increments == [('cache_hit', {'layer': 'l1', 'exact_call_digest': 'a' * 64})]
+    assert recording.increments == [('cache_hit', {'layer': 'l1', 'exact_call_digest': 'a' * 64})]
 
 
 def test_safe_metrics_omits_exact_call_digest_without_metrics_key() -> None:
-    recording = _RecordingMetrics()
+    recording = RecordingMetrics()
     metrics = SafeMetrics(recording)
 
     metrics.increment(
@@ -276,14 +282,14 @@ def test_safe_metrics_omits_exact_call_digest_without_metrics_key() -> None:
         {'layer': 'l1', 'exact_call_digest': 'a' * 64},
     )
 
-    assert recording._increments == [('cache_hit', {'layer': 'l1'})]
+    assert recording.increments == [('cache_hit', {'layer': 'l1'})]
 
 
 def test_safe_metrics_rejects_short_metrics_keys_without_revealing_them() -> None:
     secret = b'too-short'
 
     with pytest.raises(ValueError, match='at least 32 bytes') as error:
-        SafeMetrics(_RecordingMetrics(), metrics_key=secret)
+        SafeMetrics(RecordingMetrics(), metrics_key=secret)
 
     assert secret.decode() not in str(error.value)
 
@@ -291,7 +297,7 @@ def test_safe_metrics_rejects_short_metrics_keys_without_revealing_them() -> Non
 @pytest.mark.parametrize('name', ['custom_metric', '', 'cache-hit'])
 def test_safe_metrics_rejects_undocumented_metric_names(name: str) -> None:
     with pytest.raises(ValueError, match='metric name'):
-        SafeMetrics(_RecordingMetrics()).increment(name, {'layer': 'l1'})
+        SafeMetrics(RecordingMetrics()).increment(name, {'layer': 'l1'})
 
 
 @pytest.mark.parametrize(
@@ -299,12 +305,12 @@ def test_safe_metrics_rejects_undocumented_metric_names(name: str) -> None:
 )
 def test_safe_metrics_rejects_unsafe_or_unknown_labels(label: str) -> None:
     with pytest.raises(ValueError, match='metric label'):
-        SafeMetrics(_RecordingMetrics()).increment('cache_hit', {label: 'secret-value'})
+        SafeMetrics(RecordingMetrics()).increment('cache_hit', {label: 'secret-value'})
 
 
 @pytest.mark.parametrize('digest', ['raw-query', 'A' * 64, 'a' * 63])
 def test_safe_metrics_rejects_non_hmac_correlation_values(digest: str) -> None:
-    metrics = SafeMetrics(_RecordingMetrics(), metrics_key=b'k' * 32)
+    metrics = SafeMetrics(RecordingMetrics(), metrics_key=b'k' * 32)
 
     with pytest.raises(ValueError, match='exact-call digest'):
         metrics.increment('cache_hit', {'exact_call_digest': digest})

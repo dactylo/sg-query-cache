@@ -7,7 +7,8 @@ import pytest
 from sg_query_cache import _async_support as support
 from sg_query_cache._async_support import LoopAffinity
 from sg_query_cache._backend import BackendUnavailable
-from tests._async_fakes import _Phase
+from tests._async_fakes import Phase
+from tests._fakes import FakeClock, turn
 
 _T = TypeVar('_T')
 
@@ -16,34 +17,28 @@ async def _check(affinity: LoopAffinity) -> None:
     affinity.check()
 
 
-async def _turn() -> None:
-    ready = asyncio.Event()
-    asyncio.get_running_loop().call_soon(ready.set)
-    await ready.wait()
-
-
 def test_active_close_join_outlasts_backend_operation_deadline() -> None:
     async def exercise() -> None:
         admission = support.Admission()
-        operation = _Phase()
+        operation = Phase()
 
         async def admitted() -> None:
             with admission.operation():
-                await operation._wait()
+                await operation.wait()
 
         owner = asyncio.create_task(admitted())
-        await operation._entered.wait()
+        await operation.entered.wait()
         admission.begin_close()
         closer = asyncio.create_task(support.joined_cleanup(admission.wait_idle))
-        backend = _Phase()
+        backend = Phase()
         outcome = await support.joined_cleanup(
-            backend._wait,
+            backend.wait,
             deadline=asyncio.get_running_loop().time(),
         )
         assert isinstance(outcome.error, TimeoutError)
         assert not closer.done()
         assert not owner.done()
-        operation._proceed.set()
+        operation.proceed.set()
         await owner
         closed = await closer
         assert closed.error is None
@@ -93,22 +88,25 @@ def test_admission_tokens_are_live_cache_specific_capabilities() -> None:
 
 def test_cleanup_deadline_waits_for_finite_cancellation_cleanup() -> None:
     async def exercise() -> None:
-        phase = _Phase()
-        phase._cleanup_proceed.clear()
-        owner = asyncio.create_task(
-            support.joined_cleanup(phase._wait, deadline=asyncio.get_running_loop().time())
-        )
-        await phase._cancelled.wait()
+        phase = Phase()
+        phase.cleanup_proceed.clear()
+        record = support.DeadlineRecord(asyncio.get_running_loop().time())
+        with support.publish_deadline(record):
+            owner = asyncio.create_task(
+                support.joined_cleanup(phase.wait, deadline=record.deadline)
+            )
+        await phase.cancelled.wait()
         assert not owner.done()
         owner.cancel('caller')
-        await _turn()
+        await turn()
         assert not owner.done()
-        phase._cleanup_proceed.set()
+        phase.cleanup_proceed.set()
         outcome = await owner
         assert isinstance(outcome.error, TimeoutError)
         assert outcome.cancellation is not None
         assert outcome.cancellation.args == ('caller',)
-        assert phase._finished.is_set()
+        assert phase.finished.is_set()
+        assert record.expired
 
     asyncio.run(exercise())
 
@@ -167,7 +165,7 @@ def test_closing_joins_whole_operations_and_allows_explicit_live_token() -> None
         assert admission.begin_close()
         assert not admission.begin_close()
         waiter = asyncio.create_task(admission.wait_idle())
-        await _turn()
+        await turn()
         assert not waiter.done()
         release.set()
         await owner
@@ -183,27 +181,27 @@ def test_closing_joins_whole_operations_and_allows_explicit_live_token() -> None
 
 def test_enclosing_timeout_receives_deferred_cancellation_after_settlement() -> None:
     async def exercise() -> None:
-        phase = _Phase()
+        phase = Phase()
         outcomes: list[support.CleanupOutcome[None]] = []
         timeout = asyncio.timeout(None)
 
         async def caller() -> None:
             async with timeout:
-                outcome = await support.joined_cleanup(phase._wait)
+                outcome = await support.joined_cleanup(phase.wait)
                 outcomes.append(outcome)
                 if outcome.cancellation is not None:
                     raise outcome.cancellation
 
         owner = asyncio.create_task(caller())
-        await phase._entered.wait()
+        await phase.entered.wait()
         timeout.reschedule(asyncio.get_running_loop().time())
-        await _turn()
+        await turn()
         assert not owner.done()
-        phase._proceed.set()
+        phase.proceed.set()
         with pytest.raises(TimeoutError):
             await owner
         assert outcomes[0].cancellation is not None
-        assert phase._finished.is_set()
+        assert phase.finished.is_set()
         assert owner.cancelling() == 0  # The enclosing timeout owns its own uncancel.
 
     asyncio.run(exercise())
@@ -245,24 +243,6 @@ def test_independent_inner_cancellation_is_failed_cleanup() -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('failure', [None, ValueError('failed'), BackendUnavailable('backend')])
-def test_joined_cleanup_delivers_value_or_failure_without_cancellation(
-    failure: Exception | None,
-) -> None:
-    async def exercise() -> None:
-        async def action() -> int:
-            if failure is not None:
-                raise failure
-            return 42
-
-        outcome = await support.joined_cleanup(action)
-        assert outcome.value == (42 if failure is None else None)
-        assert outcome.error is failure
-        assert outcome.cancellation is None
-
-    asyncio.run(exercise())
-
-
 def test_joined_cleanup_leaves_no_tasks_or_unhandled_errors() -> None:
     async def exercise() -> None:
         loop = asyncio.get_running_loop()
@@ -277,55 +257,9 @@ def test_joined_cleanup_leaves_no_tasks_or_unhandled_errors() -> None:
 
         outcome = await support.joined_cleanup(action)
         assert isinstance(outcome.error, ValueError)
-        await _turn()
+        await turn()
         assert asyncio.all_tasks() == before
         assert unhandled == []
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize('when', ['before', 'during', 'completion'])
-@pytest.mark.parametrize('failure', [None, ValueError('failed'), BackendUnavailable('backend')])
-def test_joined_cleanup_preserves_first_cancellation_and_settles_failures(
-    when: str,
-    failure: Exception | None,
-) -> None:
-    async def exercise() -> None:
-        phase = _Phase()
-        phase._error = failure
-        outcomes: list[support.CleanupOutcome[None]] = []
-        settled = asyncio.Event()
-
-        async def caller() -> None:
-            if when == 'before':
-                current = asyncio.current_task()
-                assert current is not None
-                current.cancel('first')
-            outcome = await support.joined_cleanup(phase._wait)
-            outcomes.append(outcome)
-            settled.set()
-            if outcome.cancellation is not None:
-                raise outcome.cancellation
-
-        owner = asyncio.create_task(caller())
-        await phase._entered.wait()
-        if when == 'during':
-            owner.cancel('first')
-        if when != 'completion':
-            await _turn()
-            owner.cancel('second')
-            await _turn()
-            assert not owner.done()
-            assert not phase._cancelled.is_set()
-        phase._proceed.set()
-        if when == 'completion':
-            owner.cancel('first')
-        with pytest.raises(asyncio.CancelledError, match='first'):
-            await owner
-        assert settled.is_set()
-        assert phase._finished.is_set()
-        assert outcomes[0].error is failure
-        assert owner.cancelling() == (1 if when == 'completion' else 2)
 
     asyncio.run(exercise())
 
@@ -362,6 +296,156 @@ def test_nested_admission_keeps_owner_active_until_every_context_exits() -> None
         assert admission.begin_close()
         await admission.wait_idle()
         admission.finish_close()
+
+    asyncio.run(exercise())
+
+
+def test_previous_cancellation_count_is_not_misreported_as_new_cancellation() -> None:
+    async def exercise() -> None:
+        owner = asyncio.current_task()
+        assert owner is not None
+        owner.cancel('previous')
+        with pytest.raises(asyncio.CancelledError):
+            await turn()
+
+        async def action() -> None:
+            raise asyncio.CancelledError('independent')
+
+        outcome = await support.joined_cleanup(action)
+        assert isinstance(outcome.error, BackendUnavailable)
+        assert outcome.cancellation is None
+        assert owner.cancelling() == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_published_deadline_record_is_scoped(cancel: bool) -> None:
+    async def exercise() -> None:
+        assert support.PUBLISHED_DEADLINE.get() is None
+        outer = support.DeadlineRecord(10.0)
+        inner = support.DeadlineRecord(20.0)
+        assert not outer.expired
+        with support.publish_deadline(outer):
+            assert support.PUBLISHED_DEADLINE.get() is outer
+
+            async def nested() -> None:
+                with support.publish_deadline(inner):
+                    assert support.PUBLISHED_DEADLINE.get() is inner
+                    if cancel:
+                        owner = asyncio.current_task()
+                        assert owner is not None
+                        owner.cancel('caller')
+                        await turn()
+
+            if cancel:
+                with pytest.raises(asyncio.CancelledError, match='caller'):
+                    await nested()
+            else:
+                await nested()
+            assert support.PUBLISHED_DEADLINE.get() is outer
+        assert support.PUBLISHED_DEADLINE.get() is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('result', ['timeout', 'replacement', 'suppressed', 'action_timeout'])
+def test_cleanup_timer_expiry_sets_the_record(
+    result: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        clock = FakeClock()
+        monkeypatch.setattr(asyncio.get_running_loop(), 'time', clock)
+        record = support.DeadlineRecord(clock() + 1)
+
+        async def action() -> None:
+            assert support.PUBLISHED_DEADLINE.get() is record
+            if result == 'action_timeout':
+                raise TimeoutError('action timeout')
+            clock.advance(1)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if result == 'replacement':
+                    raise ValueError('cleanup failure') from None
+                if result == 'suppressed':
+                    return
+                raise
+
+        with support.publish_deadline(record):
+            outcome = await support.joined_cleanup(action, deadline=record.deadline)
+        assert record.expired is (result != 'action_timeout')
+        assert outcome.cancellation is None
+        if result == 'replacement':
+            assert isinstance(outcome.error, ValueError)
+        elif result == 'suppressed':
+            assert outcome.error is None
+        else:
+            assert isinstance(outcome.error, TimeoutError)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('failure', [None, ValueError('failed'), BackendUnavailable('backend')])
+def test_joined_cleanup_delivers_value_or_failure_without_cancellation(
+    failure: Exception | None,
+) -> None:
+    async def exercise() -> None:
+        async def action() -> int:
+            if failure is not None:
+                raise failure
+            return 42
+
+        outcome = await support.joined_cleanup(action)
+        assert outcome.value == (42 if failure is None else None)
+        assert outcome.error is failure
+        assert outcome.cancellation is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('when', ['before', 'during', 'completion'])
+@pytest.mark.parametrize('failure', [None, ValueError('failed'), BackendUnavailable('backend')])
+def test_joined_cleanup_preserves_first_cancellation_and_settles_failures(
+    when: str,
+    failure: Exception | None,
+) -> None:
+    async def exercise() -> None:
+        phase = Phase()
+        phase.error = failure
+        outcomes: list[support.CleanupOutcome[None]] = []
+        settled = asyncio.Event()
+
+        async def caller() -> None:
+            if when == 'before':
+                current = asyncio.current_task()
+                assert current is not None
+                current.cancel('first')
+            outcome = await support.joined_cleanup(phase.wait)
+            outcomes.append(outcome)
+            settled.set()
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+
+        owner = asyncio.create_task(caller())
+        await phase.entered.wait()
+        if when == 'during':
+            owner.cancel('first')
+        if when != 'completion':
+            await turn()
+            owner.cancel('second')
+            await turn()
+            assert not owner.done()
+            assert not phase.cancelled.is_set()
+        phase.proceed.set()
+        if when == 'completion':
+            owner.cancel('first')
+        with pytest.raises(asyncio.CancelledError, match='first'):
+            await owner
+        assert settled.is_set()
+        assert phase.finished.is_set()
+        assert outcomes[0].error is failure
+        assert owner.cancelling() == (1 if when == 'completion' else 2)
 
     asyncio.run(exercise())
 
@@ -423,46 +507,27 @@ def test_cleanup_completion_itself_can_cancel_caller_without_losing_failure(
     asyncio.run(exercise())
 
 
-def test_previous_cancellation_count_is_not_misreported_as_new_cancellation() -> None:
-    async def exercise() -> None:
-        owner = asyncio.current_task()
-        assert owner is not None
-        owner.cancel('previous')
-        with pytest.raises(asyncio.CancelledError):
-            await _turn()
-
-        async def action() -> None:
-            raise asyncio.CancelledError('independent')
-
-        outcome = await support.joined_cleanup(action)
-        assert isinstance(outcome.error, BackendUnavailable)
-        assert outcome.cancellation is None
-        assert owner.cancelling() == 1
-
-    asyncio.run(exercise())
-
-
 def test_taskgroup_waits_for_cancelled_member_cleanup() -> None:
     async def exercise() -> None:
-        phase = _Phase()
+        phase = Phase()
         settled = asyncio.Event()
 
         async def member() -> None:
-            outcome = await support.joined_cleanup(phase._wait)
+            outcome = await support.joined_cleanup(phase.wait)
             settled.set()
             if outcome.cancellation is not None:
                 raise outcome.cancellation
 
         async def fail() -> None:
-            await phase._entered.wait()
+            await phase.entered.wait()
             raise ValueError('group failure')
 
         async def release() -> None:
-            await phase._entered.wait()
-            await _turn()
-            await _turn()
+            await phase.entered.wait()
+            await turn()
+            await turn()
             assert not settled.is_set()
-            phase._proceed.set()
+            phase.proceed.set()
 
         members: list[asyncio.Task[None]] = []
 
@@ -484,21 +549,21 @@ def test_taskgroup_waits_for_cancelled_member_cleanup() -> None:
 
 def test_whole_cleanup_uses_original_deadline_across_nested_work() -> None:
     async def exercise() -> None:
-        first = _Phase()
-        first._proceed.set()
-        second = _Phase()
+        first = Phase()
+        first.proceed.set()
+        second = Phase()
 
         async def action() -> None:
-            await first._wait()
-            await second._wait()
+            await first.wait()
+            await second.wait()
 
         outcome = await support.joined_cleanup(
             action,
             deadline=asyncio.get_running_loop().time(),
         )
-        assert first._finished.is_set()
-        assert second._cancelled.is_set()
-        assert second._finished.is_set()
+        assert first.finished.is_set()
+        assert second.cancelled.is_set()
+        assert second.finished.is_set()
         assert isinstance(outcome.error, TimeoutError)
         assert outcome.cancellation is None
 

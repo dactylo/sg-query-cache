@@ -15,12 +15,12 @@ from sg_query_cache._model import (
     Identity,
     IdentityKind,
 )
+from tests._fakes import CLIENT_OPTIONS
 
 _ExactArgument: TypeAlias = (
     bool | int | float | str | bytes | date | datetime | tuple['_ExactArgument', ...] | None
 )
 
-_CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _INCARNATION = '0123456789abcdef0123456789abcdef'
 _MAX_GENERATION = 2**63 - 1
 
@@ -72,7 +72,7 @@ def _key(
     *,
     site: str = 'https://example.invalid',
     identity: Identity | None = None,
-    client_options: Mapping[str, object] = _CLIENT_OPTIONS,
+    client_options: Mapping[str, object] = CLIENT_OPTIONS,
 ) -> str:
     return KeyBuilder.base_key(site, identity or _identity(), client_options, call or _call())
 
@@ -170,16 +170,16 @@ def test_every_method_argument_changes_the_base_key(name: str, changed: _ExactAr
 @pytest.mark.parametrize(
     ('changed_identity', 'site', 'client_options'),
     [
-        (None, 'https://other.invalid', _CLIENT_OPTIONS),
-        (_identity(issuer='other-sso'), 'https://example.invalid', _CLIENT_OPTIONS),
-        (_identity(namespace='other-scope'), 'https://example.invalid', _CLIENT_OPTIONS),
-        (_identity(entity_id=8), 'https://example.invalid', _CLIENT_OPTIONS),
+        (None, 'https://other.invalid', CLIENT_OPTIONS),
+        (_identity(issuer='other-sso'), 'https://example.invalid', CLIENT_OPTIONS),
+        (_identity(namespace='other-scope'), 'https://example.invalid', CLIENT_OPTIONS),
+        (_identity(entity_id=8), 'https://example.invalid', CLIENT_OPTIONS),
         (
             Identity(kind='human', issuer='studio-sso', namespace='render-farm', entity_id=7),
             'https://example.invalid',
-            _CLIENT_OPTIONS,
+            CLIENT_OPTIONS,
         ),
-        (_identity(epoch='permissions-v3'), 'https://example.invalid', _CLIENT_OPTIONS),
+        (_identity(epoch='permissions-v3'), 'https://example.invalid', CLIENT_OPTIONS),
         (
             None,
             'https://example.invalid',
@@ -202,7 +202,7 @@ def test_every_site_identity_and_client_context_dimension_changes_the_base_key(
 
 @pytest.mark.parametrize('credential_name', ['session_token', 'api_key'])
 def test_credentials_cannot_be_passed_in_the_key_context(credential_name: str) -> None:
-    options = {**_CLIENT_OPTIONS, credential_name: 'top-secret'}
+    options = {**CLIENT_OPTIONS, credential_name: 'top-secret'}
     call = ExactCall('find', (*_call().arguments, (credential_name, 'top-secret')))
 
     with pytest.raises(NormalizationError, match='credential'):
@@ -291,12 +291,12 @@ def test_qualified_keys_validate_purpose_incarnation_and_generation_bounds() -> 
 
 def test_records_per_page_is_an_optional_positive_integer_option() -> None:
     identity = Identity('script', 'studio', 'render')
-    without = KeyBuilder.base_key('production', identity, _CLIENT_OPTIONS, _call())
+    without = KeyBuilder.base_key('production', identity, CLIENT_OPTIONS, _call())
     with_page = KeyBuilder.base_key(
-        'production', identity, {**_CLIENT_OPTIONS, 'records_per_page': 500}, _call()
+        'production', identity, {**CLIENT_OPTIONS, 'records_per_page': 500}, _call()
     )
     other_page = KeyBuilder.base_key(
-        'production', identity, {**_CLIENT_OPTIONS, 'records_per_page': 100}, _call()
+        'production', identity, {**CLIENT_OPTIONS, 'records_per_page': 100}, _call()
     )
 
     assert len({without, with_page, other_page}) == 3
@@ -305,7 +305,7 @@ def test_records_per_page_is_an_optional_positive_integer_option() -> None:
             KeyBuilder.base_key(
                 'production',
                 identity,
-                {**_CLIENT_OPTIONS, 'records_per_page': bad},
+                {**CLIENT_OPTIONS, 'records_per_page': bad},
                 _call(),
             )
 

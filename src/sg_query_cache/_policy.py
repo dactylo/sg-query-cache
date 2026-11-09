@@ -6,7 +6,8 @@ from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias, cast
 
 from sg_query_cache._model import ExactCall
-from sg_query_cache._query import argument, filter_group
+from sg_query_cache._query import argument, filter_group, simple_condition
+from sg_query_cache._validation import require_nonempty_string
 
 _QueryClassification: TypeAlias = Literal['bypass', 'event_aware', 'ttl_only']
 
@@ -29,7 +30,6 @@ _ADDRESSING_OPERATORS = frozenset(
         'type_is_not',
     }
 )
-_CONDITION_LENGTH = 3
 _DOCUMENTED_OPERATORS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
         'addressing': _ADDRESSING_OPERATORS,
@@ -215,7 +215,7 @@ class QueryPolicy:
         """
         if self.classification not in ('bypass', 'event_aware', 'ttl_only'):
             raise ValueError('query classification is invalid')
-        _require_reason(self.reason)
+        require_nonempty_string(self.reason, 'query policy reason')
 
 
 def _classify_conditions(
@@ -281,24 +281,14 @@ def _classify_condition(
         return QueryPolicy('bypass', 'unknown_filter_group')
     if group is not None:
         return _classify_conditions(entity_type, group, schema)
-    if (
-        len(values) != _CONDITION_LENGTH
-        or not isinstance(values[0], str)
-        or not isinstance(values[1], str)
-    ):
+    simple = simple_condition(values)
+    if simple is None:
         return QueryPolicy('bypass', 'malformed_filters')
-    field = schema.resolve_field(entity_type, values[0])
+    field_name, operator, value = simple
+    field = schema.resolve_field(entity_type, field_name)
     if field is None:
         return QueryPolicy('bypass', 'unknown_field')
-    return _classify_field(field, values[1], values[2])
-
-
-def _require_reason(value: object) -> None:
-    """Require a stable nonempty policy reason string."""
-    if not isinstance(value, str):
-        raise TypeError('query policy reason must be a string')
-    if not value:
-        raise ValueError('query policy reason must be nonempty')
+    return _classify_field(field, operator, value)
 
 
 def _string_argument(call: ExactCall, name: str) -> str | None:

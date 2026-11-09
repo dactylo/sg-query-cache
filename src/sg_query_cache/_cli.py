@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
 import sys
@@ -59,6 +60,10 @@ class _RootParser(argparse.ArgumentParser):
         return formatter.format_help()
 
 
+class _MissingMetadataPasswordError(Exception):
+    """Mark a missing configured metadata password before store construction."""
+
+
 def _close_store(store: ValkeyMetadataStore) -> bool:
     """Close one store and report a redacted acknowledgement."""
     try:
@@ -79,8 +84,9 @@ def _open_store(settings: CacheSettings) -> ValkeyMetadataStore:
     factory = cast('type[ValkeyMetadataStore]', vars(module)['ValkeyMetadataStore'])
     password_env = settings.l2.valkey.metadata.password_env
     password = os.environ.get(password_env)
-    environ = {} if password is None else {password_env: password}
-    return factory.from_settings(settings, environ, NullMetrics())
+    if password is None:
+        raise _MissingMetadataPasswordError
+    return factory.from_settings(settings, {password_env: password}, NullMetrics())
 
 
 def _print_version() -> int:
@@ -114,37 +120,26 @@ def _report_error(message: str) -> None:
     print(f'error: {visible}', file=sys.stderr)
 
 
-def _configuration_failure() -> int:
-    """Report one redacted configuration failure."""
-    _report_error('configuration is invalid or unavailable')
+def _configuration_failure(message: str) -> int:
+    """Report one redacted setup failure."""
+    _report_error(message)
     return 2
 
 
-def _flush(config_path: str, site: str, reason: str) -> int:
-    """Run one metadata-only site flush."""
+def _command_settings(config_path: str) -> CacheSettings | None:
+    """Load enabled L2 settings or report the relevant setup error."""
     try:
         settings = _load_settings(config_path)
-        store = _open_store(settings)
-    except (ImportError, KeyError, OSError, TypeError, ValueError):
-        return _configuration_failure()
-    except Exception:  # noqa: BLE001 - closed redacted store-construction boundary
-        _report_error('flush operation was not acknowledged')
-        return 1
-
-    completed = False
-    try:
-        store.flush_site(site, reason)
-        completed = True
-    except (OSError, RuntimeError, TypeError, ValueError):
-        completed = False
-    finally:
-        closed = _close_store(store)
-    if not completed or not closed:
-        _report_error('flush operation was not acknowledged')
-        return 1
-    digest = sha256(site.encode()).hexdigest()
-    print(f'flush acknowledged site={digest}')
-    return 0
+    except OSError:
+        _configuration_failure('cannot read the settings file')
+        return None
+    except (TypeError, ValueError, OverflowError):
+        _configuration_failure('the settings file is invalid')
+        return None
+    if not settings.l2.enabled:
+        _configuration_failure('the settings do not enable the shared L2 cache')
+        return None
+    return settings
 
 
 def _resolved_plugin_path(module: object) -> Path:
@@ -167,38 +162,6 @@ def _daemon_plugin_path() -> int:
         _report_error('sg_query_cache daemon plugin is unavailable')
         return 1
     print(path)
-    return 0
-
-
-def _rotate(config_path: str, confirm_prefix: str) -> int:
-    """Run one confirmed all-sites incarnation rotation."""
-    try:
-        settings = _load_settings(config_path)
-    except (OSError, TypeError, ValueError):
-        return _configuration_failure()
-    if confirm_prefix != settings.l2.valkey.metadata.key_prefix:
-        _report_error('prefix confirmation does not match configuration')
-        return 2
-    try:
-        store = _open_store(settings)
-    except (ImportError, KeyError, OSError, TypeError, ValueError):
-        return _configuration_failure()
-    except Exception:  # noqa: BLE001 - closed redacted store-construction boundary
-        _report_error('incarnation rotation was not acknowledged')
-        return 1
-
-    acknowledged = False
-    try:
-        store.rotate_incarnation()
-        acknowledged = True
-    except (OSError, RuntimeError, TypeError, ValueError):
-        acknowledged = False
-    finally:
-        closed = _close_store(store)
-    if not acknowledged or not closed:
-        _report_error('incarnation rotation was not acknowledged')
-        return 1
-    print('incarnation rotation acknowledged for all sites')
     return 0
 
 
@@ -233,10 +196,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     flush.add_argument(
         '--site',
-        required=True,
         type=_site_argument,
         metavar='SITE',
-        help='site namespace to flush',
+        help='site namespace to flush (defaults to the configured site)',
     )
     flush.add_argument(
         '--reason',
@@ -274,6 +236,98 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _store_setup_message(error: Exception, settings: CacheSettings) -> str:
+    """Name one store setup cause without exposing configuration values."""
+    if isinstance(error, ImportError):
+        if importlib.util.find_spec('valkey') is None:
+            return "the valkey extra is not installed: pip install 'sg-query-cache[valkey]'"
+        return 'the Valkey store could not be set up'
+    if isinstance(error, _MissingMetadataPasswordError):
+        return f'environment variable {settings.l2.valkey.metadata.password_env} is not set'
+    if isinstance(error, (KeyError, OSError)):
+        return 'the Valkey store could not be set up'
+    return 'the Valkey settings are invalid'
+
+
+def _flush(config_path: str, site: str | None, reason: str) -> int:
+    """Run one metadata-only site flush."""
+    settings = _command_settings(config_path)
+    if settings is None:
+        return 2
+    if site is None:
+        site = settings.site_namespace
+    elif site != settings.site_namespace:
+        _report_error('--site does not match the configured site namespace')
+        return 2
+    try:
+        store = _open_store(settings)
+    except (
+        ImportError,
+        _MissingMetadataPasswordError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as e:
+        return _configuration_failure(_store_setup_message(e, settings))
+    except Exception:  # noqa: BLE001 - closed redacted store-construction boundary
+        _report_error('flush operation was not acknowledged')
+        return 1
+
+    completed = False
+    try:
+        store.flush_site(site, reason)
+        completed = True
+    except (OSError, RuntimeError, TypeError, ValueError):
+        completed = False
+    finally:
+        closed = _close_store(store)
+    if not completed or not closed:
+        _report_error('flush operation was not acknowledged')
+        return 1
+    digest = sha256(site.encode()).hexdigest()
+    print(f'flush acknowledged site={digest}')
+    return 0
+
+
+def _rotate(config_path: str, confirm_prefix: str) -> int:
+    """Run one confirmed all-sites incarnation rotation."""
+    settings = _command_settings(config_path)
+    if settings is None:
+        return 2
+    if confirm_prefix != settings.l2.valkey.metadata.key_prefix:
+        _report_error('prefix confirmation does not match configuration')
+        return 2
+    try:
+        store = _open_store(settings)
+    except (
+        ImportError,
+        _MissingMetadataPasswordError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as e:
+        return _configuration_failure(_store_setup_message(e, settings))
+    except Exception:  # noqa: BLE001 - closed redacted store-construction boundary
+        _report_error('incarnation rotation was not acknowledged')
+        return 1
+
+    acknowledged = False
+    try:
+        store.rotate_incarnation()
+        acknowledged = True
+    except (OSError, RuntimeError, TypeError, ValueError):
+        acknowledged = False
+    finally:
+        closed = _close_store(store)
+    if not acknowledged or not closed:
+        _report_error('incarnation rotation was not acknowledged')
+        return 1
+    print('incarnation rotation acknowledged for all sites')
+    return 0
+
+
 def _run(arguments: list[str]) -> int:
     """Parse arguments and run the selected operator command."""
     parser = _build_parser()
@@ -299,7 +353,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: Arguments to parse, or `None` to use `sys.argv`.
 
     Returns:
-        The process exit status.
+        Zero for success, one for an unacknowledged operation or cleanup, two
+        for configuration or unavailable-output errors, or 130 for an
+        interrupted command.
+
+    Raises:
+        SystemExit: Argument parsing handles help or rejects command syntax.
+        OSError: Output or output cleanup fails for a reason other than
+            downstream-reader closure.
     """
     if sys.stdout is None:
         # Started with standard output closed: nothing can be delivered, and the

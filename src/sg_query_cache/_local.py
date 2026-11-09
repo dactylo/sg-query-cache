@@ -4,6 +4,7 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
 from secrets import token_hex
 from threading import RLock
+from time import monotonic
 
 from sg_query_cache._backend import BackendProtocolError, MonotonicClock
 from sg_query_cache._backend_validation import (
@@ -30,7 +31,7 @@ from sg_query_cache._local_store import (
 from sg_query_cache._local_store import (
     positive_seconds as _positive_seconds,
 )
-from sg_query_cache._metrics import MetricsSink
+from sg_query_cache._metrics import MetricsSink, NullMetrics
 from sg_query_cache._model import (
     CacheHit,
     DecodedPayload,
@@ -68,16 +69,20 @@ class LocalBackend:
                     self._metrics.observe(name, value, labels)
 
     def __init__(
-        self, settings: CacheSettings, clock: MonotonicClock, metrics: MetricsSink
+        self,
+        settings: CacheSettings,
+        clock: MonotonicClock = monotonic,
+        metrics: MetricsSink | None = None,
     ) -> None:
         """Initialize the bounded store and its permanent generation records.
 
         Args:
             settings: Validated cache settings supplying L1 and operational
                 bounds.
-            clock: Backend-authoritative monotonic clock.
+            clock: Backend-authoritative monotonic clock, defaulting to
+                `time.monotonic`.
             metrics: Safe metrics boundary retained for owning state
-                transitions.
+                transitions. `None` discards metrics.
 
         Raises:
             BackendCapacity: The metadata budget cannot retain permanent
@@ -86,7 +91,7 @@ class LocalBackend:
         """
         self._clock = clock
         self._lock = RLock()
-        self._metrics = metrics
+        self._metrics = NullMetrics() if metrics is None else metrics
         self._max_dependency_tags = settings.limits.max_dependency_tags
         self._max_dependency_vector_bytes = settings.limits.max_dependency_vector_bytes
         now = _clock_read(clock)

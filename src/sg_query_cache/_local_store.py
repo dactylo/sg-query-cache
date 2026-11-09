@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Own bounded local records and callback-free state transitions."""
 
 from collections import OrderedDict
@@ -37,31 +34,24 @@ _RESULT_OVERHEAD_BYTES = 128
 class _GenerationRecord:
     """Retain a generation token and its optional retirement deadline."""
 
-    _retirement_deadline: float | None
-    _key_size: int
-    _size: int
-    _token: int
+    retirement_deadline: float | None
+    key_size: int
+    size: int
+    token: int
 
 
 @dataclass(frozen=True, slots=True)
 class _LeaseRecord:
     """Retain a lease token and its absolute expiry."""
 
-    _deadline: float
-    _size: int
-    _token: str
+    deadline: float
+    size: int
+    token: str
 
 
 @dataclass(frozen=True, slots=True)
-class ResultSnapshot:
-    """Carry immutable result bytes whose object identity fences removal.
-
-    Attributes:
-        expiry: Absolute expiration in the owning backend's monotonic seconds.
-        payload: Encoded result bytes.
-        size: Accounted result bytes, including the key and fixed index
-            allowances.
-    """
+class _ResultSnapshot:
+    """Carry immutable result bytes whose object identity fences removal."""
 
     expiry: float
     payload: bytes
@@ -149,7 +139,7 @@ class LocalStore:
         self._result_bytes = 0
         self._generations: dict[DependencyTag, _GenerationRecord] = {}
         self._leases: dict[str, _LeaseRecord] = {}
-        self._results: OrderedDict[str, ResultSnapshot] = OrderedDict()
+        self._results: OrderedDict[str, _ResultSnapshot] = OrderedDict()
         self._generation_queue: OrderedDict[DependencyTag, None] = OrderedDict()
         self._lease_queue: OrderedDict[str, None] = OrderedDict()
         self._result_queue: OrderedDict[str, None] = OrderedDict()
@@ -180,7 +170,7 @@ class LocalStore:
         """Publish addressed generation replacements and incremental totals."""
         for tag, replacement in staged.items():
             previous = self._generations.get(tag)
-            delta = replacement._size - (0 if previous is None else previous._size)
+            delta = replacement.size - (0 if previous is None else previous.size)
             self._generations[tag] = replacement
             self._generation_bytes += delta
             if tag.kind in GLOBAL_TAG_KINDS:
@@ -193,15 +183,15 @@ class LocalStore:
         """Retire one scoped generation and both accounting indexes."""
         record = self._generations.pop(tag)
         del self._generation_queue[tag]
-        self._generation_bytes -= record._size
+        self._generation_bytes -= record.size
         _increment(
             op, 'cache_scoped_generation', {'outcome': 'expired', 'tag_kind': tag.kind.value}
         )
-        if record._retirement_deadline is not None:
+        if record.retirement_deadline is not None:
             _observe(
                 op,
                 'cache_metadata_recovery_seconds',
-                max(0.0, op.now - record._retirement_deadline),
+                max(0.0, op.now - record.retirement_deadline),
                 {'outcome': 'expiration'},
             )
 
@@ -210,8 +200,8 @@ class LocalStore:
         record = self._generations.get(tag)
         if (
             record is not None
-            and record._retirement_deadline is not None
-            and record._retirement_deadline <= op.now
+            and record.retirement_deadline is not None
+            and record.retirement_deadline <= op.now
         ):
             self._remove_generation(tag, op)
 
@@ -219,12 +209,12 @@ class LocalStore:
         """Remove a lease and its maintenance index immediately."""
         record = self._leases.pop(key)
         del self._lease_queue[key]
-        self._lease_bytes -= record._size
+        self._lease_bytes -= record.size
 
     def _expire_lease(self, key: str, now: float) -> None:
         """Check an addressed lease independently of maintenance progress."""
         record = self._leases.get(key)
-        if record is not None and record._deadline <= now:
+        if record is not None and record.deadline <= now:
             self._remove_lease(key)
 
     def _remove_result(self, key: str, outcome: str, op: StoreOperation) -> None:
@@ -256,7 +246,16 @@ class LocalStore:
             raise BackendCapacity('backend metadata capacity is exhausted')
 
     def check_time(self, now: float) -> None:
-        """Check open state and a finite, wrapper-validated monotonic sample."""
+        """Accept a finite validated time sample without allowing time to move backward.
+
+        Args:
+            now: Wrapper-validated monotonic time in seconds. A successful
+                check records it as the next comparison baseline.
+
+        Raises:
+            BackendUnavailable: The store is closed or the sample precedes the
+                last accepted sample.
+        """
         if self._closed:
             raise BackendUnavailable('backend is closed')
         if now < self._last_now:
@@ -297,19 +296,26 @@ class LocalStore:
     ) -> bool:
         """Admit encoded bytes while the exact addressed lease is still live.
 
+        A matching lease is consumed even when the payload exceeds the result
+        capacity or payload limit. Admitting a result may evict older results.
+
         Args:
             lease: Validated ownership token and opaque key.
             payload: Immutable bytes within the closed backend input contract.
-            duration: Positive authoritative lifetime remaining at op.now.
+            duration: Positive authoritative lifetime remaining at `op.now`.
             op: Time sample and captured metric events for this transition.
 
         Returns:
             Whether the result was admitted under the current lease.
+
+        Raises:
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
         """
         self._maintain(op)
         self._expire_lease(lease.key, op.now)
         record = self._leases.get(lease.key)
-        if record is None or record._token != lease.token:
+        if record is None or record.token != lease.token:
             _increment(op, 'cache_lease_rejection', {'layer': 'local_l1'})
             _increment(op, 'cache_commit', {'layer': 'local_l1', 'outcome': 'rejected'})
             return False
@@ -337,7 +343,7 @@ class LocalStore:
             del self._results[lease.key]
         else:
             self._result_queue[lease.key] = None
-        self._results[lease.key] = ResultSnapshot(op.now + duration, payload, size)
+        self._results[lease.key] = _ResultSnapshot(op.now + duration, payload, size)
         self._result_bytes += size
         _observe(
             op,
@@ -358,8 +364,21 @@ class LocalStore:
         """Return accounted lease bytes, including maintenance indexes."""
         return self._lease_bytes
 
-    def lookup(self, key: str, op: StoreOperation) -> ResultSnapshot | None:
-        """Capture an immutable snapshot, checking addressed expiry immediately."""
+    def lookup(self, key: str, op: StoreOperation) -> _ResultSnapshot | None:
+        """Capture an immutable snapshot, checking addressed expiry immediately.
+
+        Args:
+            key: Validated opaque result key.
+            op: Time sample and captured metric events for this transition.
+
+        Returns:
+            The retained immutable snapshot, or `None` when the addressed
+            result is absent or expired. A hit updates result eviction order.
+
+        Raises:
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
+        """
         record = self._results.get(key)
         expired = record is not None and record.expiry <= op.now
         self._maintain(op)
@@ -407,12 +426,12 @@ class LocalStore:
                 )
                 continue
             counter = self._allocate_generation(counter)
-            deadline = None if record is None else record._retirement_deadline
-            key_size = self._generation_key_size(tag) if record is None else record._key_size
+            deadline = None if record is None else record.retirement_deadline
+            key_size = self._generation_key_size(tag) if record is None else record.key_size
             replacement = _GenerationRecord(
                 deadline, key_size, self._generation_size(key_size, counter, deadline), counter
             )
-            delta += replacement._size - (0 if record is None else record._size)
+            delta += replacement.size - (0 if record is None else record.size)
             staged[tag] = replacement
             events.append(('cache_invalidation', None, {'tag_kind': tag.kind.value}))
         self._require_metadata_capacity(self._generation_bytes + delta, self._lease_bytes, op)
@@ -421,27 +440,64 @@ class LocalStore:
         self.metadata_bytes(op)
 
     def change(self, changes: tuple[GenerationChange, ...], op: StoreOperation) -> None:
-        """Replace applicable addressed generations atomically in caller order."""
+        """Replace applicable addressed generations atomically in caller order.
+
+        Args:
+            changes: Validated ordered replacements. Missing scoped tags are
+                not materialized by a change.
+            op: Time sample and captured metric events for this transition.
+
+        Raises:
+            BackendCapacity: Generation allocation or metadata capacity cannot
+                retain the requested replacements.
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
+        """
         self._maintain(op)
         self._change(changes, op)
 
     def flush_site(self, tag: DependencyTag, reason: str, op: StoreOperation) -> None:
-        """Replace a validated site generation in one maintenance transition."""
+        """Replace a validated site generation in one maintenance transition.
+
+        Args:
+            tag: Validated permanent site dependency tag.
+            reason: Safe low-cardinality reason label for the flush metric.
+            op: Time sample and captured metric events for this transition.
+
+        Raises:
+            BackendCapacity: Generation allocation or metadata capacity cannot
+                retain the replacement.
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
+        """
         self._maintain(op)
         self._change((GenerationChange(tag),), op)
         _increment(op, 'cache_site_flush', {'reason': reason})
 
     def release(self, lease: FillLease, op: StoreOperation) -> bool:
-        """Remove only an exact current unexpired lease."""
+        """Remove only an exact current unexpired lease.
+
+        Args:
+            lease: Validated opaque key and ownership token.
+            op: Time sample and captured metric events for this transition.
+
+        Returns:
+            Whether the matching live lease was removed; `False` for an absent,
+            expired, or differently owned lease.
+
+        Raises:
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
+        """
         self._maintain(op)
         self._expire_lease(lease.key, op.now)
         record = self._leases.get(lease.key)
-        if record is None or record._token != lease.token:
+        if record is None or record.token != lease.token:
             return False
         self._remove_lease(lease.key)
         return True
 
-    def remove_snapshot(self, key: str, snapshot: ResultSnapshot) -> bool:
+    def remove_snapshot(self, key: str, snapshot: _ResultSnapshot) -> bool:
         """Remove captured result bytes only if their record is still current."""
         if self._results.get(key) is not snapshot:
             return False
@@ -463,6 +519,12 @@ class LocalStore:
 
         Returns:
             The new lease, or `None` if a live owner already exists.
+
+        Raises:
+            BackendCapacity: The lease counter is exhausted or metadata
+                capacity cannot retain the new lease.
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
         """
         self._maintain(op)
         self._expire_lease(key, op.now)
@@ -488,7 +550,25 @@ class LocalStore:
         return FillLease(key, token)
 
     def resolve(self, tags: tuple[DependencyTag, ...], op: StoreOperation) -> GenerationVector:
-        """Resolve an ordered validated vector after bounded queue maintenance."""
+        """Resolve an ordered validated vector after bounded queue maintenance.
+
+        Missing tags receive new generations. Existing scoped tags retain their
+        tokens and receive renewed retention deadlines.
+
+        Args:
+            tags: Validated ordered unique dependency tags.
+            op: Time sample and captured metric events for this transition.
+
+        Returns:
+            Every requested tag and its current token in request order, under
+            this store's incarnation.
+
+        Raises:
+            BackendCapacity: Generation allocation or metadata capacity cannot
+                retain the resolved vector.
+            BackendUnavailable: The store is closed or the sampled time moves
+                backward.
+        """
         self._maintain(op)
         staged: dict[DependencyTag, _GenerationRecord] = {}
         counter = self._generation_counter
@@ -506,12 +586,12 @@ class LocalStore:
                 if deadline is not None:
                     created.append(tag)
             else:
-                token = record._token
-                key_size = record._key_size
+                token = record.token
+                key_size = record.key_size
             replacement = _GenerationRecord(
                 deadline, key_size, self._generation_size(key_size, token, deadline), token
             )
-            delta += replacement._size - (0 if record is None else record._size)
+            delta += replacement.size - (0 if record is None else record.size)
             staged[tag] = replacement
             entries.append((tag, token))
         self._require_metadata_capacity(self._generation_bytes + delta, self._lease_bytes, op)

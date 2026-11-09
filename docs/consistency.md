@@ -4,16 +4,16 @@ This page explains how fresh cached results are, what the cache keeps apart, and
 directly. Read it before you decide which reads to cache or choose a shared layout. To try the
 cache first, start with the [README quick start](../README.md#quick-start).
 
-| If you want to...                                   | Start here                                                      |
-| --------------------------------------------------- | --------------------------------------------------------------- |
-| Know what can be stale, and for how long            | [The guarantee in brief](#the-guarantee-in-brief)               |
-| Learn the terms used in these docs                  | [How the cache works](#how-the-cache-works)                     |
-| Check which methods are cached                      | [Which reads are cached](#which-reads-are-cached)               |
-| Force a direct read or shorten the age for a block  | [Bypass and policy scopes](#bypass-and-policy-scopes)           |
-| Understand how writes invalidate results            | [Writes](#writes)                                               |
-| Compare the local, shared, and hierarchical layouts | [Layout differences](#layout-differences)                       |
-| Handle permission changes and revocation            | [Permissions and authorization](#permissions-and-authorization) |
-| Check the exact age, fence, and isolation rules     | [Detailed contract](#detailed-contract)                         |
+| If you want to...                                 | Start here                                                      |
+| ------------------------------------------------- | --------------------------------------------------------------- |
+| Know what can be stale, and for how long          | [The guarantee in brief](#the-guarantee-in-brief)               |
+| Check which methods are cached                    | [Which reads are cached](#which-reads-are-cached)               |
+| Force a direct read or change the age for a block | [Bypass and policy scopes](#bypass-and-policy-scopes)           |
+| Understand how writes invalidate results          | [Writes](#writes)                                               |
+| Compare the layouts                               | [Layout differences](#layout-differences)                       |
+| Handle permission changes and revocation          | [Permissions and authorization](#permissions-and-authorization) |
+| Look up a cache concept                           | [How the cache works](#how-the-cache-works)                     |
+| Check exact age, fence, and isolation rules       | [Detailed contract](#detailed-contract)                         |
 
 ## The guarantee in brief
 
@@ -23,13 +23,15 @@ transaction log, an authorization service, or a way to make reads causally consi
 - **Every result has a maximum age.** The cache never serves a result older than its maximum age.
   By default that is 30 seconds in the local layout, 10 seconds for the per-process copy in the
   hierarchical layout, and, in Valkey, 600 seconds for event-invalidated results, 60 seconds for
-  TTL-only results, and 1,800 seconds for schema. You can change these with
+  [TTL-only results](#how-the-cache-works), and 1,800 seconds for schema. You can change these with
   [maximum age rules](configuration.md#maximum-age-rules).
 - **Within that age, a result can be stale.** It can miss any change the cache has not been told
   about. In the local layout, that is any change made outside this process. In the shared layouts,
   it is a change whose SG event the event-daemon plugin has not processed yet.
 - **Your own writes invalidate.** A write through the same wrapper invalidates the results it can
-  affect, so that wrapper's next read reflects it. TTL-only results are the exception.
+  affect. If a layer cannot acknowledge the invalidation, that wrapper bypasses it until recovery;
+  see [fence acknowledgement](#fence-acknowledgement). Ordinary writes may leave TTL-only results
+  cached, so bypass when a read after a write must see the write.
 - **Results are isolated.** Calls that differ in method, arguments, response options, site, or
   identity never share a result.
 - **Failures fall through to SG.** If the cache is unavailable or its data is unusable, the read
@@ -40,6 +42,115 @@ transaction log, an authorization service, or a way to make reads causally consi
 
 The cache does not promise read-your-writes across different clients, causal consistency, or
 exactly-once event delivery.
+
+## Which reads are cached
+
+| Method                                                                                     | Treatment                                                                     |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `find`, `find_one`                                                                         | Event-aware when dependencies are clear; otherwise TTL-only, or read directly |
+| `schema_read`, `schema_entity_read`, `schema_field_read`                                   | Cached as schema; invalidated by schema writes and schema events              |
+| `work_schedule_read`                                                                       | TTL-only if listed in `enabled_ttl_only_methods`; otherwise read directly     |
+| `activity_stream_read`, `note_thread_read`, `preferences_read`, `summarize`, `text_search` | Always read directly                                                          |
+| Any read of `EventLogEntry`                                                                | Always read directly                                                          |
+| Supported writes, such as `create`, `update`, `delete`, `revive`, `batch`, and uploads     | Sent to SG between fences                                                     |
+| Anything else                                                                              | Call it on `raw_client`; those calls are neither cached nor fenced            |
+
+A `find` or `find_one` result is cached as TTL-only when its dependencies are uncertain: an unknown
+filter or order field, a relative-date filter, `additional_filter_presets` (only when
+`enable_additional_filter_presets` is on), or a dependency list that is still too long after
+broadening. Broadening replaces many specific tags with fewer, broader ones, such as one
+entity-type tag in place of many entity tags; a broadened result is invalidated more often.
+
+A read goes directly to SG, without reading or storing a cached result, when caching it is unsafe
+or unsupported: a human identity under `identity_policy = "scripts_only"`, a malformed query,
+arguments the cache cannot normalize, a dependency list that does not fit even as TTL-only, or a
+selected field, including `id`, whose schema or type the cache does not know. While the schema read
+is failing, that last case covers every `find` and `find_one`. A result that is too large or too
+deeply nested to store, such as one over `max_serialized_result_bytes`, is returned to the caller
+but not cached.
+
+## Bypass and policy scopes
+
+Use `bypass()` when correctness requires a direct read:
+
+```python
+with cached_sg.bypass():
+    asset = cached_sg.find_one('Asset', [['id', 'is', 123]], ['code'])
+```
+
+Inside the block, reads go to SG and neither read nor store cached results. Scopes apply to the
+current thread in synchronous code and to the current task in async code; a task created inside the
+scope inherits it.
+
+`cache_policy()` sets the maximum age or the caching mode for a block of reads:
+
+```python
+with cached_sg.cache_policy(maximum_age_seconds=5):
+    shots = cached_sg.find('Shot', [['sg_status_list', 'is', 'ip']], ['code'])
+```
+
+Inside this block, a read accepts only a result at most 5 seconds old, and a result stored from it
+uses 5 seconds as its maximum age. When scopes nest, the smallest explicit age applies. An explicit
+age replaces the configured default or rule, so it can lengthen a result's lifetime as well as
+shorten it; the [safety caps](configuration.md#maximum-age-rules) still apply.
+
+Use `mode` to make a read's caching policy more conservative:
+
+| Mode            | Effect                                                                         |
+| --------------- | ------------------------------------------------------------------------------ |
+| `'event_aware'` | Keeps event-aware reads event-aware; does not promote TTL-only or direct reads |
+| `'ttl_only'`    | Stores otherwise event-aware reads as TTL-only; direct reads still bypass      |
+| `'bypass'`      | Reads SG directly, just like `bypass()`                                        |
+
+A scope applies its mode only if it is more conservative than the read's existing policy. Schema
+reads ignore every mode except bypass.
+
+## Writes
+
+Supported writes through `CachedShotgun` or `AsyncCachedShotgun` are fenced twice: before the
+wrapper sends them to SG, and after they succeed or end with an unknown outcome. A `create`,
+`update`, or `batch` whose data sets `image` or `filmstrip_image` also uploads a file, so the
+wrapper fences the whole site for it, after any failure as well, because part of the change may
+have been applied. In async code, cancelling a write after it was sent counts as an unknown
+outcome.
+
+Pass your client's transport exception classes as `indeterminate_write_exceptions` when you create
+a wrapper, or to either wrapper's `open()` factory. A write that fails with one of them is treated
+as an unknown outcome and fenced afterward; other failures are not.
+
+Fences cover only writes made through the wrapper. Writes made through `raw_client`, another
+process, the web interface, or the REST API reach the cache only through SG events in the shared
+layouts, and otherwise only through the maximum age.
+
+TTL-only results carry no entity or field tags, so an ordinary write may not invalidate them, even
+when the same wrapper reads right after writing. Their maximum age bounds the staleness. Use bypass
+when a read after a write must see the write.
+
+## Layout differences
+
+| Layout       | Where results live                   | Changes made outside the wrapper                                                                          |
+| ------------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Local        | This process's L1                    | No event invalidation; the maximum age bounds staleness                                                   |
+| Shared       | Valkey L2                            | Writes through other wrappers fence L2; the event-daemon plugin applies other SG changes                  |
+| Hierarchical | Valkey L2 with a short-lived L1 copy | L2 invalidation does not purge another wrapper's L1; that copy can remain for up to 10 seconds by default |
+
+An L1 copy never outlives the L2 result it came from. Shared layouts depend on every client
+declaring its identity correctly and on prompt event processing. Synchronous and async wrappers can
+share L2 when settings, identity, and response options match; see
+[interoperability](#interoperability). Each wrapper's L1 remains subject to its own maximum age.
+
+## Permissions and authorization
+
+Permission and visibility changes are dependencies too, so SG events about them invalidate the
+affected results. Until that event is processed or the result reaches its maximum age, the same
+identity can still see results it no longer has permission to read. If revoking access must take
+effect immediately, bypass the cache for the affected reads, or do not cache human identities. When
+you change a script's permissions without changing its identity, set a new `epoch` on its
+`Identity` or [flush the site](operations.md#flush-or-rotate-cached-results).
+
+The cache does not authenticate identities. In the shared layouts, every client with access to
+Valkey is trusted to declare its identity, site namespace, and key prefixes correctly. See
+[identities and trust](configuration.md#identities-and-trust).
 
 ## How the cache works
 
@@ -80,120 +191,13 @@ event the plugin cannot map exactly invalidates the whole site.
 **Site namespace.** `cache.site_namespace` names one SG site. Every process that shares Valkey, and
 the event daemon, must use the same name. Flushes apply to one site namespace.
 
-## Which reads are cached
-
-| Method                                                                                     | Treatment                                                                     |
-| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `find`, `find_one`                                                                         | Event-aware when dependencies are clear; otherwise TTL-only, or read directly |
-| `schema_read`, `schema_entity_read`, `schema_field_read`                                   | Cached as schema; invalidated by schema writes and schema events              |
-| `work_schedule_read`                                                                       | TTL-only if listed in `enabled_ttl_only_methods`; otherwise read directly     |
-| `activity_stream_read`, `note_thread_read`, `preferences_read`, `summarize`, `text_search` | Always read directly                                                          |
-| Any read of `EventLogEntry`                                                                | Always read directly                                                          |
-| Supported writes, such as `create`, `update`, `delete`, `revive`, `batch`, and uploads     | Sent to SG between fences                                                     |
-| Anything else                                                                              | Call it on `raw_client`; those calls are neither cached nor fenced            |
-
-A `find` or `find_one` result is cached as TTL-only when its dependencies are uncertain: an unknown
-schema field, a relative-date filter, `additional_filter_presets` (only when
-`enable_additional_filter_presets` is on), or a dependency list that is still too long after
-broadening. Broadening replaces many specific tags with fewer, broader ones, such as one
-entity-type tag in place of many entity tags; a broadened result is invalidated more often.
-
-A read goes directly to SG, without reading or storing a cached result, when caching it is unsafe
-or unsupported: a human identity under `identity_policy = "scripts_only"`, a malformed query,
-arguments the cache cannot normalize, or a dependency list that does not fit even as TTL-only. A
-result that is too large or too deeply nested to store, such as one over
-`max_serialized_result_bytes`, is returned to the caller but not cached.
-
-## Bypass and policy scopes
-
-Use `bypass()` when correctness requires a direct read:
-
-```python
-with cached_sg.bypass():
-    asset = cached_sg.find_one('Asset', [['id', 'is', 123]], ['code'])
-```
-
-Inside the block, reads go to SG and neither read nor store cached results. Scopes apply to the
-current thread in synchronous code and to the current task in async code; a task created inside the
-scope inherits it.
-
-`cache_policy()` sets the maximum age or the caching mode for a block of reads:
-
-```python
-with cached_sg.cache_policy(maximum_age=5):
-    shots = cached_sg.find('Shot', [['sg_status_list', 'is', 'ip']], ['code'])
-```
-
-Inside this block, a read accepts only a result at most 5 seconds old, and a result stored from it
-uses 5 seconds as its maximum age. When scopes nest, the smallest explicit age applies. An explicit
-age replaces the configured default or rule, so it can lengthen a result's lifetime as well as
-shorten it; the [safety caps](configuration.md#maximum-age-rules) still apply.
-
-`mode` accepts `'event_aware'`, `'ttl_only'`, or `'bypass'`, from least to most conservative. A
-scope applies its mode only when that is more conservative than the read would otherwise be:
-`mode='ttl_only'` stores event-aware reads as TTL-only, and `mode='bypass'` is the same as
-`bypass()`. A scope never turns a direct read into a cached one, and schema reads ignore every mode
-except bypass.
-
-## Writes
-
-Supported writes through `CachedShotgun` or `AsyncCachedShotgun` are fenced twice: before the
-wrapper sends them to SG, and after they succeed or end with an unknown outcome. A `create`,
-`update`, or `batch` whose data sets `image` or `filmstrip_image` also uploads a file, so the
-wrapper fences the whole site for it, after any failure as well, because part of the change may
-have been applied. In async code, cancelling a write after it was sent counts as an unknown
-outcome.
-
-Pass your client's transport exception classes as `indeterminate_write_exceptions` when you create
-a wrapper, or to `AsyncCachedShotgun.open()`. A write that fails with one of them is treated as an
-unknown outcome and fenced afterward; other failures are not.
-
-Fences cover only writes made through the wrapper. Writes made through `raw_client`, another
-process, the web interface, or the REST API reach the cache only through SG events in the shared
-layouts, and otherwise only through the maximum age.
-
-TTL-only results carry no entity or field tags, so an ordinary write may not invalidate them, even
-when the same wrapper reads right after writing. Their maximum age bounds the staleness. Use bypass
-when a read after a write must see the write.
-
-## Layout differences
-
-- **Local.** Each process has its own L1. Writes made outside the process become visible only when
-  results reach their maximum age; nothing invalidates them through events.
-- **Shared.** Every process uses Valkey L2 directly. Results depend on every client declaring its
-  identity correctly and on the event-daemon plugin processing events promptly.
-- **Hierarchical.** Each process keeps a short-lived L1 copy of L2 results. An L1 copy never
-  outlives the L2 result it came from. A fence from another process does not purge this process's
-  L1, so a copy can stay visible for up to the hierarchical L1 age (10 seconds by default) after
-  another process writes.
-
-Synchronous and async wrappers share L2 results when they use the same settings, identity, and
-response options. Each wrapper has its own L1, so a fence from a different wrapper does not purge
-it; the L1 maximum age bounds that window.
-
-## Permissions and authorization
-
-Permission and visibility changes are dependencies too, so SG events about them invalidate the
-affected results. Until that event is processed or the result reaches its maximum age, the same
-identity can still see results it no longer has permission to read. If revoking access must take
-effect immediately, bypass the cache for the affected reads, or do not cache human identities. When
-you change a script's permissions without changing its identity, set a new `epoch` on its
-`Identity` or [flush the site](operations.md#flush-or-rotate-cached-results).
-
-The cache does not authenticate identities. In the shared layouts, every client with access to
-Valkey is trusted to declare its identity, site namespace, and key prefixes correctly. See
-[identities and trust](configuration.md#identities-and-trust).
-
 ## Detailed contract
 
 ### Maximum age selection
 
-Each read selects one maximum age. It starts from the layer default or the strongest matching
-[maximum age rule](configuration.md#maximum-age-rules). The smallest explicit age from active
-policy scopes replaces that value. The result is then capped by `global_safety_max_seconds`, the
-remaining lifetime of any signed URL in the result, the remaining L2 lifetime when an L2 result is
-copied into L1, and, for hierarchical L1, `hierarchical_max_age_seconds`. A hit older than the
-selected age is discarded and fetched from SG.
+Each read selects a maximum age from its configuration and active policy scopes, then applies the
+[safety caps](configuration.md#maximum-age-rules). A hit older than the selected age is discarded
+and fetched from SG.
 
 Events usually make a change visible before the maximum age, but they are not a causal cursor:
 processing one event does not prove that every earlier or related write has been applied.
@@ -204,7 +208,9 @@ genuinely only reads can disable event generation safely.
 
 The wrapper fences L2 before L1. If a layer does not acknowledge a fence, the write is still sent,
 and that layer serves no hits to this wrapper until the cache replays the unacknowledged changes
-and the layer acknowledges them.
+and the layer acknowledges them. The cache replays them only during its next fence, which in
+practice means the next write through the same wrapper; a read-only process bypasses that layer
+until it writes or restarts.
 
 In async code, a fence still in progress does not by itself make reads bypass. A layer that fails a
 fence keeps the failed changes immediately, before the next layer is tried. If cancellation or a

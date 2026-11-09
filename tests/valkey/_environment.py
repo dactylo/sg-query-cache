@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from dataclasses import replace
 
 import pytest
 
@@ -81,6 +82,13 @@ def settings(
     environ: Mapping[str, str],
     limits: LimitSettings | None = None,
 ) -> CacheSettings:
+    # A loaded host can make real servers miss the production setup and operation budgets, and
+    # no integration test is about those budgets, so every test gets generous ones.
+    chosen = replace(
+        limits or LimitSettings(scoped_generation_retention_seconds=RETENTION_SECONDS),
+        connect_timeout_seconds=2.0,
+        operation_timeout_seconds=5.0,
+    )
     return CacheSettings(
         site_namespace='integration',
         l1=L1Settings(enabled=False),
@@ -91,13 +99,14 @@ def settings(
                 metadata=_role('metadata', environ),
             ),
         ),
-        limits=limits or LimitSettings(scoped_generation_retention_seconds=RETENTION_SECONDS),
+        limits=chosen,
     )
 
 
 def topology_settings(profile: _ValkeyMode, environ: Mapping[str, str]) -> CacheSettings:
     return CacheSettings(
         site_namespace='failover',
+        limits=LimitSettings(connect_timeout_seconds=2.0, operation_timeout_seconds=5.0),
         l1=L1Settings(enabled=False),
         l2=L2Settings(
             enabled=True,

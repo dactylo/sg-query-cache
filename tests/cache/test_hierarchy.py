@@ -19,32 +19,34 @@ from sg_query_cache._local import LocalBackend
 from sg_query_cache._model import (
     DependencyPlan,
     DependencyTag,
-    ExactCall,
     FillLease,
     GenerationChange,
     GenerationVector,
     Identity,
 )
 from tests._fakes import (
+    CLIENT_OPTIONS,
+    BlockingBackend,
+    FakeClock,
+    FencedBackend,
+    ObservedBackend,
+    RecordingMetrics,
     ResolveFailureBackend,
-    _BlockingBackend,
-    _FakeClock,
-    _FencedBackend,
-    _ObservedBackend,
-    _RecordingMetrics,
+    asset_call,
+    asset_plan,
+    store_payload,
 )
 
-_CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _SITE = 'production'
 
 
-class _AdvancingResolveBackend(_ObservedBackend):
+class _AdvancingResolveBackend(ObservedBackend):
     __slots__ = ('_advance', '_clock', '_trigger_at')
 
     def __init__(
         self,
         backend: CacheBackend,
-        clock: _FakeClock,
+        clock: FakeClock,
         *,
         trigger_at: int,
         advance: float,
@@ -56,12 +58,12 @@ class _AdvancingResolveBackend(_ObservedBackend):
 
     def resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
         vector = super().resolve(tags)
-        if len(self._resolved) == self._trigger_at:
-            self._clock._advance(self._advance)
+        if len(self.resolved) == self._trigger_at:
+            self._clock.advance(self._advance)
         return vector
 
 
-class _GenerationBarrierBackend(_ObservedBackend):
+class _GenerationBarrierBackend(ObservedBackend):
     __slots__ = ('_barrier', '_change', '_l2', '_lock', '_resolves')
 
     def __init__(
@@ -83,18 +85,18 @@ class _GenerationBarrierBackend(_ObservedBackend):
             self._resolves += 1
             attempt = self._resolves
         if attempt <= self._barrier.parties:
-            vector = self._backend.resolve(tags)
+            vector = self.backend.resolve(tags)
             self._barrier.wait(timeout=2)
             return vector
         if attempt == self._barrier.parties + 1:
             changes = (self._change,)
-            self._backend.change(changes)
+            self.backend.change(changes)
             self._l2.change(changes)
-        return self._backend.resolve(tags)
+        return self.backend.resolve(tags)
 
 
-class _ReleaseTrackingBackend(_ObservedBackend):
-    __slots__ = ('_release_attempts',)
+class _ReleaseTrackingBackend(ObservedBackend):
+    __slots__ = ('release_attempts',)
 
     def __init__(
         self,
@@ -108,14 +110,14 @@ class _ReleaseTrackingBackend(_ObservedBackend):
             commit_outcome=commit_outcome,
             replacement_payload=replacement_payload,
         )
-        self._release_attempts: list[FillLease] = []
+        self.release_attempts: list[FillLease] = []
 
     def release(self, lease: FillLease) -> bool:
-        self._release_attempts.append(lease)
+        self.release_attempts.append(lease)
         return super().release(lease)
 
 
-class _ChangeHookBackend(_ObservedBackend):
+class _ChangeHookBackend(ObservedBackend):
     __slots__ = ('_before_change',)
 
     def __init__(self, backend: CacheBackend, before_change: Callable[[], None]) -> None:
@@ -124,7 +126,7 @@ class _ChangeHookBackend(_ObservedBackend):
 
     def change(self, changes: tuple[GenerationChange, ...]) -> None:
         self._before_change()
-        self._backend.change(changes)
+        self.backend.change(changes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,10 +134,10 @@ class _PopulationDecision:
     remaining_seconds: float | None
 
 
-class _ArmedMetrics(_RecordingMetrics):
+class _ArmedMetrics(RecordingMetrics):
     __slots__ = ('_advance', '_clock', '_event', '_labels')
 
-    def __init__(self, clock: _FakeClock) -> None:
+    def __init__(self, clock: FakeClock) -> None:
         super().__init__()
         self._advance = 0.0
         self._clock = clock
@@ -151,9 +153,9 @@ class _ArmedMetrics(_RecordingMetrics):
         if self._event != (method, name) or not self._labels.items() <= labels.items():
             return
         self._event = None
-        self._clock._advance(self._advance)
+        self._clock.advance(self._advance)
 
-    def _arm(
+    def arm(
         self,
         method: Literal['increment', 'observe'],
         name: str,
@@ -174,10 +176,10 @@ class _ArmedMetrics(_RecordingMetrics):
         super().observe(name, value, labels)
 
 
-class _SlowMetrics(_RecordingMetrics):
+class _SlowMetrics(RecordingMetrics):
     __slots__ = ('_advance', '_clock', '_seen')
 
-    def __init__(self, clock: _FakeClock, advance: float) -> None:
+    def __init__(self, clock: FakeClock, advance: float) -> None:
         super().__init__()
         self._advance = advance
         self._clock = clock
@@ -187,12 +189,12 @@ class _SlowMetrics(_RecordingMetrics):
         if name == 'cache_ttl_selection' and labels.get('layer') == 'hierarchical_l1':
             self._seen += 1
             if self._seen == 2:
-                self._clock._advance(self._advance)
+                self._clock.advance(self._advance)
         super().observe(name, value, labels)
 
 
-def _backend(settings: CacheSettings, clock: _FakeClock) -> LocalBackend:
-    return LocalBackend(settings, clock, _RecordingMetrics())
+def _backend(settings: CacheSettings, clock: FakeClock) -> LocalBackend:
+    return LocalBackend(settings, clock, RecordingMetrics())
 
 
 def _cache(
@@ -200,20 +202,16 @@ def _cache(
     l1: CacheBackend,
     l2: CacheBackend,
     *,
-    metrics: _RecordingMetrics | None = None,
+    metrics: RecordingMetrics | None = None,
 ) -> QueryCache:
     return QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
-        metrics=metrics or _RecordingMetrics(),
+        metrics=metrics or RecordingMetrics(),
     )
-
-
-def _call() -> ExactCall:
-    return ExactCall('find', (('entity_type', 'Asset'), ('filters', ())))
 
 
 def _encoded_result() -> bytes:
@@ -228,20 +226,8 @@ def _parse(value: object) -> object:
     return ('parsed', value)
 
 
-def _plan() -> DependencyPlan:
-    return DependencyPlan(
-        'event_aware',
-        (
-            DependencyTag.site(_SITE),
-            DependencyTag.authorization(_SITE),
-            DependencyTag.type_membership(_SITE, 'Asset'),
-        ),
-        'event_aware',
-    )
-
-
 def _parsed_read(cache: QueryCache, fetch: Callable[[], object]) -> object:
-    return cache.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, _parse)
+    return cache.read_parsed(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, _parse)
 
 
 def _read(
@@ -250,10 +236,10 @@ def _read(
     population_decision: Callable[[object], _PopulationDecision] | None = None,
 ) -> object:
     return cache.read(
-        _call(),
-        _plan(),
+        asset_call(),
+        asset_plan(),
         fetch,
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         _population_decision=population_decision,
     )
 
@@ -262,31 +248,38 @@ def _settings() -> CacheSettings:
     return CacheSettings(l2=L2Settings(enabled=True))
 
 
-def _store_payload(backend: CacheBackend, payload: bytes, age: float) -> None:
-    base_key = KeyBuilder.base_key(
-        _SITE,
-        Identity('script', 'studio', 'render'),
-        _CLIENT_OPTIONS,
-        _call(),
-    )
-    vector = backend.resolve(_plan().tags)
-    key = KeyBuilder.qualified_key(base_key, vector, 'result')
-    lease = backend.reserve(key, 30)
-    assert lease is not None
-    assert backend.commit(lease, payload, age)
+def test_aged_l2_hit_skips_an_unusable_l1_promotion() -> None:
+    settings = _settings()
+    clock = FakeClock()
+    metrics = RecordingMetrics()
+    cache = _cache(settings, _backend(settings, clock), _backend(settings, clock), metrics=metrics)
+    calls = 0
+
+    def fetch() -> object:
+        nonlocal calls
+        calls += 1
+        return [{'call': calls}]
+
+    assert _read(cache, fetch) == [{'call': 1}]
+    clock.advance(11)
+    metrics.increments.clear()
+
+    assert _read(cache, fetch) == [{'call': 1}]
+    assert calls == 1
+    assert ('cache_fill', {'layer': 'hierarchical_l1'}) not in metrics.increments
 
 
 def test_completed_old_key_flight_rejoins_the_current_memo_key() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     raw_l1 = _backend(settings, clock)
     l2 = _backend(settings, clock)
-    plan = _plan()
+    plan = asset_plan()
     base_key = KeyBuilder.base_key(
         _SITE,
         Identity('script', 'studio', 'render'),
-        _CLIENT_OPTIONS,
-        _call(),
+        CLIENT_OPTIONS,
+        asset_call(),
     )
     old_key = KeyBuilder.qualified_key(base_key, raw_l1.resolve(plan.tags), 'result')
     change = GenerationChange(DependencyTag.type_membership(_SITE, 'Asset'))
@@ -307,7 +300,7 @@ def test_completed_old_key_flight_rejoins_the_current_memo_key() -> None:
         deadline = monotonic() + 2
         while monotonic() < deadline:
             flight = cache._flights.get(f'memo:{old_key}')
-            if flight is not None and flight._participants == 4:
+            if flight is not None and flight.participants == 4:
                 break
             sleep(0.005)
         else:
@@ -319,11 +312,54 @@ def test_completed_old_key_flight_rejoins_the_current_memo_key() -> None:
     assert calls == 1
 
 
+def test_concurrent_reads_of_an_aged_l2_value_do_not_fetch() -> None:
+    settings = _settings()
+    clock = FakeClock()
+    l1 = _backend(settings, clock)
+    l2 = ObservedBackend(_backend(settings, clock))
+    cache = _cache(settings, l1, l2)
+    counter_lock = Lock()
+    calls = 0
+
+    def fetch() -> object:
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            return [{'call': calls}]
+
+    assert _read(cache, fetch) == [{'call': 1}]
+    clock.advance(11)
+    base_key = KeyBuilder.base_key(
+        _SITE,
+        Identity('script', 'studio', 'render'),
+        CLIENT_OPTIONS,
+        asset_call(),
+    )
+    flight_key = KeyBuilder.qualified_key(base_key, l1.resolve(asset_plan().tags), 'result')
+
+    def hold_leader_until_follower_joins() -> None:
+        deadline = monotonic() + 2
+        while monotonic() < deadline:
+            flight = cache._flights.get(flight_key)
+            if flight is not None and flight.participants == 2:
+                return
+            sleep(0.005)
+        pytest.fail('the follower did not join the L1 flight')
+
+    l2.on_lookup = hold_leader_until_follower_joins
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_read, cache, fetch) for _ in range(2)]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert results == [[{'call': 1}]] * 2
+    assert calls == 1
+
+
 def test_hierarchy_parsed_fill_honors_a_later_shorter_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
     cache = _cache(settings, _backend(settings, clock), _backend(settings, clock))
     calls = 0
@@ -335,38 +371,15 @@ def test_hierarchy_parsed_fill_honors_a_later_shorter_scope(
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    clock._advance(2)
+    clock.advance(2)
     with cache.policy(maximum_age=1):
         assert _parsed_read(cache, fetch) == ('parsed', {'call': 2})
     assert calls == 2
 
 
-def test_host_clock_skew_cannot_extend_l2_age() -> None:
-    settings = _settings()
-    l1_clock = _FakeClock(start=1_000_000_000)
-    l2_clock = _FakeClock(start=10)
-    l2 = _backend(settings, l2_clock)
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
-    cache = _cache(settings, _backend(settings, l1_clock), l2)
-    calls = 0
-
-    def fetch() -> object:
-        nonlocal calls
-        calls += 1
-        return [{'call': calls}]
-
-    assert _read(seed, fetch) == [{'call': 1}]
-    l2_clock._advance(595)
-    assert _read(cache, fetch) == [{'call': 1}]
-    l1_clock._advance(5)
-    l2_clock._advance(5)
-    assert _read(cache, fetch) == [{'call': 2}]
-    assert calls == 2
-
-
 def test_interleaved_reader_cannot_repromote_a_pre_write_value() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     value = ['PRE-WRITE']
     reader_cache: list[QueryCache] = []
 
@@ -394,8 +407,8 @@ def test_l1_failure_continues_to_a_healthy_l2() -> None:
             raise BackendUnavailable('local unavailable')
 
     settings = _settings()
-    l2 = _backend(settings, _FakeClock())
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l2 = _backend(settings, FakeClock())
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     assert _read(seed, lambda: [{'id': 7}]) == [{'id': 7}]
     cache = _cache(settings, cast('CacheBackend', _FailingL1()), l2)
     calls = 0
@@ -411,8 +424,8 @@ def test_l1_failure_continues_to_a_healthy_l2() -> None:
 
 def test_l1_hit_avoids_l2() -> None:
     settings = _settings()
-    l1 = _backend(settings, _FakeClock())
-    observed_l2 = _ObservedBackend(_backend(settings, _FakeClock()))
+    l1 = _backend(settings, FakeClock())
+    observed_l2 = ObservedBackend(_backend(settings, FakeClock()))
     cache = _cache(settings, l1, observed_l2)
     calls = 0
 
@@ -422,19 +435,19 @@ def test_l1_hit_avoids_l2() -> None:
         return [{'id': 7}]
 
     assert _read(cache, fetch) == [{'id': 7}]
-    lookups_after_fill = observed_l2._lookup_count
+    lookups_after_fill = observed_l2.lookup_count
     assert _read(cache, fetch) == [{'id': 7}]
 
     assert calls == 1
-    assert observed_l2._lookup_count == lookups_after_fill
+    assert observed_l2.lookup_count == lookups_after_fill
 
 
 def test_l1_promotion_expires_at_hierarchical_cap() -> None:
     settings = _settings()
-    l1_clock = _FakeClock()
-    l2_clock = _FakeClock()
-    l2 = _ObservedBackend(_backend(settings, l2_clock))
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l1_clock = FakeClock()
+    l2_clock = FakeClock()
+    l2 = ObservedBackend(_backend(settings, l2_clock))
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     cache = _cache(settings, _backend(settings, l1_clock), l2)
     calls = 0
 
@@ -445,20 +458,25 @@ def test_l1_promotion_expires_at_hierarchical_cap() -> None:
 
     assert _read(seed, fetch) == [{'id': 7}]
     assert _read(cache, fetch) == [{'id': 7}]
-    promoted_lookups = l2._lookup_count
-    l1_clock._advance(10)
+    promoted_lookups = l2.lookup_count
+    l1_clock.advance(10)
     assert _read(cache, fetch) == [{'id': 7}]
 
     assert calls == 1
-    assert l2._lookup_count == promoted_lookups + 1
+    assert l2.lookup_count == promoted_lookups + 1
 
 
-def test_l1_promotion_expires_at_shorter_l2_remaining_age() -> None:
+@pytest.mark.parametrize(
+    ('l1_start', 'l2_start'),
+    [(1_000.0, 1_000.0), (1_000_000_000.0, 10.0)],
+    ids=['aligned-host-clocks', 'skewed-host-clocks'],
+)
+def test_l1_promotion_expires_at_the_remaining_l2_age(l1_start: float, l2_start: float) -> None:
     settings = _settings()
-    l1_clock = _FakeClock()
-    l2_clock = _FakeClock()
-    l2 = _backend(settings, l2_clock)
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l1_clock = FakeClock(start=l1_start)
+    l2_clock = FakeClock(start=l2_start)
+    l2 = ObservedBackend(_backend(settings, l2_clock))
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     cache = _cache(settings, _backend(settings, l1_clock), l2)
     calls = 0
 
@@ -467,11 +485,16 @@ def test_l1_promotion_expires_at_shorter_l2_remaining_age() -> None:
         calls += 1
         return [{'call': calls}]
 
-    assert _read(seed, fetch) == [{'call': 1}]
-    l2_clock._advance(595)
+    assert seed.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=8) == [
+        {'call': 1}
+    ]
+    l2_clock.advance(2)
     assert _read(cache, fetch) == [{'call': 1}]
-    l1_clock._advance(5)
-    l2_clock._advance(5)
+    promoted_lookups = l2.lookup_count
+    assert _read(cache, fetch) == [{'call': 1}]
+    assert l2.lookup_count == promoted_lookups
+    l1_clock.advance(6)
+    l2_clock.advance(6)
     assert _read(cache, fetch) == [{'call': 2}]
     assert calls == 2
 
@@ -480,8 +503,8 @@ def test_l2_hit_decodes_once_before_l1_promotion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    l2 = _backend(settings, _FakeClock())
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l2 = _backend(settings, FakeClock())
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     assert _read(seed, lambda: {'items': [1]}) == {'items': [1]}
     original_backend_decode = local_module.decode_value
     original_core_decode = cache_common_module.decode_value
@@ -499,7 +522,7 @@ def test_l2_hit_decodes_once_before_l1_promotion(
 
     monkeypatch.setattr(local_module, 'decode_value', count_backend_decode)
     monkeypatch.setattr(cache_common_module, 'decode_value', count_core_decode)
-    cache = _cache(settings, _backend(settings, _FakeClock()), l2)
+    cache = _cache(settings, _backend(settings, FakeClock()), l2)
 
     promoted = cast('dict[str, list[int]]', _read(cache, lambda: {'items': [2]}))
 
@@ -511,21 +534,21 @@ def test_l2_hit_expiring_during_decode_fetches_without_promotion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    l2_clock = _FakeClock()
+    l2_clock = FakeClock()
     l2 = _backend(settings, l2_clock)
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     assert _read(seed, lambda: [{'id': 7}]) == [{'id': 7}]
-    l2_clock._advance(595)
+    l2_clock.advance(595)
     original_decode = local_module.decode_value
 
     def delayed_decode(payload: bytes) -> object:
         value = original_decode(payload)
-        l2_clock._advance(5)
+        l2_clock.advance(5)
         return value
 
     monkeypatch.setattr(local_module, 'decode_value', delayed_decode)
-    observed_l2 = _ObservedBackend(l2)
-    cache = _cache(settings, _backend(settings, _FakeClock()), observed_l2)
+    observed_l2 = ObservedBackend(l2)
+    cache = _cache(settings, _backend(settings, FakeClock()), observed_l2)
     calls = 0
 
     def fetch() -> object:
@@ -536,14 +559,14 @@ def test_l2_hit_expiring_during_decode_fetches_without_promotion(
     assert _read(cache, fetch) == [{'id': 8}]
     assert _read(cache, fetch) == [{'id': 8}]
     assert calls == 1
-    assert observed_l2._lookup_count == 2
+    assert observed_l2.lookup_count == 2
 
 
 def test_l2_hit_promotes_an_isolated_value_to_l1() -> None:
     settings = _settings()
-    l2 = _backend(settings, _FakeClock())
-    first = _cache(settings, _backend(settings, _FakeClock()), l2)
-    second = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l2 = _backend(settings, FakeClock())
+    first = _cache(settings, _backend(settings, FakeClock()), l2)
+    second = _cache(settings, _backend(settings, FakeClock()), l2)
     calls = 0
 
     def fetch() -> object:
@@ -562,8 +585,8 @@ def test_l2_hit_promotes_an_isolated_value_to_l1() -> None:
 
 def test_l2_invalidation_leaves_l1_usable_only_until_short_cap() -> None:
     settings = _settings()
-    l1_clock = _FakeClock()
-    l2 = _backend(settings, _FakeClock())
+    l1_clock = FakeClock()
+    l2 = _backend(settings, FakeClock())
     cache = _cache(settings, _backend(settings, l1_clock), l2)
     calls = 0
 
@@ -575,27 +598,31 @@ def test_l2_invalidation_leaves_l1_usable_only_until_short_cap() -> None:
     assert _read(cache, fetch) == [{'call': 1}]
     l2.change((GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),))
     assert _read(cache, fetch) == [{'call': 1}]
-    l1_clock._advance(10)
+    l1_clock.advance(10)
     assert _read(cache, fetch) == [{'call': 2}]
     assert calls == 2
 
 
 def test_malformed_l1_records_codec_failure_and_continues_to_l2() -> None:
     settings = _settings()
-    l1 = _backend(settings, _FakeClock())
-    l2 = _backend(settings, _FakeClock())
+    l1 = _backend(settings, FakeClock())
+    l2 = _backend(settings, FakeClock())
     private_payload = 'local-payload-private-detail'
-    _store_payload(l1, encode_value((private_payload, {'id': 1})), 10)
-    _store_payload(
-        l2,
-        encode_value(('sg-query-cache-result-v1', 0.0, 600.0, 0.01, [{'id': 7}])),
-        600,
+    store_payload(
+        l1, asset_call(), asset_plan(), encode_value((private_payload, {'id': 1})), age=10
     )
-    metrics = _RecordingMetrics()
+    store_payload(
+        l2,
+        asset_call(),
+        asset_plan(),
+        encode_value(('sg-query-cache-result-v1', 0.0, 600.0, 0.01, [{'id': 7}])),
+        age=600,
+    )
+    metrics = RecordingMetrics()
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
@@ -609,22 +636,24 @@ def test_malformed_l1_records_codec_failure_and_continues_to_l2() -> None:
 
     assert _read(cache, fetch) == [{'id': 7}]
     assert calls == 0
-    assert ('cache_bypass', {'reason': 'codec_failure'}) in metrics._increments
-    assert private_payload not in str(metrics._increments)
-    assert 'hierarchy-response-private-detail' not in str(metrics._increments)
+    assert ('cache_bypass', {'reason': 'codec_failure'}) in metrics.increments
+    assert private_payload not in str(metrics.increments)
+    assert 'hierarchy-response-private-detail' not in str(metrics.increments)
 
 
 def test_malformed_l2_fetches_directly_without_l1_or_l2_population() -> None:
     settings = _settings()
-    l1 = _backend(settings, _FakeClock())
-    l2 = _backend(settings, _FakeClock())
+    l1 = _backend(settings, FakeClock())
+    l2 = _backend(settings, FakeClock())
     private_payload = 'hierarchy-shared-payload-private-detail'
-    _store_payload(l2, encode_value((private_payload, {'id': 1})), 600)
-    metrics = _RecordingMetrics()
+    store_payload(
+        l2, asset_call(), asset_plan(), encode_value((private_payload, {'id': 1})), age=600
+    )
+    metrics = RecordingMetrics()
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
@@ -639,37 +668,37 @@ def test_malformed_l2_fetches_directly_without_l1_or_l2_population() -> None:
     assert _read(cache, fetch) == [{'hierarchy-shared-response-private-detail': 1}]
     assert _read(cache, fetch) == [{'hierarchy-shared-response-private-detail': 2}]
     assert calls == 2
-    assert ('cache_bypass', {'reason': 'codec_failure'}) in metrics._increments
-    assert private_payload not in str(metrics._increments)
-    assert 'hierarchy-shared-response-private-detail' not in str(metrics._increments)
+    assert ('cache_bypass', {'reason': 'codec_failure'}) in metrics.increments
+    assert private_payload not in str(metrics.increments)
+    assert 'hierarchy-shared-response-private-detail' not in str(metrics.increments)
 
 
 def test_memo_is_keyed_by_parser_identity() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     cache = _cache(settings, _backend(settings, clock), _backend(settings, clock))
 
     assert cache.read_parsed(
-        _call(),
-        _plan(),
+        asset_call(),
+        asset_plan(),
         lambda: {'v': 1},
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         _parse,
     ) == ('parsed', {'v': 1})
     assert cache.read_parsed(
-        _call(),
-        _plan(),
+        asset_call(),
+        asset_plan(),
         lambda: {'v': 2},
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         _identity_parse,
     ) == {'v': 1}
 
 
 def test_memo_is_not_used_while_a_layer_has_unacknowledged_changes() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     l1 = _backend(settings, clock)
-    l2 = _FencedBackend(_backend(settings, clock), failures=1)
+    l2 = FencedBackend(_backend(settings, clock), failures=1)
     cache = _cache(settings, l1, l2)
     calls = 0
 
@@ -688,7 +717,7 @@ def test_memo_is_not_used_while_a_layer_has_unacknowledged_changes() -> None:
 
 def test_parse_failure_refetches_once_and_publishes_the_memo() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     cache = _cache(settings, _backend(settings, clock), _backend(settings, clock))
     calls = 0
 
@@ -703,17 +732,17 @@ def test_parse_failure_refetches_once_and_publishes_the_memo() -> None:
         return ('parsed', value)
 
     assert cache.read_parsed(
-        _call(),
-        _plan(),
+        asset_call(),
+        asset_plan(),
         fetch,
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         parse,
     ) == ('parsed', b'good')
     assert cache.read_parsed(
-        _call(),
-        _plan(),
+        asset_call(),
+        asset_plan(),
         fetch,
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
         parse,
     ) == ('parsed', b'good')
     assert calls == 2
@@ -723,9 +752,9 @@ def test_parsed_read_rejects_shared_revalidation_crossing_a_retained_fence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    l2 = _BlockingBackend(_backend(settings, clock), failures=1)
+    l2 = BlockingBackend(_backend(settings, clock), failures=1)
     cache = _cache(settings, _backend(settings, clock), l2)
     calls = 0
 
@@ -735,15 +764,15 @@ def test_parsed_read_rejects_shared_revalidation_crossing_a_retained_fence(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    clock._advance(11)
-    l2._arm('resolve')
+    clock.advance(11)
+    l2.arm('resolve')
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_parsed_read, cache, fetch)
-        assert l2._entered.wait(timeout=2)
+        assert l2.entered.wait(timeout=2)
         acknowledged = cache.invalidate(
             (GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),)
         )
-        l2._release_block.set()
+        l2.release_block.set()
         value = future.result(timeout=2)
 
     assert acknowledged is False
@@ -753,9 +782,9 @@ def test_parsed_read_rejects_shared_revalidation_crossing_a_retained_fence(
 
 def test_parsed_read_uses_l2_after_preliminary_l1_resolution_failure() -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     l2 = _backend(settings, clock)
-    _store_payload(l2, _encoded_result(), 5)
+    store_payload(l2, asset_call(), asset_plan(), _encoded_result(), age=5)
     l1 = ResolveFailureBackend(_backend(settings, clock), failures=2)
     cache = _cache(settings, l1, l2)
     calls = 0
@@ -773,9 +802,9 @@ def test_parsed_view_is_reused_and_revalidated_without_lookups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    l2 = _ObservedBackend(_backend(settings, clock))
+    l2 = ObservedBackend(_backend(settings, clock))
     cache = _cache(settings, _backend(settings, clock), l2)
     calls = 0
 
@@ -785,16 +814,16 @@ def test_parsed_view_is_reused_and_revalidated_without_lookups(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    lookups = l2._lookup_count
+    lookups = l2.lookup_count
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert l2._lookup_count == lookups
-    clock._advance(11)
+    assert l2.lookup_count == lookups
+    clock.advance(11)
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert l2._lookup_count == lookups
+    assert l2.lookup_count == lookups
     assert calls == 1
 
     l2.change((GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),))
-    clock._advance(11)
+    clock.advance(11)
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 2})
     assert calls == 2
 
@@ -803,9 +832,10 @@ def test_promoted_hit_keeps_its_origin_age_for_a_shorter_caller_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    l2 = _backend(settings, clock)
+    l2 = ObservedBackend(_backend(settings, clock))
+    seed = _cache(settings, _backend(settings, clock), l2)
     cache = _cache(settings, _backend(settings, clock), l2)
     calls = 0
 
@@ -814,12 +844,17 @@ def test_promoted_hit_keeps_its_origin_age_for_a_shorter_caller_age(
         calls += 1
         return [{'call': calls}]
 
+    assert _read(seed, fetch) == [{'call': 1}]
+    clock.advance(3)
     assert _read(cache, fetch) == [{'call': 1}]
-    clock._advance(11)
+    promoted_lookups = l2.lookup_count
     assert _read(cache, fetch) == [{'call': 1}]
-    clock._advance(1)
+    assert l2.lookup_count == promoted_lookups
+    clock.advance(1)
 
-    assert cache.read(_call(), _plan(), fetch, _CLIENT_OPTIONS, per_call_age=2.0) == [{'call': 2}]
+    assert cache.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=2.0) == [
+        {'call': 2}
+    ]
     assert calls == 2
 
 
@@ -827,15 +862,15 @@ def test_promotion_bound_failure_reports_its_own_bypass_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     l2 = _backend(settings, clock)
     l1 = _backend(settings, clock)
-    _store_payload(l2, _encoded_result(), 5)
-    metrics = _RecordingMetrics()
+    store_payload(l2, asset_call(), asset_plan(), _encoded_result(), age=5)
+    metrics = RecordingMetrics()
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
@@ -847,31 +882,31 @@ def test_promotion_bound_failure_reports_its_own_bypass_reason(
     monkeypatch.setattr(cache_module, 'encode_result', reject_bound)
 
     assert _read(cache, lambda: [{'id': 8}]) == [{'id': 7}]
-    assert ('cache_bypass', {'reason': 'result_too_deep'}) in metrics._increments
-    assert ('cache_bypass', {'reason': 'codec_failure'}) not in metrics._increments
+    assert ('cache_bypass', {'reason': 'result_too_deep'}) in metrics.increments
+    assert ('cache_bypass', {'reason': 'codec_failure'}) not in metrics.increments
 
 
 def test_promotion_deadline_is_anchored_before_metrics_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
     l2 = _backend(settings, clock)
     l1 = _backend(settings, clock)
-    _store_payload(l2, _encoded_result(), 5)
+    store_payload(l2, asset_call(), asset_plan(), _encoded_result(), age=5)
     metrics = _SlowMetrics(clock, 3)
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
     )
 
     assert _read(cache, lambda: [{'id': 8}]) == [{'id': 7}]
-    clock._advance(4)
+    clock.advance(4)
 
     assert _read(cache, lambda: [{'id': 8}]) == [{'id': 8}]
 
@@ -881,34 +916,34 @@ def test_promotion_over_configured_byte_limit_records_size_reason() -> None:
         l2=L2Settings(enabled=True),
         limits=LimitSettings(max_serialized_result_bytes=100),
     )
-    clock = _FakeClock()
+    clock = FakeClock()
     l2 = _backend(_settings(), clock)
     l1 = _backend(settings, clock)
-    _store_payload(l2, _encoded_result(), 5)
-    metrics = _RecordingMetrics()
+    store_payload(l2, asset_call(), asset_plan(), _encoded_result(), age=5)
+    metrics = RecordingMetrics()
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=l1,
         l2=l2,
         metrics=metrics,
     )
 
     assert _read(cache, lambda: [{'id': 8}]) == [{'id': 7}]
-    assert ('cache_bypass', {'reason': 'result_too_large_bytes'}) in metrics._increments
-    assert ('cache_bypass', {'reason': 'codec_failure'}) not in metrics._increments
+    assert ('cache_bypass', {'reason': 'result_too_large_bytes'}) in metrics.increments
+    assert ('cache_bypass', {'reason': 'codec_failure'}) not in metrics.increments
 
 
 def test_promotion_uses_original_l1_vector() -> None:
     settings = _settings()
-    l2 = _backend(settings, _FakeClock())
-    seed = _cache(settings, _backend(settings, _FakeClock()), l2)
+    l2 = _backend(settings, FakeClock())
+    seed = _cache(settings, _backend(settings, FakeClock()), l2)
     assert _read(seed, lambda: [{'id': 7}]) == [{'id': 7}]
 
-    l1 = _backend(settings, _FakeClock())
+    l1 = _backend(settings, FakeClock())
     change = (GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),)
-    observed_l2 = _ObservedBackend(l2, on_lookup=lambda: l1.change(change))
+    observed_l2 = ObservedBackend(l2, on_lookup=lambda: l1.change(change))
     cache = _cache(settings, l1, observed_l2)
     calls = 0
 
@@ -921,21 +956,21 @@ def test_promotion_uses_original_l1_vector() -> None:
     assert _read(cache, fetch) == [{'id': 7}]
 
     assert calls == 0
-    assert observed_l2._lookup_count == 2
+    assert observed_l2.lookup_count == 2
 
 
 def test_revalidation_anchors_first_deadline_before_metrics_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    l2 = _ObservedBackend(_backend(settings, clock))
+    l2 = ObservedBackend(_backend(settings, clock))
     metrics = _ArmedMetrics(clock)
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=_backend(settings, clock),
         l2=l2,
         metrics=metrics,
@@ -948,23 +983,23 @@ def test_revalidation_anchors_first_deadline_before_metrics_run(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    clock._advance(20)
-    metrics._arm(
+    clock.advance(20)
+    metrics.arm(
         'observe',
         'cache_ttl_selection',
         {'layer': 'hierarchical_l1'},
         advance=3,
     )
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    resolves_after_revalidation = len(l2._resolved)
+    resolves_after_revalidation = len(l2.resolved)
 
-    clock._advance(6.9)
+    clock.advance(6.9)
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert len(l2._resolved) == resolves_after_revalidation
+    assert len(l2.resolved) == resolves_after_revalidation
 
-    clock._advance(0.2)
+    clock.advance(0.2)
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert len(l2._resolved) == resolves_after_revalidation + 1
+    assert len(l2.resolved) == resolves_after_revalidation + 1
     assert calls == 1
 
 
@@ -979,7 +1014,7 @@ def test_revalidation_rechecks_age_after_shared_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
     l2 = _AdvancingResolveBackend(
         _backend(settings, clock),
@@ -996,7 +1031,7 @@ def test_revalidation_rechecks_age_after_shared_resolution(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    clock._advance(age_before_resolve)
+    clock.advance(age_before_resolve)
 
     if maximum_age is None:
         result = _parsed_read(cache, fetch)
@@ -1012,13 +1047,13 @@ def test_shared_fill_deadline_includes_commit_and_release_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    local_clock = _FakeClock()
+    local_clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', local_clock)
-    observed_l2 = _ObservedBackend(
-        _backend(settings, _FakeClock()),
-        on_commit=lambda: local_clock._advance(6),
+    observed_l2 = ObservedBackend(
+        _backend(settings, FakeClock()),
+        on_commit=lambda: local_clock.advance(6),
     )
-    cache = _cache(settings, _backend(settings, _FakeClock()), observed_l2)
+    cache = _cache(settings, _backend(settings, FakeClock()), observed_l2)
     calls = 0
 
     def fetch() -> object:
@@ -1026,25 +1061,29 @@ def test_shared_fill_deadline_includes_commit_and_release_time(
         calls += 1
         return [{'id': 7}]
 
-    assert cache.read(_call(), _plan(), fetch, _CLIENT_OPTIONS, per_call_age=5) == [{'id': 7}]
-    lookups_after_fill = observed_l2._lookup_count
-    assert cache.read(_call(), _plan(), fetch, _CLIENT_OPTIONS, per_call_age=5) == [{'id': 7}]
+    assert cache.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=5) == [
+        {'id': 7}
+    ]
+    lookups_after_fill = observed_l2.lookup_count
+    assert cache.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=5) == [
+        {'id': 7}
+    ]
     assert calls == 1
-    assert observed_l2._lookup_count == lookups_after_fill + 1
+    assert observed_l2.lookup_count == lookups_after_fill + 1
 
 
 def test_slow_reuse_telemetry_does_not_move_the_first_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    l2 = _ObservedBackend(_backend(settings, clock))
+    l2 = ObservedBackend(_backend(settings, clock))
     metrics = _ArmedMetrics(clock)
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=_backend(settings, clock),
         l2=l2,
         metrics=metrics,
@@ -1057,9 +1096,9 @@ def test_slow_reuse_telemetry_does_not_move_the_first_deadline(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    resolves_after_acquisition = len(l2._resolved)
-    clock._advance(9.9)
-    metrics._arm(
+    resolves_after_acquisition = len(l2.resolved)
+    clock.advance(9.9)
+    metrics.arm(
         'increment',
         'cache_schema_view',
         {'outcome': 'reuse'},
@@ -1067,9 +1106,9 @@ def test_slow_reuse_telemetry_does_not_move_the_first_deadline(
     )
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert len(l2._resolved) == resolves_after_acquisition
+    assert len(l2.resolved) == resolves_after_acquisition
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    assert len(l2._resolved) == resolves_after_acquisition + 1
+    assert len(l2.resolved) == resolves_after_acquisition + 1
     assert calls == 1
 
 
@@ -1084,13 +1123,13 @@ def test_slow_telemetry_after_a_fresh_decision_changes_only_the_next_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
     metrics = _ArmedMetrics(clock)
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=_backend(settings, clock),
         l2=_backend(settings, clock),
         metrics=metrics,
@@ -1103,8 +1142,8 @@ def test_slow_telemetry_after_a_fresh_decision_changes_only_the_next_call(
         return {'call': calls}
 
     assert _parsed_read(cache, fetch) == ('parsed', {'call': 1})
-    clock._advance(age_before_revalidation)
-    metrics._arm(
+    clock.advance(age_before_revalidation)
+    metrics.arm(
         'increment',
         'cache_schema_view',
         {'outcome': 'revalidated'},
@@ -1133,12 +1172,12 @@ def test_shared_commit_must_succeed_before_l1_promotion(
         ('sg-query-cache-result-v1', 0.0, 600.0, 0.0, [{'version': 'new'}])
     )
     observed_l2 = _ReleaseTrackingBackend(
-        _backend(settings, _FakeClock()),
+        _backend(settings, FakeClock()),
         commit_outcome=commit_outcome,
         replacement_payload=replacement_payload,
     )
-    metrics = _RecordingMetrics()
-    cache = _cache(settings, _backend(settings, _FakeClock()), observed_l2, metrics=metrics)
+    metrics = RecordingMetrics()
+    cache = _cache(settings, _backend(settings, FakeClock()), observed_l2, metrics=metrics)
     calls = 0
 
     def fetch() -> object:
@@ -1155,8 +1194,8 @@ def test_shared_commit_must_succeed_before_l1_promotion(
 
     assert _read(cache, fetch, decide) == [{'version': 'rejected'}]
     if commit_outcome == 'fail':
-        assert ('cache_bypass', {'reason': 'backend_failure'}) in metrics._increments
-        assert len(observed_l2._release_attempts) == 1
+        assert ('cache_bypass', {'reason': 'backend_failure'}) in metrics.increments
+        assert len(observed_l2.release_attempts) == 1
     assert _read(cache, fetch) == [{'version': 'new'}]
     assert calls == 1
     assert decisions == 1
@@ -1165,7 +1204,7 @@ def test_shared_commit_must_succeed_before_l1_promotion(
 @pytest.mark.parametrize('storable', [True, False])
 def test_concurrent_parsed_reads_share_one_fetch(storable: bool) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     l1 = _backend(settings, clock)
     cache = _cache(settings, l1, _backend(settings, clock))
     fetch_release = Event()
@@ -1194,25 +1233,27 @@ def test_concurrent_parsed_reads_share_one_fetch(storable: bool) -> None:
     base_key = KeyBuilder.base_key(
         _SITE,
         Identity('script', 'studio', 'render'),
-        _CLIENT_OPTIONS,
-        _call(),
+        CLIENT_OPTIONS,
+        asset_call(),
     )
     flight_key = 'memo:' + KeyBuilder.qualified_key(
         base_key,
-        l1.resolve(_plan().tags),
+        l1.resolve(asset_plan().tags),
         'result',
     )
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
-            pool.submit(cache.read_parsed, _call(), _plan(), fetch, _CLIENT_OPTIONS, parse)
+            pool.submit(
+                cache.read_parsed, asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse
+            )
             for _ in range(4)
         ]
         try:
             deadline = monotonic() + 2
             while monotonic() < deadline:
                 flight = cache._flights.get(flight_key)
-                if flight is not None and flight._participants == 4:
+                if flight is not None and flight.participants == 4:
                     break
                 sleep(0.005)
             else:
@@ -1236,14 +1277,14 @@ def test_stored_malformed_view_refetches_once_and_records_all_view_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
-    metrics = _RecordingMetrics()
+    metrics = RecordingMetrics()
     identity = Identity('script', 'studio', 'render')
     hierarchy = QueryCache(
         settings,
         identity,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=_backend(settings, clock),
         l2=_backend(settings, clock),
         metrics=metrics,
@@ -1251,21 +1292,23 @@ def test_stored_malformed_view_refetches_once_and_records_all_view_outcomes(
 
     assert _parsed_read(hierarchy, lambda: {'schema': 1}) == ('parsed', {'schema': 1})
     assert _parsed_read(hierarchy, lambda: {'schema': 2}) == ('parsed', {'schema': 1})
-    clock._advance(11)
+    clock.advance(11)
     assert _parsed_read(hierarchy, lambda: {'schema': 3}) == ('parsed', {'schema': 1})
 
     local_settings = CacheSettings()
     malformed_backend = _backend(local_settings, clock)
-    _store_payload(
+    store_payload(
         malformed_backend,
+        asset_call(),
+        asset_plan(),
         encode_value(('sg-query-cache-result-v1', 0.0, 30.0, 0.0, b'not-a-view')),
-        30,
+        age=30,
     )
-    clock._advance(8)
+    clock.advance(8)
     local = QueryCache(
         local_settings,
         identity,
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=malformed_backend,
         metrics=metrics,
     )
@@ -1281,25 +1324,25 @@ def test_stored_malformed_view_refetches_once_and_records_all_view_outcomes(
             raise ValueError('malformed')
         return ('parsed', value)
 
-    assert local.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, parse) == (
+    assert local.read_parsed(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse) == (
         'parsed',
         b'good',
     )
     with local.policy(maximum_age=5):
-        assert local.read_parsed(_call(), _plan(), fetch, _CLIENT_OPTIONS, parse) == (
+        assert local.read_parsed(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, parse) == (
             'parsed',
             b'good',
         )
     assert calls == 1
     assert {
-        labels['outcome'] for name, labels in metrics._increments if name == 'cache_schema_view'
+        labels['outcome'] for name, labels in metrics.increments if name == 'cache_schema_view'
     } == {'reuse', 'revalidated', 'rebuild', 'malformed', 'refetch'}
 
 
 def test_ttl_only_scope_cannot_downgrade_a_schema_plan() -> None:
     settings = _settings()
-    clock = _FakeClock()
-    l2 = _ObservedBackend(_backend(settings, clock))
+    clock = FakeClock()
+    l2 = ObservedBackend(_backend(settings, clock))
     cache = _cache(settings, _backend(settings, clock), l2)
     schema_plan = DependencyPlan(
         'schema',
@@ -1313,27 +1356,27 @@ def test_ttl_only_scope_cannot_downgrade_a_schema_plan() -> None:
 
     with cache.policy(mode='ttl_only'):
         cache.read_parsed(
-            _call(),
+            asset_call(),
             schema_plan,
             lambda: {'schema': 1},
-            _CLIENT_OPTIONS,
+            CLIENT_OPTIONS,
             _identity_parse,
         )
 
-    assert DependencyTag.schema(_SITE) in l2._resolved[-1]
+    assert DependencyTag.schema(_SITE) in l2.resolved[-1]
     with cache.bypass():
         assert cache.read_parsed(
-            _call(),
+            asset_call(),
             schema_plan,
             lambda: {'schema': 2},
-            _CLIENT_OPTIONS,
+            CLIENT_OPTIONS,
             _identity_parse,
         ) == {'schema': 2}
 
 
 def test_uncommitted_parsed_view_is_still_memoized(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings()
-    clock = _FakeClock()
+    clock = FakeClock()
     monkeypatch.setattr(cache_module, 'monotonic', clock)
     cache = _cache(settings, _backend(settings, clock), _backend(settings, clock))
     calls = 0
@@ -1346,9 +1389,9 @@ def test_uncommitted_parsed_view_is_still_memoized(monkeypatch: pytest.MonkeyPat
 
     assert _parsed_read(cache, fetch) == ('parsed', oversized)
     assert _parsed_read(cache, fetch) == ('parsed', oversized)
-    clock._advance(11)
+    clock.advance(11)
     assert _parsed_read(cache, fetch) == ('parsed', oversized)
-    clock._advance(1_800)
+    clock.advance(1_800)
     assert _parsed_read(cache, fetch) == ('parsed', oversized)
     assert calls == 2
 
@@ -1357,8 +1400,8 @@ def test_wrapper_invalidation_immediately_redirects_l1() -> None:
     settings = _settings()
     cache = _cache(
         settings,
-        _backend(settings, _FakeClock()),
-        _backend(settings, _FakeClock()),
+        _backend(settings, FakeClock()),
+        _backend(settings, FakeClock()),
     )
     calls = 0
 

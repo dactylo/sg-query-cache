@@ -7,6 +7,7 @@ from typing import Literal, TypeAlias, cast
 
 from sg_query_cache._validation import (
     require_nonempty_string,
+    require_positive_int,
     require_positive_number,
 )
 
@@ -381,7 +382,7 @@ class GenerationVector:
                 raise TypeError('each generation-vector entry must be a two-item tuple')
             tag, token = parts
             tags.append(_require_dependency_tag(tag, 'generation-vector tag'))
-            _require_positive_integer(token, 'generation token')
+            require_positive_int(token, 'generation token')
         _reject_duplicate_tags(tuple(tags), 'generation vector')
 
 
@@ -421,7 +422,7 @@ class Identity:
         require_nonempty_string(self.issuer, 'identity issuer')
         require_nonempty_string(self.namespace, 'identity namespace')
         if self.entity_id is not None:
-            _require_positive_integer(self.entity_id, 'identity entity ID')
+            require_positive_int(self.entity_id, 'identity entity ID')
         if self.kind == 'human' and self.entity_id is None:
             raise ValueError('human identity requires a positive SG entity ID')
         if self.epoch is not None:
@@ -464,14 +465,6 @@ def _require_exact_value(value: object) -> None:
             _require_exact_value(item)
         return
     raise TypeError('exact-call values must use immutable closed value forms')
-
-
-def _require_positive_integer(value: object, owner: str) -> None:
-    """Require a positive non-boolean integer."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f'{owner} must be a positive integer')
-    if value <= 0:
-        raise ValueError(f'{owner} must be a positive integer')
 
 
 def _require_tag_kind(value: object) -> TagKind:
@@ -543,4 +536,4 @@ def _require_dependency_tag_shape(kind: object, components: object) -> None:
         if expected_type is str:
             require_nonempty_string(value, 'dependency tag component')
         else:
-            _require_positive_integer(value, 'dependency tag component')
+            require_positive_int(value, 'dependency tag component')

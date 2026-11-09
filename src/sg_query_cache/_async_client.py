@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Wrap native asynchronous SG calls with exact caching and conservative fences."""
 
 from __future__ import annotations
@@ -9,7 +6,6 @@ from asyncio import CancelledError, current_task, sleep
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from importlib import import_module
 from os import environ as process_environ
 from time import monotonic
@@ -17,45 +13,46 @@ from typing import TYPE_CHECKING, Any, Self, TypeAlias, cast
 
 from sg_query_cache._async_cache import AsyncQueryCache, client_binding
 from sg_query_cache._async_local import AsyncLocalBackend
+from sg_query_cache._backend import BackendUnavailable
 from sg_query_cache._client_common import (
-    IMPLICIT_UPLOAD_FIELDS,
     ClientContext,
     EntityPlanContext,
-    batch_changes,
-    batch_has_create,
-    batch_post_changes,
-    bound_call,
+    EntityRead,
+    WritePlan,
+    batch_write_plan,
     client_options,
-    create_changes,
-    create_post_changes,
+    create_write_plan,
     entity_calls,
     entity_read_plan,
     exception_types,
-    freeze,
-    key_freeze,
     lifecycle_changes,
-    opaque,
     parse_schema_view,
+    population_callback,
+    require_context_namespace,
     schema_changes,
+    schema_entity_read_call,
+    schema_field_read_call,
     schema_plan,
+    schema_read_call,
+    schema_view_call,
+    site_call,
     site_changes,
     ttl_only_plan,
     unconditional_entity_plan,
-    update_changes,
+    update_write_plan,
+    work_schedule_read_call,
 )
 from sg_query_cache._dependencies import DependencyAnalyzer, SchemaView
 from sg_query_cache._metrics import MetricsSink, NullMetrics
 from sg_query_cache._model import (
     DependencyPlan,
-    DependencyTag,
     ExactCall,
-    GenerationChange,
     Identity,
 )
-from sg_query_cache._urls import AgeDecision, cap_response_age
 
 if TYPE_CHECKING:
-    from contextlib import AbstractAsyncContextManager, AbstractContextManager
+    from contextlib import AbstractContextManager
+    from datetime import datetime
 
     from sg_query_cache._async_backend import AsyncCacheBackend
     from sg_query_cache._async_support import OperationToken
@@ -64,40 +61,16 @@ if TYPE_CHECKING:
     from sg_query_cache.valkey_async import AsyncValkeyBackend
 
 _AsyncCall: TypeAlias = Callable[[], Awaitable[object]]
-_PostChanges: TypeAlias = Callable[[object], tuple[GenerationChange, ...]]
 
 
 @dataclass(frozen=True, slots=True)
 class _ReadRequest:
     """Keep one planned wrapper read compact across its async cache boundary."""
 
-    _call: ExactCall
-    _plan: DependencyPlan
-    _context: ClientContext
-    _returned_fields: Mapping[str, str] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class _OpenRequest:
-    """Keep the prescribed owning-factory inputs compact during construction."""
-
-    _client: object
-    _settings: CacheSettings
-    _identity: Identity
-    _context: ClientContext
-    _metrics: MetricsSink | None
-    _environ: Mapping[str, object] | None
-    _indeterminate_write_exceptions: tuple[type[Exception], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _WriteRequest:
-    """Keep one write's shared fence policy separate from its native dispatch."""
-
-    _changes: tuple[GenerationChange, ...]
-    _post_changes: _PostChanges | None = None
-    _indeterminate_changes: tuple[GenerationChange, ...] | None = None
-    _repeat_on_exception: bool = False
+    call: ExactCall
+    plan: DependencyPlan
+    context: ClientContext
+    returned_fields: Mapping[str, str] | None = None
 
 
 class AsyncCachedShotgun:
@@ -153,8 +126,7 @@ class AsyncCachedShotgun:
             ValueError: Shared cache and context namespaces disagree.
         """
         settings, identity = client_binding(cache)
-        if settings.l2.enabled and context.site_namespace != settings.site_namespace:
-            raise ValueError('shared cache context must use the configured site namespace')
+        require_context_namespace(settings, context)
         self._analyzer = DependencyAnalyzer(
             enable_additional_filter_presets=settings.enable_additional_filter_presets
         )
@@ -166,7 +138,15 @@ class AsyncCachedShotgun:
         self._settings = settings
 
     async def __aenter__(self) -> Self:
-        """Enter a non-owning wrapper context after validating cache admission."""
+        """Enter a non-owning wrapper context after validating cache admission.
+
+        Returns:
+            This wrapper without acquiring ownership of the cache or client.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+        """
         with self._cache.admit():
             return self
 
@@ -189,30 +169,13 @@ class AsyncCachedShotgun:
         token: OperationToken,
     ) -> object:
         """Execute one exact read and safely apply response-derived age caps."""
-        options = client_options(request._context, request._call)
-        exact_call = ExactCall(
-            request._call.method,
-            (*request._call.arguments, ('site_url', request._context.site_url)),
-        )
-        population_decision = None
-        if request._returned_fields and {'image', 'url'} & set(request._returned_fields.values()):
-
-            def decide(value: object) -> AgeDecision:
-                return cap_response_age(
-                    value,
-                    cast('Mapping[str, str]', request._returned_fields),
-                    datetime.now(tz=UTC),
-                    self._settings,
-                )
-
-            population_decision = decide
         return await self._cache.read_admitted(
-            exact_call,
-            request._plan,
+            site_call(request.call, request.context),
+            request.plan,
             fetch,
-            options,
+            client_options(request.context, request.call),
             token=token,
-            _population_decision=population_decision,
+            _population_decision=population_callback(request.returned_fields, self._settings),
         )
 
     async def _read_direct(
@@ -221,12 +184,14 @@ class AsyncCachedShotgun:
         fetch: _AsyncCall,
         context: ClientContext,
         token: OperationToken,
+        *,
+        reason: str = 'unsupported_argument',
     ) -> object:
-        """Bypass the cache for a call whose arguments cannot be normalized."""
+        """Bypass the cache, without building a call key, for one stated reason."""
         call = ExactCall(method, ())
         return await self._cache.read_admitted(
             call,
-            DependencyPlan('bypass', (), 'unsupported_argument'),
+            DependencyPlan('bypass', (), reason),
             fetch,
             client_options(context, call),
             token=token,
@@ -248,9 +213,7 @@ class AsyncCachedShotgun:
         async def fetch() -> object:
             return await method(project_entity)
 
-        call = bound_call(
-            lambda: ExactCall('schema_read', (('project_entity', key_freeze(project_entity)),))
-        )
+        call = schema_read_call(project_entity)
         if call is None:
             return await self._read_direct('schema_read', fetch, context, token)
         return await self._read(
@@ -260,10 +223,7 @@ class AsyncCachedShotgun:
     async def _schema_view(self, context: ClientContext, token: OperationToken) -> SchemaView:
         """Load the identity-scoped compact schema view through the parsed memo."""
         method = cast('Any', self._client).schema_read
-        call = ExactCall(
-            'schema_view',
-            (('project_entity', None), ('site_url', context.site_url)),
-        )
+        call = schema_view_call(context)
 
         async def fetch() -> object:
             return SchemaView.from_api_response(await method(None)).to_compact()
@@ -295,39 +255,71 @@ class AsyncCachedShotgun:
 
     async def _write_with_fence(
         self,
-        request: _WriteRequest,
+        plan: WritePlan,
         call: _AsyncCall,
         token: OperationToken,
     ) -> object:
         """Fence one write before dispatch and after nondefinite outcomes."""
-        await self._cache.invalidate_admitted(request._changes, token=token)
+        await self._cache.invalidate_admitted(plan.changes, token=token)
         await sleep(0)
         try:
             value = await call()
         except CancelledError:
             with suppress(CancelledError):
                 await self._cache.invalidate_admitted(
-                    request._indeterminate_changes or request._changes,
+                    plan.indeterminate_changes or plan.changes,
                     token=token,
                 )
             raise
         except Exception as error:
-            if request._repeat_on_exception or isinstance(
+            if plan.repeat_on_exception or isinstance(
                 error,
                 self._indeterminate_write_exceptions,
             ):
                 await self._cache.invalidate_admitted(
-                    request._indeterminate_changes or request._changes,
+                    plan.indeterminate_changes or plan.changes,
                     token=token,
                 )
             raise
         await self._cache.invalidate_admitted(
-            request._post_changes(value)
-            if request._post_changes is not None
-            else request._changes,
+            plan.post_changes(value) if plan.post_changes is not None else plan.changes,
             token=token,
         )
         return value
+
+    def bypass(self) -> AbstractContextManager[None]:
+        """Bypass reads and population within the current task-local scope."""
+        return self._cache.bypass()
+
+    @property
+    def context(self) -> ClientContext:
+        """Return the immutable context used by subsequent operations."""
+        return self._context
+
+    async def _entity_read(
+        self, read: EntityRead, fetch: _AsyncCall, token: OperationToken
+    ) -> object:
+        """Plan and read one `find` or `find_one`, reading directly when unnormalizable."""
+        context = self.context
+        analysis_call, call = entity_calls(read)
+        if analysis_call is None or call is None:
+            return await self._read_direct(read.method, fetch, context, token)
+        plan = unconditional_entity_plan(
+            self._identity(), self._settings, read.entity_type, lambda: self._cache.bypass_active
+        )
+        returned_fields = None
+        if plan is None:
+            schema = await self._schema_view_or_empty(context, token)
+            plan, returned_fields = entity_read_plan(
+                analysis_call,
+                schema,
+                read.entity_type,
+                read.fields,
+                EntityPlanContext(
+                    self._analyzer, self._identity(), self._settings, context.site_namespace
+                ),
+            )
+        return await self._read(_ReadRequest(call, plan, context, returned_fields), fetch, token)
 
     async def activity_stream_read(  # noqa: PLR0913, PLR0917 - exact official SG signature
         self,
@@ -338,7 +330,22 @@ class AsyncCachedShotgun:
         max_id: int | None = None,
         limit: int | None = None,
     ) -> dict[str, object]:
-        """Always read an activity stream directly."""
+        """Always read an activity stream directly.
+
+        Bypass cache lookup and population because this composite response has
+        no proven URL lifetime for caching.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.activity_stream_read`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).activity_stream_read
@@ -346,48 +353,57 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(entity_type, entity_id, entity_fields, min_id, max_id, limit)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'activity_stream_read',
-                    (
-                        ('entity_type', entity_type),
-                        ('entity_id', entity_id),
-                        ('entity_fields', opaque(entity_fields)),
-                        ('min_id', min_id),
-                        ('max_id', max_id),
-                        ('limit', limit),
-                    ),
-                )
-            )
-            if call is None:
-                return cast(
-                    'dict[str, object]',
-                    await self._read_direct('activity_stream_read', fetch, context, token),
-                )
             return cast(
                 'dict[str, object]',
-                await self._read(
-                    _ReadRequest(
-                        call,
-                        self._ttl_only_plan('activity_stream_read', context),
-                        context,
-                    ),
-                    fetch,
-                    token,
+                await self._read_direct(
+                    'activity_stream_read', fetch, context, token, reason='composite_url_unproven'
                 ),
             )
 
-    def bypass(self) -> AbstractContextManager[None]:
-        """Bypass reads and population within the current task-local scope."""
-        return self._cache.bypass()
+    async def batch(self, requests: list[dict[str, object]]) -> list[dict[str, object] | bool]:
+        """Execute one ordered batch behind its complete conservative fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Writes containing implicit uploads use a site-wide fence and repeat it
+        after other ordinary failures as well.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.batch`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
+        with self._cache.admit() as token:
+            method = cast('Any', self._client).batch
+            return cast(
+                'list[dict[str, object] | bool]',
+                await self._write_with_fence(
+                    batch_write_plan(self.context.site_namespace, requests),
+                    lambda: method(requests),
+                    token,
+                ),
+            )
 
     def cache_policy(
         self,
         mode: PolicyMode | None = None,
         maximum_age: float | None = None,
+        *,
+        maximum_age_seconds: float | None = None,
     ) -> AbstractContextManager[None]:
         """Apply one validated task-local cache policy scope.
 
+        Passing non-`None` values for both age spellings raises `TypeError`.
         Entering the returned context validates its arguments. Nonfinite,
         boolean, or nonnumeric ages raise `TypeError`; unsupported modes or
         nonpositive ages raise `ValueError`. Child tasks inherit the scope
@@ -396,64 +412,18 @@ class AsyncCachedShotgun:
         Args:
             mode: Optional conservative downgrade to event-aware, TTL-only, or
                 bypass.
-            maximum_age: Optional positive age in seconds, combined by minimum
-                with all active scopes and per-call ages. The selected explicit
-                age replaces configured ages before safety caps are applied.
+            maximum_age: Positional or keyword alias for `maximum_age_seconds`.
+            maximum_age_seconds: Optional positive age in seconds, combined by
+                minimum with all active scopes and per-call ages. The selected
+                explicit age replaces configured ages before safety caps apply.
 
         Returns:
             A nestable context manager delegated to the query cache.
         """
-        return self._cache.policy(mode, maximum_age)
-
-    @property
-    def context(self) -> ClientContext:
-        """Return the immutable context used by subsequent operations."""
-        return self._context
-
-    async def batch(self, requests: list[dict[str, object]]) -> list[dict[str, object] | bool]:
-        """Execute one ordered batch behind its complete conservative fence."""
-        with self._cache.admit() as token:
-            site_namespace = self.context.site_namespace
-            composite = any(
-                isinstance(request.get('data'), Mapping)
-                and not IMPLICIT_UPLOAD_FIELDS.isdisjoint(
-                    cast('Mapping[str, object]', request['data'])
-                )
-                for request in requests
-            )
-            changes = (
-                site_changes(site_namespace)
-                if composite
-                else batch_changes(site_namespace, requests)
-            )
-            indeterminate_changes = (
-                site_changes(site_namespace)
-                if composite or batch_has_create(requests)
-                else changes
-            )
-            method = cast('Any', self._client).batch
-            return cast(
-                'list[dict[str, object] | bool]',
-                await self._write_with_fence(
-                    _WriteRequest(
-                        changes,
-                        _post_changes=(
-                            None
-                            if composite
-                            else lambda value: batch_post_changes(
-                                site_namespace,
-                                requests,
-                                changes,
-                                value,
-                            )
-                        ),
-                        _indeterminate_changes=indeterminate_changes,
-                        _repeat_on_exception=composite,
-                    ),
-                    lambda: method(requests),
-                    token,
-                ),
-            )
+        if maximum_age is not None and maximum_age_seconds is not None:
+            raise TypeError('maximum_age and maximum_age_seconds cannot both be provided')
+        age = maximum_age if maximum_age_seconds is None else maximum_age_seconds
+        return self._cache.policy(mode, age)
 
     async def create(
         self,
@@ -461,48 +431,66 @@ class AsyncCachedShotgun:
         data: dict[str, object],
         return_fields: list[str] | None = None,
     ) -> dict[str, object]:
-        """Create one entity behind conservative membership fences."""
+        """Create one entity behind conservative membership fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Writes containing implicit uploads use a site-wide fence and repeat it
+        after other ordinary failures as well.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.create`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
-            site_namespace = self.context.site_namespace
-            composite = not IMPLICIT_UPLOAD_FIELDS.isdisjoint(data)
-            changes = (
-                site_changes(site_namespace)
-                if composite
-                else create_changes(site_namespace, entity_type, data)
-            )
             method = cast('Any', self._client).create
             return cast(
                 'dict[str, object]',
                 await self._write_with_fence(
-                    _WriteRequest(
-                        changes,
-                        _post_changes=(
-                            None
-                            if composite
-                            else lambda value: create_post_changes(
-                                site_namespace,
-                                entity_type,
-                                changes,
-                                value,
-                            )
-                        ),
-                        _indeterminate_changes=site_changes(site_namespace),
-                        _repeat_on_exception=composite,
-                    ),
+                    create_write_plan(self.context.site_namespace, entity_type, data),
                     lambda: method(entity_type, data, return_fields),
                     token,
                 ),
             )
 
     async def delete(self, entity_type: str, entity_id: int) -> bool:
-        """Delete one entity behind conservative lifecycle fences."""
+        """Delete one entity behind conservative lifecycle fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.delete`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = lifecycle_changes(self.context.site_namespace, entity_type, entity_id)
             method = cast('Any', self._client).delete
             return cast(
                 'bool',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, entity_id),
                     token,
                 ),
@@ -521,66 +509,48 @@ class AsyncCachedShotgun:
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
     ) -> list[dict[str, object]]:
-        """Return matching entities through the exact query cache."""
+        """Return matching entities through the exact query cache.
+
+        Use exact query caching when dependency analysis and active policy
+        admit the call. Unnormalizable or unsupported calls bypass lookup and
+        population. Cache failures fall back to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.find`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
-            context = self.context
             method = cast('Any', self._client).find
-
-            async def fetch() -> object:
-                return await method(
-                    entity_type,
-                    filters,
-                    fields,
-                    order,
-                    filter_operator,
-                    limit,
-                    retired_only,
-                    page,
-                    include_archived_projects,
-                    additional_filter_presets,
-                )
-
-            analysis_call, call = entity_calls(
-                'find',
-                (
-                    ('entity_type', entity_type),
-                    ('filters', filters),
-                    ('fields', fields),
-                    ('order', order),
-                    ('filter_operator', filter_operator),
-                    ('limit', limit),
-                    ('retired_only', retired_only),
-                    ('page', page),
-                    ('include_archived_projects', include_archived_projects),
-                    ('additional_filter_presets', additional_filter_presets),
+            values = (
+                entity_type,
+                filters,
+                fields,
+                order,
+                filter_operator,
+                limit,
+                retired_only,
+                page,
+                include_archived_projects,
+                additional_filter_presets,
+            )
+            return cast(
+                'list[dict[str, object]]',
+                await self._entity_read(
+                    EntityRead('find', entity_type, fields, values),
+                    lambda: method(*values),
+                    token,
                 ),
             )
-            if analysis_call is None or call is None:
-                return cast(
-                    'list[dict[str, object]]',
-                    await self._read_direct('find', fetch, context, token),
-                )
-            plan = unconditional_entity_plan(
-                self._identity(), self._settings, entity_type, lambda: self._cache.bypass_active
-            )
-            returned_fields = None
-            if plan is None:
-                schema = await self._schema_view_or_empty(context, token)
-                plan, returned_fields = entity_read_plan(
-                    analysis_call,
-                    schema,
-                    entity_type,
-                    fields,
-                    EntityPlanContext(
-                        self._analyzer, self._identity(), self._settings, context.site_namespace
-                    ),
-                )
-            value = await self._read(
-                _ReadRequest(call, plan, context, returned_fields),
-                fetch,
-                token,
-            )
-            return cast('list[dict[str, object]]', value)
 
     async def find_one(  # noqa: PLR0913, PLR0917 - exact official SG signature
         self,
@@ -593,74 +563,76 @@ class AsyncCachedShotgun:
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
     ) -> dict[str, object] | None:
-        """Return the first matching entity through its distinct exact key."""
+        """Return the first matching entity through its distinct exact key.
+
+        Use exact query caching when dependency analysis and active policy
+        admit the call. Unnormalizable or unsupported calls bypass lookup and
+        population. Cache failures fall back to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.find_one`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
-            context = self.context
             method = cast('Any', self._client).find_one
-
-            async def fetch() -> object:
-                return await method(
-                    entity_type,
-                    filters,
-                    fields,
-                    order,
-                    filter_operator,
-                    retired_only,
-                    include_archived_projects,
-                    additional_filter_presets,
-                )
-
-            analysis_call, call = entity_calls(
-                'find_one',
-                (
-                    ('entity_type', entity_type),
-                    ('filters', filters),
-                    ('fields', fields),
-                    ('order', order),
-                    ('filter_operator', filter_operator),
-                    ('retired_only', retired_only),
-                    ('include_archived_projects', include_archived_projects),
-                    ('additional_filter_presets', additional_filter_presets),
+            values = (
+                entity_type,
+                filters,
+                fields,
+                order,
+                filter_operator,
+                retired_only,
+                include_archived_projects,
+                additional_filter_presets,
+            )
+            return cast(
+                'dict[str, object] | None',
+                await self._entity_read(
+                    EntityRead('find_one', entity_type, fields, values),
+                    lambda: method(*values),
+                    token,
                 ),
             )
-            if analysis_call is None or call is None:
-                return cast(
-                    'dict[str, object] | None',
-                    await self._read_direct('find_one', fetch, context, token),
-                )
-            plan = unconditional_entity_plan(
-                self._identity(), self._settings, entity_type, lambda: self._cache.bypass_active
-            )
-            returned_fields = None
-            if plan is None:
-                schema = await self._schema_view_or_empty(context, token)
-                plan, returned_fields = entity_read_plan(
-                    analysis_call,
-                    schema,
-                    entity_type,
-                    fields,
-                    EntityPlanContext(
-                        self._analyzer, self._identity(), self._settings, context.site_namespace
-                    ),
-                )
-            value = await self._read(
-                _ReadRequest(call, plan, context, returned_fields),
-                fetch,
-                token,
-            )
-            return cast('dict[str, object] | None', value)
 
     async def follow(
         self, user: dict[str, object], entity: dict[str, object]
     ) -> dict[str, object]:
-        """Follow one entity behind a conservative site fence."""
+        """Follow one entity behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.follow`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).follow
             return cast(
                 'dict[str, object]',
                 await self._write_with_fence(
-                    _WriteRequest(changes), lambda: method(user, entity), token
+                    WritePlan(changes), lambda: method(user, entity), token
                 ),
             )
 
@@ -669,7 +641,22 @@ class AsyncCachedShotgun:
         note_id: int,
         entity_fields: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
-        """Always read a note thread directly."""
+        """Always read a note thread directly.
+
+        Bypass cache lookup and population because this composite response has
+        no proven URL lifetime for caching.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.note_thread_read`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).note_thread_read
@@ -677,32 +664,16 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(note_id, entity_fields)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'note_thread_read',
-                    (('note_id', note_id), ('entity_fields', opaque(entity_fields))),
-                )
-            )
-            if call is None:
-                return cast(
-                    'list[dict[str, object]]',
-                    await self._read_direct('note_thread_read', fetch, context, token),
-                )
             return cast(
                 'list[dict[str, object]]',
-                await self._read(
-                    _ReadRequest(
-                        call,
-                        self._ttl_only_plan('note_thread_read', context),
-                        context,
-                    ),
-                    fetch,
-                    token,
+                await self._read_direct(
+                    'note_thread_read', fetch, context, token, reason='composite_url_unproven'
                 ),
             )
 
     @classmethod
-    def open(  # noqa: PLR0913 - exact prescribed local factory signature
+    @asynccontextmanager
+    async def open(  # noqa: PLR0913 - exact prescribed local factory signature
         cls,
         client: object,
         settings: CacheSettings,
@@ -712,7 +683,7 @@ class AsyncCachedShotgun:
         metrics: MetricsSink | None = None,
         environ: Mapping[str, object] | None = None,
         indeterminate_write_exceptions: tuple[type[Exception], ...] = (),
-    ) -> AbstractAsyncContextManager[Self]:
+    ) -> AsyncGenerator[Self]:
         """Construct and own configured async cache layers around a caller-owned client.
 
         Args:
@@ -745,57 +716,41 @@ class AsyncCachedShotgun:
             Exception: Backend construction fails, or cleanup fails without a
                 higher-priority body error or caller cancellation.
         """
-        return cls._open(
-            _OpenRequest(
-                client,
-                settings,
-                identity,
-                context,
-                metrics,
-                environ,
-                indeterminate_write_exceptions,
-            )
-        )
-
-    @classmethod
-    @asynccontextmanager
-    async def _open(cls, request: _OpenRequest) -> AsyncGenerator[Self]:
-        """Own configured construction and joined cleanup with explicit precedence."""
         sink = (
             NullMetrics()
-            if request._metrics is None
+            if metrics is None
             else AsyncQueryCache.build_metrics(
-                request._settings,
-                process_environ if request._environ is None else request._environ,
-                request._metrics,
+                settings,
+                process_environ if environ is None else environ,
+                metrics,
             )
         )
         backend: AsyncLocalBackend | None = None
         shared: AsyncCacheBackend | None = None
         cache: AsyncQueryCache | None = None
         try:
-            if request._settings.l1.enabled:
-                backend = AsyncLocalBackend(request._settings, monotonic, sink)
-            if request._settings.l2.enabled:
+            if settings.l1.enabled:
+                backend = AsyncLocalBackend(settings, monotonic, sink)
+            if settings.l2.enabled:
                 valkey = import_module('sg_query_cache.valkey_async')
                 backend_type = cast('type[AsyncValkeyBackend]', valkey.AsyncValkeyBackend)
                 shared = await backend_type.from_settings(
-                    request._settings,
-                    process_environ if request._environ is None else request._environ,
+                    settings,
+                    process_environ if environ is None else environ,
                     sink,
                 )
             cache = AsyncQueryCache(
-                request._settings,
-                request._identity,
+                settings,
+                identity,
                 l1=backend,
                 l2=shared,
                 metrics=sink,
             )
             wrapper = cls(
-                request._client,
+                client,
                 cache,
-                request._context,
-                indeterminate_write_exceptions=request._indeterminate_write_exceptions,
+                context,
+                indeterminate_write_exceptions=indeterminate_write_exceptions,
             )
         except BaseException as error:
             resources = (cache,) if cache is not None else (shared, backend)
@@ -809,7 +764,22 @@ class AsyncCachedShotgun:
         await cache.close()
 
     async def preferences_read(self, prefs: list[str] | None = None) -> dict[str, object]:
-        """Always read preferences directly."""
+        """Always read preferences directly.
+
+        Bypass cache lookup and population because this composite response has
+        no proven URL lifetime for caching.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.preferences_read`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).preferences_read
@@ -817,22 +787,10 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(prefs)
 
-            call = bound_call(lambda: ExactCall('preferences_read', (('prefs', freeze(prefs)),)))
-            if call is None:
-                return cast(
-                    'dict[str, object]',
-                    await self._read_direct('preferences_read', fetch, context, token),
-                )
             return cast(
                 'dict[str, object]',
-                await self._read(
-                    _ReadRequest(
-                        call,
-                        self._ttl_only_plan('preferences_read', context),
-                        context,
-                    ),
-                    fetch,
-                    token,
+                await self._read_direct(
+                    'preferences_read', fetch, context, token, reason='composite_url_unproven'
                 ),
             )
 
@@ -859,27 +817,43 @@ class AsyncCachedShotgun:
             ValueError: Shared cache and replacement namespaces disagree.
         """
         with self._cache.admit() as token:
-            settings = self._settings
-            if settings.l2.enabled and context.site_namespace != settings.site_namespace:
-                raise ValueError('shared cache context must use the configured site namespace')
+            require_context_namespace(self._settings, context)
             previous = self._context
             if previous == context:
                 return
             self._context = context
             await self._cache.invalidate_admitted(
-                (GenerationChange(DependencyTag.site(previous.site_namespace)),),
+                site_changes(previous.site_namespace),
                 token=token,
             )
 
     async def revive(self, entity_type: str, entity_id: int) -> bool:
-        """Revive one entity behind conservative lifecycle fences."""
+        """Revive one entity behind conservative lifecycle fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.revive`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = lifecycle_changes(self.context.site_namespace, entity_type, entity_id)
             method = cast('Any', self._client).revive
             return cast(
                 'bool',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, entity_id),
                     token,
                 ),
@@ -888,7 +862,27 @@ class AsyncCachedShotgun:
     async def schema_entity_read(
         self, project_entity: dict[str, object] | None = None
     ) -> dict[str, dict[str, object]]:
-        """Return cached entity schema for an optional project."""
+        """Return cached entity schema for an optional project.
+
+        Use identity-scoped schema caching subject to active cache policy.
+        Calls that cannot be normalized read directly; cache failures fall back
+        to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_entity_read`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).schema_entity_read
@@ -896,12 +890,7 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(project_entity)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'schema_entity_read',
-                    (('project_entity', key_freeze(project_entity)),),
-                )
-            )
+            call = schema_entity_read_call(project_entity)
             if call is None:
                 return cast(
                     'dict[str, dict[str, object]]',
@@ -923,28 +912,66 @@ class AsyncCachedShotgun:
         display_name: str,
         properties: dict[str, object] | None = None,
     ) -> str:
-        """Create one field behind schema-generation fences."""
+        """Create one field behind schema-generation fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_field_create`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = schema_changes(self.context.site_namespace)
             method = cast('Any', self._client).schema_field_create
             return cast(
                 'str',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, data_type, display_name, properties),
                     token,
                 ),
             )
 
     async def schema_field_delete(self, entity_type: str, field_name: str) -> bool:
-        """Delete one field behind schema-generation fences."""
+        """Delete one field behind schema-generation fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_field_delete`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = schema_changes(self.context.site_namespace)
             method = cast('Any', self._client).schema_field_delete
             return cast(
                 'bool',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, field_name),
                     token,
                 ),
@@ -956,7 +983,27 @@ class AsyncCachedShotgun:
         field_name: str | None = None,
         project_entity: dict[str, object] | None = None,
     ) -> dict[str, dict[str, object]]:
-        """Return cached field schema for an entity type and optional project."""
+        """Return cached field schema for an entity type and optional project.
+
+        Use identity-scoped schema caching subject to active cache policy.
+        Calls that cannot be normalized read directly; cache failures fall back
+        to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_field_read`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).schema_field_read
@@ -964,16 +1011,7 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(entity_type, field_name, project_entity)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'schema_field_read',
-                    (
-                        ('entity_type', entity_type),
-                        ('field_name', field_name),
-                        ('project_entity', key_freeze(project_entity)),
-                    ),
-                )
-            )
+            call = schema_field_read_call(entity_type, field_name, project_entity)
             if call is None:
                 return cast(
                     'dict[str, dict[str, object]]',
@@ -995,14 +1033,33 @@ class AsyncCachedShotgun:
         properties: dict[str, object],
         project_entity: dict[str, object] | None = None,
     ) -> bool:
-        """Update one field behind schema-generation fences."""
+        """Update one field behind schema-generation fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_field_update`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = schema_changes(self.context.site_namespace)
             method = cast('Any', self._client).schema_field_update
             return cast(
                 'bool',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, field_name, properties, project_entity),
                     token,
                 ),
@@ -1011,7 +1068,27 @@ class AsyncCachedShotgun:
     async def schema_read(
         self, project_entity: dict[str, object] | None = None
     ) -> dict[str, dict[str, dict[str, object]]]:
-        """Return cached full schema for an optional project."""
+        """Return cached full schema for an optional project.
+
+        Use identity-scoped schema caching subject to active cache policy.
+        Calls that cannot be normalized read directly; cache failures fall back
+        to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.schema_read`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             return cast(
                 'dict[str, dict[str, dict[str, object]]]',
@@ -1026,14 +1103,33 @@ class AsyncCachedShotgun:
         filmstrip_thumbnail: bool = False,
         **kwargs: object,
     ) -> int:
-        """Share a thumbnail behind a conservative site fence."""
+        """Share a thumbnail behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.share_thumbnail`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).share_thumbnail
             return cast(
                 'int',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(
                         entities,
                         thumbnail_path,
@@ -1054,7 +1150,21 @@ class AsyncCachedShotgun:
         grouping: list[dict[str, str]] | None = None,
         include_archived_projects: bool = True,
     ) -> dict[str, object]:
-        """Always summarize entities directly."""
+        """Always summarize entities directly.
+
+        Bypass cache lookup and population because this composite response has
+        no proven URL lifetime for caching.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.summarize`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).summarize
@@ -1069,34 +1179,10 @@ class AsyncCachedShotgun:
                     include_archived_projects,
                 )
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'summarize',
-                    (
-                        ('entity_type', entity_type),
-                        ('filters', freeze(filters)),
-                        ('summary_fields', opaque(summary_fields)),
-                        ('filter_operator', filter_operator),
-                        ('grouping', opaque(grouping)),
-                        ('include_archived_projects', include_archived_projects),
-                    ),
-                )
-            )
-            if call is None:
-                return cast(
-                    'dict[str, object]',
-                    await self._read_direct('summarize', fetch, context, token),
-                )
             return cast(
                 'dict[str, object]',
-                await self._read(
-                    _ReadRequest(
-                        call,
-                        self._ttl_only_plan('summarize', context),
-                        context,
-                    ),
-                    fetch,
-                    token,
+                await self._read_direct(
+                    'summarize', fetch, context, token, reason='composite_url_unproven'
                 ),
             )
 
@@ -1107,7 +1193,22 @@ class AsyncCachedShotgun:
         project_ids: list[object] | None = None,
         limit: int | None = None,
     ) -> dict[str, object]:
-        """Always search text directly."""
+        """Always search text directly.
+
+        Bypass cache lookup and population because this composite response has
+        no proven URL lifetime for caching.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.text_search`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).text_search
@@ -1115,46 +1216,42 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(text, entity_types, project_ids, limit)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'text_search',
-                    (
-                        ('text', text),
-                        ('entity_types', opaque(entity_types)),
-                        ('project_ids', freeze(project_ids)),
-                        ('limit', limit),
-                    ),
-                )
-            )
-            if call is None:
-                return cast(
-                    'dict[str, object]',
-                    await self._read_direct('text_search', fetch, context, token),
-                )
             return cast(
                 'dict[str, object]',
-                await self._read(
-                    _ReadRequest(
-                        call,
-                        self._ttl_only_plan('text_search', context),
-                        context,
-                    ),
-                    fetch,
-                    token,
+                await self._read_direct(
+                    'text_search', fetch, context, token, reason='composite_url_unproven'
                 ),
             )
 
     async def unfollow(
         self, user: dict[str, object], entity: dict[str, object]
     ) -> dict[str, object]:
-        """Unfollow one entity behind a conservative site fence."""
+        """Unfollow one entity behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.unfollow`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).unfollow
             return cast(
                 'dict[str, object]',
                 await self._write_with_fence(
-                    _WriteRequest(changes), lambda: method(user, entity), token
+                    WritePlan(changes), lambda: method(user, entity), token
                 ),
             )
 
@@ -1165,20 +1262,34 @@ class AsyncCachedShotgun:
         data: dict[str, object],
         multi_entity_update_modes: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        """Update one known entity behind value and membership fences."""
+        """Update one known entity behind value and membership fences.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Writes containing implicit uploads use a site-wide fence and repeat it
+        after other ordinary failures as well.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.update`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
-            site_namespace = self.context.site_namespace
-            composite = not IMPLICIT_UPLOAD_FIELDS.isdisjoint(data)
-            changes = (
-                site_changes(site_namespace)
-                if composite
-                else update_changes(site_namespace, entity_type, entity_id, data)
-            )
             method = cast('Any', self._client).update
             return cast(
                 'dict[str, object]',
                 await self._write_with_fence(
-                    _WriteRequest(changes, _repeat_on_exception=composite),
+                    update_write_plan(self.context.site_namespace, entity_type, entity_id, data),
                     lambda: method(entity_type, entity_id, data, multi_entity_update_modes),
                     token,
                 ),
@@ -1189,13 +1300,30 @@ class AsyncCachedShotgun:
         project: dict[str, object],
         user: dict[str, object] | None = None,
     ) -> None:
-        """Update project access state behind a conservative site fence."""
+        """Update project access state behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.update_project_last_accessed`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).update_project_last_accessed
-            await self._write_with_fence(
-                _WriteRequest(changes), lambda: method(project, user), token
-            )
+            await self._write_with_fence(WritePlan(changes), lambda: method(project, user), token)
 
     async def upload(  # noqa: PLR0913, PLR0917 - exact official SG signature
         self,
@@ -1207,14 +1335,32 @@ class AsyncCachedShotgun:
         tag_list: str | None = None,
         created_at: datetime | None = None,
     ) -> int:
-        """Upload one file behind a site-wide Attachment creation fence."""
+        """Upload one file behind a site-wide Attachment creation fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of `AsyncShotgun.upload`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).upload
             return cast(
                 'int',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(
                         entity_type,
                         entity_id,
@@ -1235,14 +1381,33 @@ class AsyncCachedShotgun:
         path: str,
         **kwargs: object,
     ) -> int:
-        """Upload a filmstrip thumbnail behind a site-wide Attachment fence."""
+        """Upload a filmstrip thumbnail behind a site-wide Attachment fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.upload_filmstrip_thumbnail`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).upload_filmstrip_thumbnail
             return cast(
                 'int',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, entity_id, path, **kwargs),
                     token,
                 ),
@@ -1255,27 +1420,65 @@ class AsyncCachedShotgun:
         path: str,
         **kwargs: object,
     ) -> int:
-        """Upload a thumbnail behind a site-wide Attachment creation fence."""
+        """Upload a thumbnail behind a site-wide Attachment creation fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.upload_thumbnail`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).upload_thumbnail
             return cast(
                 'int',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(entity_type, entity_id, path, **kwargs),
                     token,
                 ),
             )
 
     async def user_subscriptions_create(self, users: list[dict[str, object]]) -> bool:
-        """Create user subscriptions behind a conservative site fence."""
+        """Create user subscriptions behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.user_subscriptions_create`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).user_subscriptions_create
             return cast(
                 'bool',
-                await self._write_with_fence(_WriteRequest(changes), lambda: method(users), token),
+                await self._write_with_fence(WritePlan(changes), lambda: method(users), token),
             )
 
     async def work_schedule_read(
@@ -1285,7 +1488,27 @@ class AsyncCachedShotgun:
         project: dict[str, object] | None = None,
         user: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        """Read work schedules directly unless TTL-only caching is enabled."""
+        """Read work schedules directly unless TTL-only caching is enabled.
+
+        Cache only when this method is enabled in `enabled_ttl_only_methods`,
+        the call can be normalized, and identity and policy permit caching.
+        Cache failures fall back to SG.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.work_schedule_read`.
+
+        Returns:
+            An isolated cache hit or the direct SG result, with the upstream
+            result contract.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             context = self.context
             method = cast('Any', self._client).work_schedule_read
@@ -1293,17 +1516,7 @@ class AsyncCachedShotgun:
             async def fetch() -> object:
                 return await method(start_date, end_date, project, user)
 
-            call = bound_call(
-                lambda: ExactCall(
-                    'work_schedule_read',
-                    (
-                        ('start_date', start_date),
-                        ('end_date', end_date),
-                        ('project', key_freeze(project)),
-                        ('user', key_freeze(user)),
-                    ),
-                )
-            )
+            call = work_schedule_read_call(start_date, end_date, project, user)
             if call is None:
                 return cast(
                     'dict[str, object]',
@@ -1331,14 +1544,33 @@ class AsyncCachedShotgun:
         user: dict[str, object] | None = None,
         recalculate_field: str | None = None,
     ) -> dict[str, object]:
-        """Update work schedule state behind a conservative site fence."""
+        """Update work schedule state behind a conservative site fence.
+
+        Attempt invalidation before SG dispatch and after success or a
+        configured indeterminate transport failure. Failed cache fences do not
+        prevent SG dispatch.
+
+        Cancellation during SG dispatch attempts a conservative post-write
+        fence before propagating.
+
+        Admit the complete operation, including planning and cleanup, on the
+        cache's owning event loop.
+
+        Arguments, results and SG errors are those of
+        `AsyncShotgun.work_schedule_update`.
+
+        Raises:
+            RuntimeError: The cache is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
+        """
         with self._cache.admit() as token:
             changes = site_changes(self.context.site_namespace)
             method = cast('Any', self._client).work_schedule_update
             return cast(
                 'dict[str, object]',
                 await self._write_with_fence(
-                    _WriteRequest(changes),
+                    WritePlan(changes),
                     lambda: method(
                         date,
                         working,
@@ -1350,6 +1582,15 @@ class AsyncCachedShotgun:
                     token,
                 ),
             )
+
+
+def _record_partial_cleanup_failure(metrics: MetricsSink, error: Exception | None) -> None:
+    """Report an owned cleanup failure with its optional client category."""
+    labels = {'backend_operation': 'factory_close', 'outcome': 'failure'}
+    if isinstance(error, BackendUnavailable) and error.failure_class is not None:
+        labels['failure_class'] = error.failure_class
+    with suppress(Exception):
+        metrics.increment('backend_failure', labels)
 
 
 async def _close_partial(
@@ -1372,19 +1613,17 @@ async def _close_partial(
                 cancellation = cancellation or pending_cancellation
             requests = task.cancelling()
             failed = False
+            cleanup_failure: Exception | None = None
             try:
                 await resource.close()
             except CancelledError as cleanup_cancellation:
                 failed = True
                 if task.cancelling() > requests:
                     cancellation = cancellation or cleanup_cancellation
-            except Exception:  # noqa: BLE001 - record lower-priority owned cleanup failure
+            except Exception as cleanup_error:  # noqa: BLE001 - record lower-priority owned cleanup failure
                 failed = True
+                cleanup_failure = cleanup_error
             if failed:
-                with suppress(Exception):
-                    metrics.increment(
-                        'backend_failure',
-                        {'backend_operation': 'factory_close', 'outcome': 'failure'},
-                    )
+                _record_partial_cleanup_failure(metrics, cleanup_failure)
     if cancellation is not None:
         raise cancellation from None

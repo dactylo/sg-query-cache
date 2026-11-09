@@ -15,7 +15,7 @@ from sg_query_cache._valkey_common import (
     parse_record,
     validation_is_current,
 )
-from tests._valkey_control_cases import _RECORD_A, _RECORD_B
+from tests._valkey_control_cases import RECORD_A, RECORD_B
 
 
 def test_cleared_validation_is_never_current() -> None:
@@ -75,7 +75,7 @@ def test_resolve_decoder_rejects_stale_or_partial_control_state(status: bytes) -
 def test_cached_validation_requires_current_role_and_covered_connection(
     epoch: RoleEpoch, now: float, current: bool, hit: bool
 ) -> None:
-    incarnation = parse_record(_RECORD_A, 'sgqc')
+    incarnation = parse_record(RECORD_A, 'sgqc')
     state = ValidationState(incarnation, (0, 1, 'primary'), 0.0, 1, frozenset({1, 2}))
 
     assert validation_is_current(state, epoch, now, 30) is current
@@ -84,7 +84,7 @@ def test_cached_validation_requires_current_role_and_covered_connection(
 
 @pytest.mark.parametrize('validated_at', [0.0, 20.0, 29.0])
 def test_joined_validation_preserves_original_time_and_epoch(validated_at: float) -> None:
-    incarnation = parse_record(_RECORD_A, 'sgqc')
+    incarnation = parse_record(RECORD_A, 'sgqc')
     state = ValidationState(incarnation, (0, 1, None), 0.0, 1, frozenset({1}))
 
     published = next_validation_state(state, incarnation, (0, 2, None), validated_at, join=True)
@@ -94,11 +94,11 @@ def test_joined_validation_preserves_original_time_and_epoch(validated_at: float
 
 @pytest.mark.parametrize('reason', ['forced-or-expired', 'changed-incarnation', 'cleared'])
 def test_new_validation_replaces_coverage_time_and_epoch(reason: str) -> None:
-    incarnation = parse_record(_RECORD_A, 'sgqc')
+    incarnation = parse_record(RECORD_A, 'sgqc')
     state = ValidationState(incarnation, (0, 1, None), 0.0, 1, frozenset({1, 3}))
     candidate: Incarnation = incarnation
     if reason == 'changed-incarnation':
-        candidate = parse_record(_RECORD_B, 'sgqc')
+        candidate = parse_record(RECORD_B, 'sgqc')
     elif reason == 'cleared':
         state = ValidationState(None, None, None, 1)
 

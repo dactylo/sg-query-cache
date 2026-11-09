@@ -60,6 +60,26 @@
     "type": "EventLogEntry",
     "user": { "id": 11, "type": "HumanUser" }
   },
+  "asset_retirement": {
+    "attribute_name": null,
+    "created_at": "2026-08-29T12:00:08Z",
+    "entity": null,
+    "event_type": "Shotgun_Asset_Retirement",
+    "id": 9,
+    "meta": {
+      "class_name": "Asset",
+      "display_name": "Tree B",
+      "entity_id": 7,
+      "entity_type": "Asset",
+      "id": 7,
+      "retirement_date": "2026-08-29 12:00:08 UTC",
+      "type": "entity_retirement"
+    },
+    "project": { "id": 5, "type": "Project" },
+    "session_uuid": "00000000-0000-0000-0000-000000000009",
+    "type": "EventLogEntry",
+    "user": { "id": 11, "type": "HumanUser" }
+  },
   "group_change": {
     "attribute_name": "users",
     "created_at": "2026-08-29T12:00:07Z",

@@ -1,6 +1,3 @@
-# Same-file collaborators use private implementation members.
-# pyright: reportPrivateUsage=false
-
 """Provide the optional asynchronous two-role Valkey cache backend.
 
 Use `AsyncValkeyBackend.from_settings` to own configured result and metadata
@@ -13,10 +10,12 @@ from asyncio import (
     CancelledError,
     Future,
     Task,
+    Timeout,
     create_task,
     gather,
     get_running_loop,
     timeout,
+    timeout_at,
 )
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterable, Mapping
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -28,99 +27,116 @@ from typing import Protocol, Self, TypeVar, cast
 from weakref import WeakKeyDictionary
 
 from typing_extensions import override
-from valkey.asyncio import Connection, Sentinel, Valkey
-from valkey.asyncio.connection import AbstractConnection, SSLConnection
-from valkey.asyncio.connection import ConnectionPool as MaintainedConnectionPool
-from valkey.asyncio.retry import Retry
-from valkey.asyncio.sentinel import SentinelConnectionPool as MaintainedSentinelPool
-from valkey.asyncio.sentinel import SentinelManagedConnection
-from valkey.backoff import NoBackoff
-from valkey.exceptions import ConnectionError as ValkeyConnectionError
-from valkey.exceptions import ReadOnlyError, ValkeyError
-from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
-from sg_query_cache._async_support import (
-    Admission,
-    CleanupOutcome,
-    LoopAffinity,
-    enter_cleanup,
-    join_shared_close,
-    joined_cleanup,
-)
-from sg_query_cache._async_valkey_control import (
-    AsyncValkeyControl,
-    ControlClient,
-    PinnedControlClient,
-    ResultClient,
-    ScriptClient,
-    execute_commit,
-    execute_script,
-)
-from sg_query_cache._backend import (
-    BackendCapacity,
-    BackendProtocolError,
-    BackendUnavailable,
-    StaleIncarnation,
-)
-from sg_query_cache._backend_validation import (
-    encoded_payload,
-    fill_lease,
-    flush_reason,
-    generation_changes,
-    metric_flush_reason,
-    opaque_key,
-)
-from sg_query_cache._config import (
-    CacheSettings,
-    ValkeyRoleSettings,
-    parse_sentinel_address,
-)
-from sg_query_cache._keys import KeyBuilder
-from sg_query_cache._metrics import MetricsSink
-from sg_query_cache._model import (
-    CacheHit,
-    DependencyTag,
-    FillLease,
-    GenerationChange,
-    GenerationVector,
-)
-from sg_query_cache._valkey_common import CircuitBreaker as _CircuitBreaker
-from sg_query_cache._valkey_common import (
-    Incarnation,
-    LookupOutcome,
-    RoleEpoch,
-    ScriptArgument,
-    decode_change_reply,
-    decode_release_reply,
-    decode_reserve_reply,
-    decode_resolve_reply,
-    finalize_lookup,
-    interpret_lookup,
-    lookup_operands,
-    metadata_operands,
-    milliseconds,
-    release_operands,
-    require_enabled_l2,
-    reserve_operands,
-    role_password,
-    validated_resolve_tags,
-)
-from sg_query_cache._valkey_proof import require_primary_reply
-from sg_query_cache._valkey_scripts import (
-    CHANGE_SCRIPT,
-    CHANGE_SCRIPT_SHA,
-    LOOKUP_SCRIPT,
-    LOOKUP_SCRIPT_SHA,
-    RELEASE_SCRIPT,
-    RELEASE_SCRIPT_SHA,
-    RESERVE_SCRIPT,
-    RESERVE_SCRIPT_SHA,
-    RESOLVE_SCRIPT,
-    RESOLVE_SCRIPT_SHA,
-    translate_client_error,
-)
+try:
+    import valkey
+    from valkey.asyncio import Connection, Sentinel, Valkey
+    from valkey.asyncio.connection import AbstractConnection, SSLConnection
+    from valkey.asyncio.connection import ConnectionPool as MaintainedConnectionPool
+    from valkey.asyncio.retry import Retry
+    from valkey.asyncio.sentinel import SentinelConnectionPool as MaintainedSentinelPool
+    from valkey.asyncio.sentinel import SentinelManagedConnection
+    from valkey.backoff import NoBackoff
+    from valkey.exceptions import ConnectionError as ValkeyConnectionError
+    from valkey.exceptions import ReadOnlyError
+    from valkey.exceptions import TimeoutError as ValkeyTimeoutError
+except ModuleNotFoundError as error:
+    if error.name != 'valkey':
+        raise
+    raise ImportError(
+        "sg_query_cache.valkey_async requires the 'valkey' extra: "
+        "pip install 'sg-query-cache[valkey]'"
+    ) from error
+else:
+    from sg_query_cache._async_support import (
+        PUBLISHED_DEADLINE,
+        Admission,
+        CleanupOutcome,
+        LoopAffinity,
+        enter_cleanup,
+        join_shared_close,
+        joined_cleanup,
+    )
+    from sg_query_cache._async_valkey_control import (
+        AsyncValkeyControl,
+        ControlClient,
+        PinnedControlClient,
+        ResultClient,
+        ScriptClient,
+        execute_commit,
+        execute_script,
+    )
+    from sg_query_cache._backend import (
+        BACKEND_ERRORS,
+        BackendCapacity,
+        BackendProtocolError,
+        BackendUnavailable,
+        StaleIncarnation,
+    )
+    from sg_query_cache._backend_validation import (
+        encoded_payload,
+        fill_lease,
+        flush_reason,
+        generation_changes,
+        metric_flush_reason,
+        opaque_key,
+    )
+    from sg_query_cache._config import (
+        CacheSettings,
+        ValkeyRoleSettings,
+        parse_sentinel_address,
+    )
+    from sg_query_cache._keys import KeyBuilder
+    from sg_query_cache._metrics import MetricsSink
+    from sg_query_cache._model import (
+        CacheHit,
+        DependencyTag,
+        FillLease,
+        GenerationChange,
+        GenerationVector,
+    )
+    from sg_query_cache._valkey_common import CircuitBreaker as _CircuitBreaker
+    from sg_query_cache._valkey_common import (
+        Incarnation,
+        LookupOutcome,
+        RoleEpoch,
+        ScriptArgument,
+        decode_change_reply,
+        decode_release_reply,
+        decode_reserve_reply,
+        decode_resolve_reply,
+        finalize_lookup,
+        interpret_lookup,
+        lookup_operands,
+        metadata_operands,
+        milliseconds,
+        release_operands,
+        require_enabled_l2,
+        reserve_operands,
+        role_password,
+        validated_resolve_tags,
+    )
+    from sg_query_cache._valkey_proof import require_primary_reply
+    from sg_query_cache._valkey_scripts import (
+        CHANGE_SCRIPT,
+        CHANGE_SCRIPT_SHA,
+        LOOKUP_SCRIPT,
+        LOOKUP_SCRIPT_SHA,
+        RELEASE_SCRIPT,
+        RELEASE_SCRIPT_SHA,
+        RESERVE_SCRIPT,
+        RESERVE_SCRIPT_SHA,
+        RESOLVE_SCRIPT,
+        RESOLVE_SCRIPT_SHA,
+        client_failure_class,
+        translate_client_error,
+    )
+del valkey
 
 _T = TypeVar('_T')
+
+
+__all__ = ['AsyncValkeyBackend', 'AsyncValkeyMetadataStore']
 
 
 class _MetadataStore(Protocol):
@@ -175,15 +191,6 @@ class _Lifecycle:
         self._pending: list[Callable[[], Awaitable[None]]] = []
         self._settling = False
 
-    @asynccontextmanager
-    async def _budget(self) -> AsyncGenerator[None]:
-        """Apply the whole operation's cooperative budget."""
-        try:
-            async with timeout(self._timeout_seconds):
-                yield
-        except TimeoutError:
-            raise BackendUnavailable('Valkey operation deadline expired') from None
-
     async def _close_all(self) -> CleanupOutcome[None]:
         """Join operations and settle every explicitly retained close obligation."""
         idle = await joined_cleanup(self._admission.wait_idle)
@@ -191,22 +198,19 @@ class _Lifecycle:
             # Independent cancellation is failed cleanup, not proof of idleness.
             await self._admission.wait_idle()
         deadline = get_running_loop().time() + self._timeout_seconds
+        record = PUBLISHED_DEADLINE.get()
+        if record is not None:
+            deadline = min(deadline, record.deadline)
         outcome = await _close_resources(tuple(self._pending), deadline=deadline)
         self._pending.clear()
         self._admission.finish_close()
         failure = idle.error or outcome.error
         if isinstance(failure, TimeoutError):
-            failure = BackendUnavailable('Valkey close deadline expired')
+            failure = BackendUnavailable('Valkey close deadline expired', failure_class='timeout')
         return CleanupOutcome(
             error=failure,
             cancellation=idle.cancellation or outcome.cancellation,
         )
-
-    @contextmanager
-    def _operation(self) -> Generator[None]:
-        """Admit the whole operation before its first suspension."""
-        with self._admission.operation():
-            yield
 
     async def _settle_close(
         self,
@@ -234,8 +238,48 @@ class _Lifecycle:
         completion.set_result(settled)
         return None
 
-    async def _close(self, resources: tuple[Callable[[], Awaitable[None]], ...]) -> None:
-        """Join shared cleanup and synchronously claim any pre-entry settlement."""
+    @asynccontextmanager
+    async def budget(self) -> AsyncGenerator[Timeout]:
+        """Apply the whole operation's cooperative budget.
+
+        Yields:
+            The owning timer, whose expiry remains available during settlement.
+
+        Raises:
+            BackendUnavailable: The operation exceeds its deadline.
+        """
+        deadline = get_running_loop().time() + self._timeout_seconds
+        record = PUBLISHED_DEADLINE.get()
+        if record is not None:
+            deadline = min(deadline, record.deadline)
+        timer = timeout_at(deadline)
+        try:
+            async with timer:
+                try:
+                    yield timer
+                finally:
+                    if timer.expired() and record is not None:
+                        record.expired = True
+        except TimeoutError:
+            raise BackendUnavailable(
+                'Valkey operation deadline expired', failure_class='timeout'
+            ) from None
+
+    async def close(self, resources: tuple[Callable[[], Awaitable[None]], ...]) -> None:
+        """Join shared cleanup and synchronously claim any pre-entry settlement.
+
+        Args:
+            resources: Owned cleanup callbacks, attempted in order by the first
+                closer.
+
+        Raises:
+            RuntimeError: Called by an admitted operation or from another event
+                loop.
+            BackendUnavailable: Cleanup exceeds its deadline or is interrupted.
+            Exception: A retained cleanup callback fails.
+            CancelledError: The caller is cancelled; shared cleanup is joined
+                first.
+        """
         if self._admission.begin_close():
             self._pending = list(resources)
             self._completion = get_running_loop().create_future()
@@ -246,6 +290,21 @@ class _Lifecycle:
         if task is None or completion is None:
             raise RuntimeError('close task was not published')
         await join_shared_close(task, completion, lambda: self._settle_close(task, completion))
+
+    @contextmanager
+    def operation(self) -> Generator[None]:
+        """Admit the whole operation before its first suspension.
+
+        Yields:
+            Control while the operation is admitted and terminal close must
+            wait.
+
+        Raises:
+            RuntimeError: Closing, closed, outside a task, or on another event
+                loop.
+        """
+        with self._admission.operation():
+            yield
 
 
 async def _close_resources(
@@ -271,10 +330,16 @@ async def _cleanup_construction(
     """Settle owned resources with caller cancellation before construction failure."""
     outcome = await _close_resources(resources)
     if outcome.error is not None and metrics is not None:
+        labels = {'backend_operation': 'construction_close', 'outcome': 'failure'}
+        if (
+            isinstance(outcome.error, BackendUnavailable)
+            and outcome.error.failure_class is not None
+        ):
+            labels['failure_class'] = outcome.error.failure_class
         with suppress(Exception):
             metrics.increment(
                 'backend_failure',
-                {'backend_operation': 'construction_close', 'outcome': 'failure'},
+                labels,
             )
     if isinstance(error, CancelledError):
         return
@@ -298,19 +363,45 @@ class _ConnectionGeneration:
         self._generation_count += 1
         self._by_connection[connection] = self._generation_count
 
-    def _for_connection(self, connection: AbstractConnection | None) -> int | None:
-        """Sample one connection's latest role-unique generation without I/O."""
+    def for_connection(self, connection: AbstractConnection | None) -> int | None:
+        """Sample one connection's latest role-unique generation without I/O.
+
+        Returns:
+            The tracked generation, or `None` for an absent or untracked
+            connection.
+
+        Raises:
+            RuntimeError: No event loop is running, or the tracker belongs to
+                another loop.
+        """
         self._affinity.check()
         return None if connection is None else self._by_connection.get(connection)
 
     @property
-    def _generation(self) -> int:
-        """Sample the aggregate diagnostic generation without I/O."""
+    def generation(self) -> int:
+        """Sample the aggregate diagnostic generation without I/O.
+
+        Raises:
+            RuntimeError: No event loop is running, or the tracker belongs to
+                another loop.
+        """
         self._affinity.check()
         return self._generation_count
 
-    async def _initialize(self, connection: AbstractConnection) -> None:
-        """Complete setup, prove HA primaries, and register a weak reconnect callback."""
+    async def initialize(self, connection: AbstractConnection) -> None:
+        """Complete setup, prove HA primaries, and register a weak reconnect callback.
+
+        Args:
+            connection: Newly connected socket whose maintained setup must
+                finish.
+
+        Raises:
+            RuntimeError: No event loop is running, or the tracker belongs to
+                another loop.
+            ValkeyConnectionError: Connection setup fails, or the primary proof
+                is malformed or reports a non-primary role.
+            ValkeyTimeoutError: Connection setup times out.
+        """
         self._affinity.check()
         await connection.on_connect()
         if self._prove_primary:
@@ -325,6 +416,20 @@ class _Connection(Connection):
     async def send_packed_command(
         self, command: bytes | str | Iterable[bytes], check_health: bool = True
     ) -> None:
+        """Write a packed command while preserving caller cancellation.
+
+        Args:
+            command: Encoded protocol data, text to encode, or ordered byte
+                chunks.
+            check_health: Whether to check an already-connected socket before
+                writing.
+
+        Raises:
+            ValkeyTimeoutError: Connecting, checking health, or writing times
+                out.
+            ValkeyConnectionError: The connection cannot be established or
+                used.
+        """
         if not self.is_connected:
             await self.connect()
         elif check_health:
@@ -385,23 +490,19 @@ class _ConnectionPool(MaintainedConnectionPool):
             max_connections=max_connections,
             **connection_kwargs,
         )
-
-    async def _settle_disconnect(self) -> None:
-        """Attempt every detached socket after independently interrupted cleanup."""
-        for connection in tuple(chain(self._available_connections, self._in_use_connections)):
-            # nowait disconnect uses the maintained socket-close path without
-            # suspending for shutdown. Preserve the original cleanup outcome.
-            with suppress(Exception):
-                await connection.disconnect(nowait=True)
-
-    async def _settle_release(self, connection: AbstractConnection) -> None:
-        """Return a still-owned pin after interrupted release through the maintained API."""
-        if connection in self._in_use_connections:
-            # Maintained release performs only synchronous set/list updates.
-            await super().release(connection)
+        self.borrow_tokens: WeakKeyDictionary[AbstractConnection, object] = WeakKeyDictionary()
 
     @override
     async def disconnect(self, inuse_connections: bool = True) -> None:
+        """Attempt every selected socket close before propagating a failure.
+
+        Args:
+            inuse_connections: Include borrowed connections as well as idle
+                ones.
+
+        Raises:
+            Exception: A selected connection fails to disconnect.
+        """
         connections = tuple(
             chain(
                 self._available_connections,
@@ -418,6 +519,14 @@ class _ConnectionPool(MaintainedConnectionPool):
 
     @override
     async def ensure_connection(self, connection: AbstractConnection) -> None:
+        """Prepare a usable connection and close it if setup is cancelled.
+
+        Raises:
+            ValkeyConnectionError: The connection cannot be established or has
+                unread data.
+            ValkeyTimeoutError: Connection setup or readiness checking times
+                out.
+        """
         try:
             await super().ensure_connection(connection)
         except CancelledError:
@@ -425,6 +534,41 @@ class _ConnectionPool(MaintainedConnectionPool):
             # after we close any socket established before setup was interrupted.
             await _disconnect_interrupted(connection)
             raise
+
+    @override
+    def get_available_connection(self) -> AbstractConnection:
+        """Borrow an idle or new connection and assign its ownership token.
+
+        Raises:
+            ValkeyConnectionError: The pool has reached its connection limit.
+        """
+        connection = super().get_available_connection()
+        self.borrow_tokens[connection] = object()
+        return connection
+
+    async def settle_disconnect(self) -> None:
+        """Attempt every detached socket after independently interrupted cleanup."""
+        for connection in tuple(chain(self._available_connections, self._in_use_connections)):
+            # nowait disconnect uses the maintained socket-close path without
+            # suspending for shutdown. Preserve the original cleanup outcome.
+            with suppress(Exception):
+                await connection.disconnect(nowait=True)
+
+    async def settle_release(self, connection: AbstractConnection, token: object | None) -> None:
+        """Return a still-owned pin after interrupted release through the maintained API.
+
+        Args:
+            connection: Borrowed connection to release.
+            token: Ownership token captured before cleanup; an absent or stale
+                token leaves the connection untouched.
+        """
+        if (
+            token is not None
+            and self.borrow_tokens.get(connection) is token
+            and connection in self._in_use_connections
+        ):
+            # Maintained release performs only synchronous set/list updates.
+            await super().release(connection)
 
 
 class _SentinelConnectionPool(MaintainedSentinelPool, _ConnectionPool):
@@ -447,19 +591,39 @@ class _RawClient(Protocol):
     connection_pool: _ConnectionPool | _SentinelConnectionPool
 
     async def aclose(self, close_connection_pool: bool = False) -> None:
-        """Release the pin and optionally disconnect its whole pool."""
+        """Release a backend pin or its owned pool during joined cleanup.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.aclose`.
+        """
         ...
 
     def client(self) -> Self:
-        """Create an uninitialized single-connection child client."""
+        """Create a lazy single-connection child for a backend operation.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.client`.
+
+        Returns:
+            A child sharing the owning pool, retained only for the backend
+            operation and closed when that operation finishes.
+        """
         ...
 
     async def execute_command(self, *args: ScriptArgument) -> object:
-        """Execute one command through maintained send/read and retry handling."""
+        """Dispatch a backend command through maintained send and read handling.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.execute_command`.
+        """
         ...
 
     async def initialize(self) -> Self:
-        """Acquire and initialize a maintained pinned connection."""
+        """Acquire the physical connection before yielding a backend pin.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.Valkey.initialize`.
+        """
         ...
 
 
@@ -491,10 +655,6 @@ class _RoleClient:
             self._client = self._factory()
         return self._client
 
-    def _connection_generation(self, client: _RawClient) -> int | None:
-        """Sample a borrowed connection's latest role-unique generation without I/O."""
-        return self._connections._for_connection(client.connection)
-
     async def _invalidate(self, expected: _RawClient | None = None) -> None:
         """Detach an affected pool before joining attempt-all connection cleanup."""
         self._affinity.check()
@@ -505,14 +665,73 @@ class _RoleClient:
         self._pool_epoch += 1
         outcome = await joined_cleanup(lambda: client.aclose(close_connection_pool=True))
         if outcome.error is not None:
-            await client.connection_pool._settle_disconnect()
+            await client.connection_pool.settle_disconnect()
         if outcome.cancellation is not None:
             raise outcome.cancellation
         if outcome.error is not None:
             translate_client_error(outcome.error)
 
-    async def _invoke_on(self, pool: _RawClient, operation: Callable[[], Awaitable[_T]]) -> _T:
-        """Run once against a current pool and discard reconnect-class failures."""
+    def _role_epoch(self) -> tuple[int, object | None]:
+        """Sample pool and endpoint state without the aggregate diagnostic counter."""
+        self._affinity.check()
+        return self._pool_epoch, self._endpoint
+
+    async def close(self) -> None:
+        """Make the role terminal and join cleanup of its detached pool.
+
+        New operations remain rejected even when cleanup fails. Repeated close
+        calls do not construct a pool.
+
+        Pool release uses `valkey.asyncio.Valkey.aclose`, which owns the
+        upstream release contract. This boundary normalizes client failures.
+
+        Raises:
+            BackendCapacity: Pool cleanup is rejected for capacity.
+            BackendProtocolError: Pool cleanup violates the backend protocol.
+            BackendUnavailable: Pool cleanup cannot complete reliably.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels close; cleanup is joined before
+                propagation.
+        """
+        self._affinity.check()
+        self._closed = True
+        await self._invalidate()
+
+    def connection_generation(self, client: _RawClient) -> int | None:
+        """Sample a borrowed connection's latest role-unique generation without I/O.
+
+        Returns:
+            The tracked generation, or `None` for an absent or untracked
+            connection.
+
+        Raises:
+            RuntimeError: No event loop is running, or the tracker belongs to
+                another loop.
+        """
+        return self._connections.for_connection(client.connection)
+
+    def epoch(self) -> RoleEpoch:
+        """Sample the immutable pool, connection, and endpoint epoch without I/O."""
+        self._affinity.check()
+        return self._pool_epoch, self._connections.generation, self._endpoint
+
+    async def invoke_on(self, pool: _RawClient, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Run once against a current pool and discard reconnect-class failures.
+
+        Args:
+            pool: Pool retained by the caller's pin; it must still be current.
+            operation: Command callback executed once against that pool.
+
+        Returns:
+            The callback's result.
+
+        Raises:
+            RuntimeError: No event loop is running, or the role belongs to
+                another loop.
+            BackendUnavailable: The pool was discarded or the role has closed.
+            Exception: The command or subsequent pool cleanup fails.
+            CancelledError: Command execution or cleanup is cancelled.
+        """
         self._affinity.check()
         if self._closed or self._client is not pool:
             raise BackendUnavailable('Valkey pin belongs to a discarded pool')
@@ -522,25 +741,32 @@ class _RoleClient:
             await self._invalidate(pool)
             raise
 
-    def _role_epoch(self) -> tuple[int, object | None]:
-        """Sample pool and endpoint state without the aggregate diagnostic counter."""
-        self._affinity.check()
-        return self._pool_epoch, self._endpoint
-
-    async def close(self) -> None:
-        """Make the role terminal and detach its pool before cleanup awaits."""
-        self._affinity.check()
-        self._closed = True
-        await self._invalidate()
-
-    def epoch(self) -> RoleEpoch:
-        """Sample the immutable pool, connection, and endpoint epoch without I/O."""
-        self._affinity.check()
-        return self._pool_epoch, self._connections._generation, self._endpoint
-
     @asynccontextmanager
     async def pin(self) -> AsyncGenerator['_PinnedRoleClient']:
-        """Borrow one maintained single-connection client and join its release."""
+        """Borrow one physical connection for a complete backend operation.
+
+        Borrowing follows `valkey.asyncio.Valkey.client`; release follows
+        `valkey.asyncio.Valkey.aclose`. Those methods own their upstream
+        contracts.
+
+        Join release before propagating cancellation.
+
+        Yields:
+            A command wrapper valid only inside this context. Its borrowed
+            child is released on exit.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         pool = self._active()
         pinned = pool.client()
         wrapped = _PinnedRoleClient(self, pool, pinned)
@@ -549,7 +775,7 @@ class _RoleClient:
             failure: Exception | None = None
             try:
                 await pinned.initialize()
-            except ValkeyError as error:
+            except Exception as error:  # noqa: BLE001 - closed external-client boundary
                 failure = error
             if failure is not None:
                 if isinstance(failure, (ReadOnlyError, ValkeyConnectionError, ValkeyTimeoutError)):
@@ -565,19 +791,57 @@ class _RoleClient:
             await self._invalidate(pool)
             raise
         finally:
-            wrapped._finish()
+            wrapped.finish()
             if self._client is not pool and pinned.connection is not None:
                 with suppress(Exception):
                     await pinned.connection.disconnect(nowait=True)
             await _close_pin(pinned, cancellation)
 
     async def refresh(self) -> None:
-        """Detach the affected pool and construct a fresh lazy replacement."""
+        """Discard the current pool and construct its lazy replacement.
+
+        The replacement is constructed after detachment; it is not a borrowed
+        pin.
+
+        Pool release uses `valkey.asyncio.Valkey.aclose`, which owns the
+        upstream release contract. This boundary normalizes client failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         await self._invalidate()
         self._active()
 
     async def refresh_endpoint(self) -> None:
-        """Discover and publish the current endpoint outside pure epoch sampling."""
+        """Refresh primary discovery and discard a pool whose endpoint changed.
+
+        Do nothing when the role has no endpoint probe.
+
+        Discovery arguments, results and upstream errors are owned by
+        `valkey.asyncio.sentinel.SentinelConnectionPool.get_master_address`;
+        this boundary normalizes discovery failures.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         self._affinity.check()
         probe = self._endpoint_probe
         if probe is None:
@@ -587,7 +851,7 @@ class _RoleClient:
         endpoint: object | None = None
         try:
             endpoint = await probe(client)
-        except (BackendCapacity, BackendProtocolError, BackendUnavailable, StaleIncarnation):
+        except BACKEND_ERRORS:
             raise
         except Exception as error:  # noqa: BLE001 - closed discovery boundary
             failure = error
@@ -602,7 +866,39 @@ class _RoleClient:
             await self._invalidate(client)
 
     async def run_operation(self, operation: Callable[[PinnedControlClient], Awaitable[_T]]) -> _T:
-        """Check one result command's endpoint and physical delivery span."""
+        """Run result work within one verified physical-connection span.
+
+        Borrowing uses `valkey.asyncio.Valkey.client`; discovery uses
+        `valkey.asyncio.sentinel.SentinelConnectionPool.get_master_address`.
+        Those methods own their upstream contracts. Callback command contracts
+        belong to the corresponding `valkey.asyncio.Valkey` methods.
+
+        Callback failures propagate after successful settlement; settlement
+        failures take precedence. Cancellation skips settlement and joins pin
+        release.
+
+        Args:
+            operation: Callback receiving a pinned client valid only for this
+                call. It may issue multiple commands. Await its result before
+                settlement.
+
+        Returns:
+            The callback result after endpoint and connection state settle
+            unchanged.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            Exception: The callback fails and role settlement succeeds.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         before = self._role_epoch()
         await self.refresh_endpoint()
         # Initial discovery is admission, not a change of an existing endpoint.
@@ -613,43 +909,154 @@ class _RoleClient:
         async with self.pin() as pinned:
             pool = self._active()
             initial = self._role_epoch(), pinned.connection_generation()
-            cancelled = False
+            outcome: tuple[_T, ...] = ()
+            operation_failure: BaseException | None = None
             try:
-                return await operation(pinned)
-            except CancelledError:
-                cancelled = True
+                outcome = (await operation(pinned),)
+            except BaseException as error:
+                if isinstance(error, CancelledError):
+                    raise
+                operation_failure = error
+            try:
+                await self.refresh_endpoint()
+            except BaseException:
+                del operation_failure
                 raise
-            finally:
-                if not cancelled:
-                    await self.refresh_endpoint()
-                    if (self._role_epoch(), pinned.connection_generation()) != initial:
-                        await self._invalidate(pool)
-                        raise BackendUnavailable('Valkey role changed during operation')
+            if (self._role_epoch(), pinned.connection_generation()) != initial:
+                failure_class = client_failure_class(
+                    operation_failure if isinstance(operation_failure, Exception) else None
+                )
+                del operation_failure
+                await self._invalidate(pool)
+                raise BackendUnavailable(
+                    'Valkey role changed during operation', failure_class=failure_class
+                ) from None
+            if operation_failure is not None:
+                raise operation_failure
+            if not outcome:
+                raise BackendUnavailable('Valkey operation did not return an outcome')
+            return outcome[0]
 
     async def evalsha(self, sha: str, numkeys: int, *keys_and_args: ScriptArgument) -> object:
-        """Execute one cached script inside an observed role delivery span."""
+        """Execute a cached backend script within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.evalsha`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         return await self.run_operation(
             lambda client: client.evalsha(sha, numkeys, *keys_and_args)
         )
 
     async def exists(self, key: str) -> object:
-        """Read key existence inside an observed role delivery span."""
+        """Check control-key presence within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.exists`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         return await self.run_operation(lambda client: client.exists(key))
 
     async def get(self, key: str) -> object:
-        """Read one raw value inside an observed role delivery span.
+        """Read the control record within a verified role span.
 
-        Returns:
-            The raw stored value, or `None` when the key is absent.
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.get`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
         """
         return await self.run_operation(lambda client: client.get(key))
 
     async def info(self, section: str) -> object:
-        """Read server information inside an observed role delivery span."""
+        """Read replication information within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.info`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         return await self.run_operation(lambda client: client.info(section))
 
     async def script_load(self, script: bytes | str) -> object:
-        """Load a script and return its raw server digest inside an observed role span."""
+        """Load a backend script within a verified role span.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.script_load`.
+
+        Discovery, connection acquisition and final settlement follow
+        `run_operation`;
+        reject a result if the role or physical connection changes.
+
+        Raises:
+            BackendCapacity: Valkey rejects required discovery, setup, or
+                cleanup for capacity.
+            BackendProtocolError: Required discovery, setup, or cleanup
+                violates the backend protocol.
+            BackendUnavailable: The role changes or its connection state cannot
+                be established or settled.
+            RuntimeError: The role belongs to another event loop or required
+                pool access finds it closed.
+            CancelledError: The caller cancels the operation; connection
+                cleanup is joined before propagation.
+        """
         return await self.run_operation(lambda client: client.script_load(script))
 
 
@@ -663,16 +1070,12 @@ class _PinnedRoleClient:
         self._pool = pool
         self._finished = False
 
-    def _finish(self) -> None:
-        """Revoke this pin synchronously before release can suspend."""
-        self._finished = True
-
     async def _invoke(self, *args: ScriptArgument) -> object:
         """Refuse detached pins and preserve maintained command cancellation handling."""
         if self._finished:
             raise BackendUnavailable('Valkey pin has left its scope')
         try:
-            return await self._owner._invoke_on(
+            return await self._owner.invoke_on(
                 self._pool,
                 lambda: self._client.execute_command(*args),
             )
@@ -690,30 +1093,115 @@ class _PinnedRoleClient:
             The role-wide generation recorded when this physical connection
             last connected, or `None` when it has no tracking record.
         """
-        return self._owner._connection_generation(self._client)
+        return self._owner.connection_generation(self._client)
 
     async def evalsha(self, sha: str, numkeys: int, *keys_and_args: ScriptArgument) -> object:
-        """Execute one cached script on the borrowed connection."""
+        """Execute a cached backend script on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.evalsha`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+
+        Raises:
+            BackendCapacity: Cleanup after a reconnect-class failure is
+                rejected for capacity.
+            BackendProtocolError: Cleanup after a reconnect-class failure
+                violates the backend protocol.
+            BackendUnavailable: The pin has left its scope, its pool was
+                discarded, the role closed, or cleanup failed.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels the command; the interrupted
+                connection is settled before propagation.
+        """
         return await self._invoke('EVALSHA', sha, numkeys, *keys_and_args)
 
     async def exists(self, key: str) -> object:
-        """Read key existence on the borrowed connection."""
+        """Check control-key presence on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.exists`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+
+        Raises:
+            BackendCapacity: Cleanup after a reconnect-class failure is
+                rejected for capacity.
+            BackendProtocolError: Cleanup after a reconnect-class failure
+                violates the backend protocol.
+            BackendUnavailable: The pin has left its scope, its pool was
+                discarded, the role closed, or cleanup failed.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels the command; the interrupted
+                connection is settled before propagation.
+        """
         return await self._invoke('EXISTS', key)
 
-    async def get(self, key: str) -> object:
-        """Read one raw string value on the borrowed connection.
+    def finish(self) -> None:
+        """Revoke this pin synchronously before release can suspend."""
+        self._finished = True
 
-        Returns:
-            The raw stored value, or `None` when the key is absent.
+    async def get(self, key: str) -> object:
+        """Read the control record on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.get`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+
+        Raises:
+            BackendCapacity: Cleanup after a reconnect-class failure is
+                rejected for capacity.
+            BackendProtocolError: Cleanup after a reconnect-class failure
+                violates the backend protocol.
+            BackendUnavailable: The pin has left its scope, its pool was
+                discarded, the role closed, or cleanup failed.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels the command; the interrupted
+                connection is settled before propagation.
         """
         return await self._invoke('GET', key)
 
     async def info(self, section: str) -> object:
-        """Read one parsed information section on the borrowed connection."""
+        """Read replication information on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.info`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+
+        Raises:
+            BackendCapacity: Cleanup after a reconnect-class failure is
+                rejected for capacity.
+            BackendProtocolError: Cleanup after a reconnect-class failure
+                violates the backend protocol.
+            BackendUnavailable: The pin has left its scope, its pool was
+                discarded, the role closed, or cleanup failed.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels the command; the interrupted
+                connection is settled before propagation.
+        """
         return await self._invoke('INFO', section)
 
     async def script_load(self, script: bytes | str) -> object:
-        """Load one script and return its raw server digest on the borrowed connection."""
+        """Load a backend script on the borrowed connection.
+
+        Arguments, results and command errors are those of
+        `valkey.asyncio.Valkey.script_load`.
+
+        Reconnect-class command failures invalidate the owning role pool.
+
+        Raises:
+            BackendCapacity: Cleanup after a reconnect-class failure is
+                rejected for capacity.
+            BackendProtocolError: Cleanup after a reconnect-class failure
+                violates the backend protocol.
+            BackendUnavailable: The pin has left its scope, its pool was
+                discarded, the role closed, or cleanup failed.
+            RuntimeError: The role belongs to another event loop.
+            CancelledError: The caller cancels the command; the interrupted
+                connection is settled before propagation.
+        """
         return await self._invoke('SCRIPT LOAD', script)
 
 
@@ -723,7 +1211,11 @@ class _SentinelAPI(Protocol):
     sentinels: list[_RawClient]
 
     def master_for(self, service_name: str, **kwargs: object) -> _RawClient:
-        """Construct a lazy maintained primary client for one service."""
+        """Construct the lazy primary client owned by a backend role.
+
+        Arguments, results and client errors are those of
+        `valkey.asyncio.sentinel.Sentinel.master_for`.
+        """
         ...
 
 
@@ -748,6 +1240,15 @@ class _ConfiguredRole(_RoleClient):
 
     @override
     async def close(self) -> None:
+        """Close the primary role and all retained discovery clients.
+
+        Raises:
+            BackendCapacity: A client reports capacity rejection during
+                cleanup.
+            BackendProtocolError: A client reports invalid protocol data during
+                cleanup.
+            BackendUnavailable: An owned resource cannot be closed.
+        """
         resources = [super().close]
         discovery, self._discovery = self._discovery, []
         resources.extend(partial(_close_raw, client) for client in discovery)
@@ -776,6 +1277,8 @@ class AsyncValkeyMetadataStore:
     Concurrent close calls join cleanup; later close calls do nothing.
     Cancellation joins owned work before returning.
     """
+
+    owns_published_deadline = True
 
     __slots__ = (
         '_breaker',
@@ -871,48 +1374,6 @@ class AsyncValkeyMetadataStore:
         with suppress(Exception):
             self._metrics.observe(name, value, labels)
 
-    async def _guard(self, name: str, operation: Callable[[], Awaitable[_T]]) -> _T:
-        """Run one metadata operation through its role breaker."""
-        started_at = monotonic()
-        fresh = self._breaker.admit()
-        try:
-            async with self._lifecycle._budget():
-                if fresh:
-                    await self._client.refresh()
-                result = await operation()
-        except BackendCapacity:
-            self._metadata_capacity_failure(fresh)
-            raise
-        except StaleIncarnation:
-            if fresh:
-                self._breaker.succeed()
-            raise
-        except (BackendProtocolError, BackendUnavailable):
-            self._increment(
-                'backend_failure',
-                {'backend_operation': name, 'outcome': 'failure'},
-            )
-            self._breaker.fail()
-            raise
-        except BaseException:
-            if fresh:
-                self._breaker.fail()
-            raise
-        self._breaker.succeed()
-        self._observe(
-            'backend_latency_seconds',
-            monotonic() - started_at,
-            {'backend_operation': name},
-        )
-        if self._metadata_pressure_started is not None:
-            self._observe(
-                'cache_metadata_recovery_seconds',
-                monotonic() - self._metadata_pressure_started,
-                {'outcome': 'recovered'},
-            )
-            self._metadata_pressure_started = None
-        return result
-
     async def _resolve(self, tags: tuple[DependencyTag, ...]) -> GenerationVector:
         """Perform one unguarded metadata vector resolution."""
 
@@ -937,6 +1398,63 @@ class AsyncValkeyMetadataStore:
 
         return await self._control.run(operation)
 
+    def _settle_guard(
+        self,
+        name: str,
+        error: BaseException | None,
+        *,
+        fresh: bool,
+        timer: Timeout | None,
+    ) -> None:
+        """Settle the admitted operation from its own timer before its outcome."""
+        expired = timer is not None and timer.expired()
+        if expired or isinstance(error, (BackendProtocolError, BackendUnavailable)):
+            failure_class = error.failure_class if isinstance(error, BackendUnavailable) else None
+            if expired:
+                failure_class = 'timeout'
+            labels = {'backend_operation': name, 'outcome': 'failure'}
+            if failure_class is not None:
+                labels['failure_class'] = failure_class
+            self._increment('backend_failure', labels)
+            self._breaker.fail(failure_class)
+        elif isinstance(error, BackendCapacity):
+            self._metadata_capacity_failure(fresh)
+        elif error is None or (fresh and isinstance(error, StaleIncarnation)):
+            self._breaker.succeed()
+        elif fresh:
+            if isinstance(error, CancelledError):
+                self._breaker.abandon()
+            else:
+                self._breaker.fail()
+
+    async def _guard(self, name: str, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Run one metadata operation through its role breaker."""
+        started_at = monotonic()
+        fresh = self._breaker.admit()
+        timer: Timeout | None = None
+        try:
+            async with self._lifecycle.budget() as timer:
+                if fresh:
+                    await self._client.refresh()
+                result = await operation()
+        except BaseException as error:
+            self._settle_guard(name, error, fresh=fresh, timer=timer)
+            raise
+        self._settle_guard(name, None, fresh=fresh, timer=timer)
+        self._observe(
+            'backend_latency_seconds',
+            monotonic() - started_at,
+            {'backend_operation': name},
+        )
+        if self._metadata_pressure_started is not None:
+            self._observe(
+                'cache_metadata_recovery_seconds',
+                monotonic() - self._metadata_pressure_started,
+                {'outcome': 'recovered'},
+            )
+            self._metadata_pressure_started = None
+        return result
+
     async def change(self, changes: tuple[GenerationChange, ...]) -> None:
         """Replace all applicable generations in one metadata script.
 
@@ -944,11 +1462,18 @@ class AsyncValkeyMetadataStore:
             changes: Ordered global and replace-if-materialized scoped changes.
 
         Raises:
-            BackendProtocolError: The change tuple is malformed.
+            BackendCapacity: Required generation metadata cannot be retained.
+            BackendProtocolError: The change tuple or a backend reply is
+                malformed.
+            BackendUnavailable: Metadata validation or the change cannot
+                complete reliably.
             StaleIncarnation: Control state changed or its counter requires
                 rotation.
+            RuntimeError: The store is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             validated = generation_changes(changes)
             return await self._guard('change', lambda: self._change(validated))
 
@@ -969,16 +1494,29 @@ class AsyncValkeyMetadataStore:
             BackendProtocolError: A role close reports a malformed response.
             BackendUnavailable: A role close cannot complete.
         """
-        await self._lifecycle._close((self._client.close,))
+        await self._lifecycle.close((self._client.close,))
 
     async def flush_site(self, site_namespace: str, reason: str) -> None:
         """Replace one site's permanent generation through the metadata role.
 
         Args:
             site_namespace: Stable configured site namespace.
-            reason: Short operator-facing reason code.
+            reason: Nonempty operator-facing ASCII reason of at most 64
+                characters.
+
+        Raises:
+            BackendCapacity: Required global metadata cannot be retained.
+            BackendProtocolError: The namespace, reason, or backend reply is
+                malformed.
+            BackendUnavailable: Metadata validation or the flush cannot
+                complete reliably.
+            StaleIncarnation: Control state changed or its counter requires
+                rotation.
+            RuntimeError: The store is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             try:
                 tag = DependencyTag.site(site_namespace)
             except (TypeError, ValueError):
@@ -1016,7 +1554,9 @@ class AsyncValkeyMetadataStore:
         """
         require_enabled_l2(settings)
         role = settings.l2.valkey.metadata
-        client = await _create_client(role, settings, role_password(role, environ), metrics)
+        client = await _create_client(
+            role, settings, role_password(role, environ, 'metadata'), metrics
+        )
         try:
             return cls(client, settings, metrics)
         except BaseException as error:
@@ -1030,15 +1570,21 @@ class AsyncValkeyMetadataStore:
             tags: Ordered unique validated dependency tags.
 
         Returns:
-            Every tag and token under the active incarnation.
+            Every tag and token in request order under the active incarnation.
 
         Raises:
-            BackendProtocolError: The vector is malformed or exceeds its
-                bounds.
+            BackendCapacity: Metadata capacity cannot retain the vector.
+            BackendProtocolError: The vector or backend reply is malformed, or
+                the vector exceeds its bounds.
+            BackendUnavailable: Metadata validation or resolution cannot
+                complete reliably.
             StaleIncarnation: Control state changed or its counter requires
                 rotation.
+            RuntimeError: The store is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             validated = validated_resolve_tags(tags, self._settings)
             self._observe(
                 'cache_dependency_vector_tags',
@@ -1073,6 +1619,8 @@ class AsyncValkeyBackend:
     Concurrent close calls join cleanup; later close calls do nothing.
     Cancellation joins owned work before returning.
     """
+
+    owns_published_deadline = True
 
     __slots__ = (
         '_lifecycle',
@@ -1184,31 +1732,47 @@ class AsyncValkeyBackend:
             return None
         return FillLease(key, token)
 
+    def _settle_guard(
+        self,
+        name: str,
+        error: BaseException | None,
+        *,
+        fresh: bool,
+        timer: Timeout | None,
+    ) -> None:
+        """Settle the admitted operation from its own timer before its outcome."""
+        expired = timer is not None and timer.expired()
+        if expired or isinstance(error, (BackendProtocolError, BackendUnavailable)):
+            failure_class = error.failure_class if isinstance(error, BackendUnavailable) else None
+            if expired:
+                failure_class = 'timeout'
+            labels = {'backend_operation': name, 'outcome': 'failure'}
+            if failure_class is not None:
+                labels['failure_class'] = failure_class
+            self._increment('backend_failure', labels)
+            self._result_breaker.fail(failure_class)
+        elif error is None or (fresh and isinstance(error, (BackendCapacity, StaleIncarnation))):
+            self._result_breaker.succeed()
+        elif fresh:
+            if isinstance(error, CancelledError):
+                self._result_breaker.abandon()
+            else:
+                self._result_breaker.fail()
+
     async def _result_guard(self, name: str, operation: Callable[[], Awaitable[_T]]) -> _T:
         """Run one result operation through its independent role breaker."""
         started_at = monotonic()
         fresh = self._result_breaker.admit()
+        timer: Timeout | None = None
         try:
-            async with self._lifecycle._budget():
+            async with self._lifecycle.budget() as timer:
                 if fresh:
                     await self._result_client.refresh()
                 result = await operation()
-        except (BackendCapacity, StaleIncarnation):
-            if fresh:
-                self._result_breaker.succeed()
+        except BaseException as error:
+            self._settle_guard(name, error, fresh=fresh, timer=timer)
             raise
-        except (BackendProtocolError, BackendUnavailable):
-            self._increment(
-                'backend_failure',
-                {'backend_operation': name, 'outcome': 'failure'},
-            )
-            self._result_breaker.fail()
-            raise
-        except BaseException:
-            if fresh:
-                self._result_breaker.fail()
-            raise
-        self._result_breaker.succeed()
+        self._settle_guard(name, None, fresh=fresh, timer=timer)
         self._observe(
             'backend_latency_seconds',
             monotonic() - started_at,
@@ -1221,8 +1785,19 @@ class AsyncValkeyBackend:
 
         Args:
             changes: Ordered generation replacements to acknowledge together.
+
+        Raises:
+            BackendCapacity: Required generation metadata cannot be retained.
+            BackendProtocolError: The change tuple or backend reply is
+                malformed.
+            BackendUnavailable: Metadata validation or the change cannot
+                complete reliably.
+            StaleIncarnation: The metadata incarnation is no longer current.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             await self._metadata.change(changes)
 
     async def close(self) -> None:
@@ -1242,16 +1817,28 @@ class AsyncValkeyBackend:
             BackendProtocolError: A role close reports a malformed response.
             BackendUnavailable: A role close cannot complete.
         """
-        await self._lifecycle._close((self._result_client.close, self._metadata.close))
+        await self._lifecycle.close((self._result_client.close, self._metadata.close))
 
     async def flush_site(self, site_namespace: str, reason: str) -> None:
         """Replace one site's permanent site generation.
 
         Args:
             site_namespace: Stable configured site namespace.
-            reason: Short operator-facing reason code.
+            reason: Nonempty operator-facing ASCII reason of at most 64
+                characters.
+
+        Raises:
+            BackendCapacity: Required global metadata cannot be retained.
+            BackendProtocolError: The namespace, reason, or backend reply is
+                malformed.
+            BackendUnavailable: Metadata validation or the flush cannot
+                complete reliably.
+            StaleIncarnation: The metadata incarnation is no longer current.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             await self._metadata.flush_site(site_namespace, reason)
 
     @classmethod
@@ -1284,8 +1871,8 @@ class AsyncValkeyBackend:
         require_enabled_l2(settings)
         metadata_role = settings.l2.valkey.metadata
         result_role = settings.l2.valkey.result
-        metadata_password = role_password(metadata_role, environ)
-        result_password = role_password(result_role, environ)
+        metadata_password = role_password(metadata_role, environ, 'metadata')
+        result_password = role_password(result_role, environ, 'result')
         resources: list[Callable[[], Awaitable[None]]] = []
         try:
             metadata_client = await _create_client(
@@ -1301,15 +1888,27 @@ class AsyncValkeyBackend:
             raise
 
     async def lookup(self, key: str) -> CacheHit | None:
-        """Read valid encoded bytes and their server-authoritative remaining age.
+        """Read valid encoded bytes with conservatively debited remaining age.
 
         Args:
-            key: Opaque generation-qualified result key.
+            key: Nonempty UTF-8 generation-qualified result key.
 
         Returns:
-            An isolated hit, or `None` for absence, expiry, or malformed data.
+            An isolated hit carrying a fresh decoded value and the server TTL
+            after elapsed lookup processing is deducted, or `None` for absence,
+            expiry, oversized values, or malformed data.
+
+        Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
+            BackendProtocolError: The key or backend reply is malformed.
+            BackendUnavailable: The result role is unavailable or the lookup
+                cannot complete reliably.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             normalized = opaque_key(key)
             outcome = finalize_lookup(
                 await self._result_guard('lookup', lambda: self._lookup(normalized)), monotonic
@@ -1325,35 +1924,53 @@ class AsyncValkeyBackend:
             lease: Exact key and random token returned by `reserve`.
 
         Returns:
-            Whether the current lease was removed.
+            Whether the current lease was removed; `False` if it is absent or
+            belongs to another token.
+
+        Raises:
+            BackendCapacity: The result role rejects required work for
+                capacity.
+            BackendProtocolError: The lease or backend reply is malformed.
+            BackendUnavailable: The result role is unavailable or release
+                cannot complete reliably.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             validated = fill_lease(lease)
             return await self._result_guard('release', lambda: self._release(validated))
 
     async def commit(self, lease: FillLease, payload: bytes, remaining_seconds: float) -> bool:
         """Store bytes only while the exact result-role lease remains current.
 
-        Oversized payloads release the matching lease and return false. A
-        script capacity-rejection reply, an obsolete lease, or exhaustion of
-        the entry-anchored lifetime also returns false.
+        Elapsed work is deducted from the lifetime measured at method entry.
+        An oversized payload triggers an attempt to release its lease.
 
         Args:
             lease: Exact key and random token returned by `reserve`.
             payload: Closed-codec result bytes.
-            remaining_seconds: Authoritative remaining lifetime in seconds, at
-                least one millisecond after flooring and at most 2**63 - 1
-                milliseconds.
+            remaining_seconds: Finite remaining lifetime in seconds whose
+                floored milliseconds fit a positive signed 64-bit integer.
 
         Returns:
-            Whether the result was admitted under the current lease.
+            Whether the result was admitted under the current lease. Return
+            `False` for a lost lease, an exhausted lifetime, an oversized
+            payload, or capacity rejection during the commit operation.
 
         Raises:
-            BackendProtocolError: The lifetime cannot be represented as a
-                positive signed 64-bit millisecond duration.
+            BackendCapacity: Role preparation or oversized-payload lease
+                cleanup encounters a capacity failure.
+            BackendProtocolError: An argument or backend reply violates the
+                backend contract.
+            BackendUnavailable: The result role is unavailable or commit or
+                oversized-payload lease cleanup cannot complete reliably.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
         entered_at = monotonic()
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             validated_lease = fill_lease(lease)
             validated_payload = encoded_payload(payload)
             milliseconds(remaining_seconds, 'remaining lifetime')
@@ -1383,18 +2000,24 @@ class AsyncValkeyBackend:
         """Reserve temporary fill ownership with a random result-role token.
 
         Args:
-            key: Opaque generation-qualified result key.
-            lease_seconds: Maximum ownership duration in seconds, floored to
-                between 1 and 2**63 - 1 milliseconds.
+            key: Nonempty UTF-8 generation-qualified result key.
+            lease_seconds: Finite ownership duration in seconds whose floored
+                milliseconds fit a positive signed 64-bit integer.
 
         Returns:
             A fresh lease, or `None` while another lease remains current.
 
         Raises:
-            BackendProtocolError: The lifetime cannot be represented as a
-                positive signed 64-bit millisecond duration.
+            BackendCapacity: The result role cannot retain the lease.
+            BackendProtocolError: An argument or backend reply violates the
+                backend contract.
+            BackendUnavailable: Entropy is unavailable, the result role is
+                unavailable, or reservation cannot complete reliably.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             normalized = opaque_key(key)
             ttl = milliseconds(lease_seconds, 'lease duration')
             try:
@@ -1415,22 +2038,37 @@ class AsyncValkeyBackend:
             tags: Ordered unique dependency tags.
 
         Returns:
-            Every requested tag and current token.
+            Every requested tag and current token in request order under one
+            metadata incarnation.
+
+        Raises:
+            BackendCapacity: Metadata capacity cannot retain the vector.
+            BackendProtocolError: The vector or backend reply is malformed, or
+                the vector exceeds its bounds.
+            BackendUnavailable: Metadata validation or resolution cannot
+                complete reliably.
+            StaleIncarnation: The metadata incarnation is no longer current.
+            RuntimeError: The backend is closing, closed, or bound to another
+                event loop.
+            CancelledError: The caller cancels the operation.
         """
-        with self._lifecycle._operation():
+        with self._lifecycle.operation():
             return await self._metadata.resolve(tags)
 
 
 async def _close_pin(client: _RawClient, cancellation: CancelledError | None) -> None:
     """Join maintained pin release before propagating cancellation or failure."""
     connection = client.connection
+    token = (
+        client.connection_pool.borrow_tokens.get(connection) if connection is not None else None
+    )
     outcome = await joined_cleanup(lambda: client.aclose(close_connection_pool=False))
-    # aclose clears connection before release, so the outer owner settles only
-    # when the owned cleanup failed. After a completed release, another pin may
-    # already have re-borrowed this connection.
+    # aclose clears connection before release. Settle failed cleanup only while
+    # the token still identifies this borrow; release may have succeeded before
+    # a later failure, allowing another pin to acquire the same connection.
     client.connection = None
     if connection is not None and outcome.error is not None:
-        await client.connection_pool._settle_release(connection)
+        await client.connection_pool.settle_release(connection, token)
     if cancellation is not None:
         raise cancellation
     if outcome.cancellation is not None:
@@ -1443,7 +2081,7 @@ async def _close_raw(client: _RawClient) -> None:
     """Close one discovery pool and settle interrupted maintained cleanup."""
     outcome = await joined_cleanup(lambda: client.aclose(close_connection_pool=True))
     if outcome.error is not None:
-        await client.connection_pool._settle_disconnect()
+        await client.connection_pool.settle_disconnect()
     if outcome.cancellation is not None:
         raise outcome.cancellation
     if outcome.error is not None:
@@ -1470,8 +2108,6 @@ async def _create_client(
     """Construct one lazy role and own each separate Sentinel discovery client."""
     tracker = _ConnectionGeneration(prove_primary=role.mode != 'standalone')
     service_name = role.service_name
-    if role.mode == 'sentinel' and service_name is None:
-        raise BackendProtocolError('Valkey Sentinel service name is absent')
     discovery: list[_RawClient] = []
     kwargs: dict[str, object] = {
         'db': role.database,
@@ -1517,7 +2153,7 @@ async def _create_client(
                     cast('str', service_name),
                     connection_pool_class=_SentinelConnectionPool,
                     ssl=role.tls,
-                    valkey_connect_func=tracker._initialize,
+                    valkey_connect_func=tracker.initialize,
                     **kwargs,
                 )
             pool = _ConnectionPool(
@@ -1525,7 +2161,7 @@ async def _create_client(
                 max_connections=None,
                 host=role.host,
                 port=role.port,
-                valkey_connect_func=tracker._initialize,
+                valkey_connect_func=tracker.initialize,
                 **kwargs,
             )
             return cast('_RawClient', cast('object', Valkey.from_pool(pool)))

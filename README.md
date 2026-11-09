@@ -3,8 +3,9 @@
 sg-query-cache reduces repeated Autodesk Flow Production Tracking API reads from Python workers.
 When render jobs, pipeline tools, or services ask the same question many times, the cache answers
 the repeats from memory or from a shared Valkey service instead of sending another request to the
-site. It wraps your existing synchronous or native asynchronous client and keeps its method
-signatures, so your code changes only where it creates the client.
+site. It wraps your existing synchronous or native asynchronous client. The methods it wraps keep
+the client's signatures, and you call any other method or attribute on `raw_client`; see
+[which reads are cached](docs/consistency.md#which-reads-are-cached).
 
 This documentation uses SG for Flow Production Tracking, formerly named Shotgun and ShotGrid.
 
@@ -53,8 +54,8 @@ python -m pip install .
 ```
 
 For the shared or hierarchical layout, include the `valkey` extra. It adds the Valkey client that
-the cache and the `sg-query-cache` operator commands use. The extra accepts valkey-py 6.1.x, the
-release family this version is tested with:
+the cache and the `sg-query-cache` operator commands use. The extra requires valkey-py
+`>=6.1.1,<6.2`:
 
 ```sh
 python -m pip install '.[valkey]'
@@ -77,9 +78,6 @@ from sg_query_cache import (
     CachedShotgun,
     ClientContext,
     Identity,
-    LocalBackend,
-    NullMetrics,
-    QueryCache,
 )
 
 site_url = os.environ['SHOTGUN_URL']
@@ -88,7 +86,6 @@ raw_sg = Shotgun(site_url, script_name=script_name, api_key=os.environ['SHOTGUN_
 
 settings = CacheSettings()
 identity = Identity(kind='script', issuer='shotgun-script', namespace=script_name)
-cache = QueryCache(settings, identity, l1=LocalBackend(settings, monotonic, NullMetrics()))
 context = ClientContext(
     site_url=site_url,
     site_namespace=settings.site_namespace,
@@ -96,22 +93,21 @@ context = ClientContext(
     convert_datetimes_to_utc=raw_sg.config.convert_datetimes_to_utc,
     records_per_page=raw_sg.config.records_per_page,
 )
-sg = CachedShotgun(raw_sg, cache, context)
 
 
-def timed_read(label: str) -> None:
+def timed_read(sg: CachedShotgun, label: str) -> None:
     started = monotonic()
     assets = sg.find('Asset', [['sg_status_list', 'is', 'ip']], ['code'])
     print(f'{label}: {len(assets)} assets in {monotonic() - started:.3f} s')
 
 
 try:
-    timed_read('first read')
-    timed_read('second read')
-    with sg.bypass():
-        timed_read('bypass')
+    with CachedShotgun.open(raw_sg, settings, identity, context) as sg:
+        timed_read(sg, 'first read')
+        timed_read(sg, 'second read')
+        with sg.bypass():
+            timed_read(sg, 'bypass')
 finally:
-    cache.close()
     raw_sg.close()
 ```
 
@@ -136,8 +132,8 @@ The example sets up four pieces:
   this script shares one identity named after the script; give scripts with different permissions
   different identities. Use stable configuration values, never an API key, session token, or
   process ID, because identity values become part of every cache key.
-- `QueryCache` with a `LocalBackend` is the cache itself. The wrapper closes neither the cache nor
-  the SG client, so the example closes both.
+- `CachedShotgun.open()` builds the cache layers selected by the settings and closes them on
+  context exit. The SG client remains yours to close, as the `finally` block does here.
 - `ClientContext` records the raw client's response options, such as page size, so results fetched
   with different options are never mixed. Keep it matched to the raw client's configuration.
 

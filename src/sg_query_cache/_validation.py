@@ -36,8 +36,8 @@ def require_nonempty_string(value: object, owner: str) -> str:
     return value
 
 
-def require_positive_int(value: object, owner: str) -> None:
-    """Require a positive non-boolean integer.
+def require_positive_int(value: object, owner: str) -> int:
+    """Return a positive non-boolean integer after validating it.
 
     Args:
         value: Candidate integer value.
@@ -51,6 +51,7 @@ def require_positive_int(value: object, owner: str) -> None:
         raise TypeError(f'{owner} must be an integer')
     if value <= 0:
         raise ValueError(f'{owner} must be positive')
+    return value
 
 
 def require_positive_number(value: object, owner: str) -> None:

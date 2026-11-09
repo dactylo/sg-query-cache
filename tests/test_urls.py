@@ -90,7 +90,8 @@ def test_configured_margin_is_subtracted_from_the_embedded_expiry() -> None:
     assert decision.remaining_seconds == pytest.approx(75)
 
 
-def test_earliest_expiry_across_rows_and_fields_wins() -> None:
+@pytest.mark.parametrize('reverse', [False, True])
+def test_earliest_expiry_across_rows_and_fields_wins(reverse: bool) -> None:
     value = [
         {
             'image': (
@@ -100,6 +101,8 @@ def test_earliest_expiry_across_rows_and_fields_wins() -> None:
         {'download': _ABSOLUTE_URL},
     ]
 
+    if reverse:
+        value.reverse()
     decision = _decision(value, {'image': 'image', 'download': 'image'})
 
     assert decision.remaining_seconds == pytest.approx(90)
@@ -221,6 +224,7 @@ def test_upload_declines_noncanonical_aws_v4_timestamp(stamp: str) -> None:
     [
         (20, None, 'signed_url_expired'),
         (32, 2, 'signed_url'),
+        (120, 5, 'transient_image'),
     ],
 )
 def test_transient_image_also_obeys_its_signed_expiry(

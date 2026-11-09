@@ -62,6 +62,19 @@ def test_bounded_affected_humans_change_each_exact_identity(
     assert GenerationChange(DependencyTag.human_visibility(_SITE)) not in changes
 
 
+def test_change_read_after_retirement_maps_from_event_metadata(
+    events: Mapping[str, Mapping[str, object]],
+) -> None:
+    event = dict(events['asset_change'])
+    event['entity'] = None
+
+    assert changes_for_event(_SITE, event) == (
+        GenerationChange(DependencyTag.type_value(_SITE, 'Asset')),
+        GenerationChange(DependencyTag.type_field(_SITE, 'Asset', 'code')),
+        GenerationChange(DependencyTag.entity(_SITE, 'Asset', 7)),
+    )
+
+
 def test_combined_human_identity_bound_allows_exactly_32_unique_ids(
     events: Mapping[str, Mapping[str, object]],
 ) -> None:
@@ -201,6 +214,25 @@ def test_lifecycle_changes_membership_and_entity(
     )
 
 
+@pytest.mark.parametrize(
+    'meta',
+    [
+        {'entity_id': 7, 'entity_type': 'Shot'},
+        {'entity_id': 0, 'entity_type': 'Asset'},
+        {'entity_id': True, 'entity_type': 'Asset'},
+        {'entity_type': 'Asset'},
+        {'entity_id': 7},
+    ],
+)
+def test_event_without_entity_link_or_matching_metadata_changes_site(
+    events: Mapping[str, Mapping[str, object]], meta: Mapping[str, object]
+) -> None:
+    event = dict(events['asset_retirement'])
+    event['meta'] = {'type': 'entity_retirement', **meta}
+
+    assert changes_for_event(_SITE, event) == (GenerationChange(DependencyTag.site(_SITE)),)
+
+
 def test_nonfield_schema_event_changes_schema_and_affected_type_state(
     events: Mapping[str, Mapping[str, object]],
 ) -> None:
@@ -305,6 +337,16 @@ def test_contradictory_event_metadata_changes_site(
     event['meta'] = {**cast('Mapping[str, object]', event['meta']), field: value}
 
     assert changes_for_event(_SITE, event) == (GenerationChange(DependencyTag.site(_SITE)),)
+
+
+def test_retirement_without_entity_link_maps_from_event_metadata(
+    events: Mapping[str, Mapping[str, object]],
+) -> None:
+    # SG nulls a retired entity's event link; the metadata still names the entity.
+    assert changes_for_event(_SITE, events['asset_retirement']) == (
+        GenerationChange(DependencyTag.type_membership(_SITE, 'Asset')),
+        GenerationChange(DependencyTag.entity(_SITE, 'Asset', 7)),
+    )
 
 
 def test_unbounded_affected_humans_change_global_visibility(

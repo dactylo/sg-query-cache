@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
-from typing import TYPE_CHECKING, TypeAlias, cast
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeGuard, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from sg_query_cache._codec import CodecError, encode_value
@@ -21,6 +21,7 @@ from sg_query_cache._model import (
 )
 from sg_query_cache._policy import URL_PROVEN_TTL_ONLY_METHODS, is_known_field_type
 from sg_query_cache._query import FILTER_GROUP_KEYS, ORDER_ITEM_KEYS
+from sg_query_cache._urls import AgeDecision, cap_response_age
 from sg_query_cache._validation import (
     require_bool,
     require_nonempty_string,
@@ -31,9 +32,9 @@ if TYPE_CHECKING:
     from sg_query_cache._config import CacheSettings
 
 _CallBuilder: TypeAlias = Callable[[], ExactCall]
-_MAX_BATCH_CHANGES = 256
+_PostChanges: TypeAlias = Callable[[object], tuple[GenerationChange, ...]]
 
-HUMAN_VISIBILITY_ENTITY_TYPES = frozenset(
+_HUMAN_VISIBILITY_ENTITY_TYPES = frozenset(
     {
         'Addressing',
         'Group',
@@ -42,7 +43,7 @@ HUMAN_VISIBILITY_ENTITY_TYPES = frozenset(
         'TaskAssigneeConnection',
     }
 )
-HUMAN_VISIBILITY_FIELDS = frozenset(
+_HUMAN_VISIBILITY_FIELDS = frozenset(
     {
         'addressings_cc',
         'addressings_to',
@@ -60,8 +61,7 @@ HUMAN_VISIBILITY_FIELDS = frozenset(
         'users',
     }
 )
-IMPLICIT_UPLOAD_FIELDS = frozenset({'filmstrip_image', 'image'})
-PERMISSION_FIELDS = frozenset(
+_PERMISSION_FIELDS = frozenset(
     {
         'permission_group',
         'permission_role',
@@ -69,10 +69,34 @@ PERMISSION_FIELDS = frozenset(
         'permission_rule_set',
     }
 )
-PERMISSION_TYPES = frozenset({'ApiUser', 'PermissionRole', 'PermissionRuleSet'})
+_PERMISSION_TYPES = frozenset({'ApiUser', 'PermissionRole', 'PermissionRuleSet'})
+_FIND_ARGUMENT_NAMES = (
+    'entity_type',
+    'filters',
+    'fields',
+    'order',
+    'filter_operator',
+    'limit',
+    'retired_only',
+    'page',
+    'include_archived_projects',
+    'additional_filter_presets',
+)
+_FIND_ONE_ARGUMENT_NAMES = (
+    'entity_type',
+    'filters',
+    'fields',
+    'order',
+    'filter_operator',
+    'retired_only',
+    'include_archived_projects',
+    'additional_filter_presets',
+)
+_IMPLICIT_UPLOAD_FIELDS = frozenset({'filmstrip_image', 'image'})
+_MAX_BATCH_CHANGES = 256
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ClientContext:
     """Describe immutable response-affecting state for one wrapped SG client.
 
@@ -133,11 +157,81 @@ class EntityPlanContext:
     site_namespace: str
 
 
+@dataclass(frozen=True, slots=True)
+class EntityRead:
+    """Bind one `find` or `find_one` call's arguments for planning and dispatch.
+
+    Attributes:
+        method: The `find` or `find_one` method name.
+        entity_type: Queried SG entity type.
+        fields: Requested result fields, or `None` for the SG default.
+        values: Every argument in the official method's positional order.
+    """
+
+    method: Literal['find', 'find_one']
+    entity_type: str
+    fields: list[str] | None
+    values: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WritePlan:
+    """Describe the fences one write needs before dispatch and after its outcome.
+
+    Attributes:
+        changes: Changes fenced before dispatch and, by default, after success.
+        post_changes: Optional derivation of the post-success changes from the
+            raw result.
+        indeterminate_changes: Changes fenced after an indeterminate outcome
+            when they differ from `changes`.
+        repeat_on_exception: Whether every failure, not only an indeterminate
+            one, repeats the fence.
+    """
+
+    changes: tuple[GenerationChange, ...]
+    post_changes: _PostChanges | None = None
+    indeterminate_changes: tuple[GenerationChange, ...] | None = None
+    repeat_on_exception: bool = False
+
+
+def _batch_has_create(requests: list[dict[str, object]]) -> bool:
+    """Return whether a batch may have created an entity with a new ID."""
+    return any(request.get('request_type') == 'create' for request in requests)
+
+
+def _bound_call(build: _CallBuilder) -> ExactCall | None:
+    """Build one exact call or report an argument outside the closed vocabulary."""
+    try:
+        return build()
+    except (CodecError, TypeError, ValueError):
+        return None
+
+
+def _freeze(value: object) -> ExactValue:
+    """Detach SG arguments: lists to tuples, string-keyed mappings to ordered pairs."""
+    if value is None or isinstance(value, bool | int | float | str | bytes | date | datetime):
+        return value
+    if isinstance(value, Mapping):
+        mapping = cast('Mapping[object, object]', value)
+        return tuple(
+            (require_nonempty_string(name, 'mapping key'), _freeze(item))
+            for name, item in mapping.items()
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_freeze(item) for item in cast('Sequence[object]', value))
+    raise TypeError('SG call arguments must use supported immutable value types')
+
+
 def _identity_bypass_plan(identity: Identity, settings: CacheSettings) -> DependencyPlan | None:
     """Return a bypass plan when settings disable caching for this human identity."""
     if identity.kind == 'human' and settings.identity_policy == 'scripts_only':
         return DependencyPlan('bypass', (), 'human_caching_disabled')
     return None
+
+
+def _is_returned_field_type(field_type: str) -> bool:
+    """Recognize response types without changing filter classification."""
+    return is_known_field_type(field_type) or field_type == 'calculated'
 
 
 def _normalize_site_url(value: object) -> str:
@@ -166,7 +260,28 @@ def _normalize_site_url(value: object) -> str:
     return urlunsplit((parsed.scheme.lower(), netloc, '', '', ''))
 
 
-def _positive_id(value: object) -> bool:
+def _opaque(value: object) -> bytes:
+    """Encode one structured SG argument as deterministic closed-codec bytes."""
+    return encode_value(value)
+
+
+def _key_freeze(value: object) -> ExactValue:
+    """Detach arguments while preserving only recognized mappings as ordered pairs."""
+    if isinstance(value, Mapping):
+        mapping = cast('Mapping[object, object]', value)
+        keys = frozenset(mapping)
+        if keys in (FILTER_GROUP_KEYS, ORDER_ITEM_KEYS):
+            return tuple(
+                (require_nonempty_string(name, 'mapping key'), _key_freeze(item))
+                for name, item in mapping.items()
+            )
+        return _opaque(mapping)
+    if isinstance(value, list | tuple):
+        return tuple(_key_freeze(item) for item in cast('Sequence[object]', value))
+    return _freeze(value)
+
+
+def _positive_id(value: object) -> TypeGuard[int]:
     """Return whether one value is a positive nonboolean integer."""
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
@@ -183,10 +298,25 @@ def _returned_field_types(
         if not isinstance(field_name, str) or not field_name:
             return None
         field = schema.resolve_field(entity_type, field_name)
-        if field is None or not is_known_field_type(field.data_type):
+        if field is None or not _is_returned_field_type(field.data_type):
             return None
         result[field_name] = field.data_type
     return result
+
+
+def affects_authorization(entity_type: str, fields: Iterable[str]) -> bool:
+    """Return whether an entity or its changed fields affect authorization."""
+    return entity_type in _PERMISSION_TYPES or (
+        entity_type == 'HumanUser' and not _PERMISSION_FIELDS.isdisjoint(fields)
+    )
+
+
+def affects_human_visibility(entity_type: str, fields: Iterable[str]) -> bool:
+    """Return whether an entity or its changed fields affect human visibility."""
+    return (
+        entity_type in _HUMAN_VISIBILITY_ENTITY_TYPES
+        or not _HUMAN_VISIBILITY_FIELDS.isdisjoint(fields)
+    )
 
 
 def _security_visibility_tags(
@@ -198,35 +328,50 @@ def _security_visibility_tags(
     """Classify conservative authorization and human-visibility write effects."""
     field_names = frozenset(fields)
     tags: list[DependencyTag] = []
-    if entity_type in PERMISSION_TYPES or (
-        entity_type == 'HumanUser' and not field_names.isdisjoint(PERMISSION_FIELDS)
-    ):
+    if affects_authorization(entity_type, field_names):
         tags.append(DependencyTag.authorization(site_namespace))
     if entity_type == 'HumanUser':
         if entity_id is None:
             tags.append(DependencyTag.human_visibility(site_namespace))
         else:
             tags.append(DependencyTag.identity_visibility(site_namespace, entity_id))
-    if entity_type in HUMAN_VISIBILITY_ENTITY_TYPES or not field_names.isdisjoint(
-        HUMAN_VISIBILITY_FIELDS
-    ):
+    if affects_human_visibility(entity_type, field_names):
         global_visibility = DependencyTag.human_visibility(site_namespace)
         if global_visibility not in tags:
             tags.append(global_visibility)
     return tuple(tags)
 
 
-def batch_has_create(requests: list[dict[str, object]]) -> bool:
-    """Return whether a batch may have created an entity with a new ID."""
-    return any(request.get('request_type') == 'create' for request in requests)
+def _create_changes(
+    site_namespace: str,
+    entity_type: str,
+    data: Mapping[str, object],
+) -> tuple[GenerationChange, ...]:
+    """Build conservative type changes for a create without a known ID."""
+    tags = [
+        *_security_visibility_tags(site_namespace, entity_type, None, data),
+        DependencyTag.type_membership(site_namespace, entity_type),
+        DependencyTag.type_value(site_namespace, entity_type),
+    ]
+    tags.extend(DependencyTag.type_field(site_namespace, entity_type, field) for field in data)
+    return tuple(GenerationChange(tag) for tag in tags)
 
 
-def bound_call(build: _CallBuilder) -> ExactCall | None:
-    """Build one exact call or report an argument outside the closed vocabulary."""
-    try:
-        return build()
-    except (CodecError, TypeError, ValueError):
-        return None
+def _update_changes(
+    site_namespace: str,
+    entity_type: str,
+    entity_id: int,
+    data: Mapping[str, object],
+) -> tuple[GenerationChange, ...]:
+    """Build exact entity, value, changed-field, and membership changes."""
+    tags = [
+        *_security_visibility_tags(site_namespace, entity_type, entity_id, data),
+        DependencyTag.entity(site_namespace, entity_type, entity_id),
+        DependencyTag.type_value(site_namespace, entity_type),
+    ]
+    tags.extend(DependencyTag.type_field(site_namespace, entity_type, field) for field in data)
+    tags.append(DependencyTag.type_membership(site_namespace, entity_type))
+    return tuple(GenerationChange(tag) for tag in tags)
 
 
 def client_options(context: ClientContext, call: ExactCall) -> dict[str, object]:
@@ -248,19 +393,24 @@ def client_options(context: ClientContext, call: ExactCall) -> dict[str, object]
     return options
 
 
-def create_changes(
-    site_namespace: str,
-    entity_type: str,
-    data: Mapping[str, object],
-) -> tuple[GenerationChange, ...]:
-    """Build conservative type changes for a create without a known ID."""
-    tags = [
-        *_security_visibility_tags(site_namespace, entity_type, None, data),
-        DependencyTag.type_membership(site_namespace, entity_type),
-        DependencyTag.type_value(site_namespace, entity_type),
-    ]
-    tags.extend(DependencyTag.type_field(site_namespace, entity_type, field) for field in data)
-    return tuple(GenerationChange(tag) for tag in tags)
+def entity_calls(read: EntityRead) -> tuple[ExactCall | None, ExactCall | None]:
+    """Build analysis and exact-key calls from one ordered query vocabulary.
+
+    Returns:
+        Both normalized calls, or `None` for a call whose arguments cannot be
+        represented by its closed vocabulary.
+    """
+    names = _FIND_ARGUMENT_NAMES if read.method == 'find' else _FIND_ONE_ARGUMENT_NAMES
+    arguments = tuple(zip(names, read.values, strict=True))
+    analysis = _bound_call(
+        lambda: ExactCall(read.method, tuple((name, _freeze(value)) for name, value in arguments))
+    )
+    key = _bound_call(
+        lambda: ExactCall(
+            read.method, tuple((name, _key_freeze(value)) for name, value in arguments)
+        )
+    )
+    return analysis, key
 
 
 def entity_read_plan(
@@ -302,29 +452,6 @@ def exception_types(value: object) -> tuple[type[Exception], ...]:
     return cast('tuple[type[Exception], ...]', values)
 
 
-def freeze(value: object) -> ExactValue:
-    """Detach supported SG arguments into the exact-call closed vocabulary.
-
-    Lists become tuples; string-keyed mappings become ordered tuples of pairs.
-    Supported scalars and temporal values are retained.
-
-    Raises:
-        TypeError: A value is unsupported or a mapping key is not a string.
-        ValueError: A mapping key is empty.
-    """
-    if value is None or isinstance(value, bool | int | float | str | bytes | date | datetime):
-        return value
-    if isinstance(value, Mapping):
-        mapping = cast('Mapping[object, object]', value)
-        return tuple(
-            (require_nonempty_string(name, 'mapping key'), freeze(item))
-            for name, item in mapping.items()
-        )
-    if isinstance(value, list | tuple):
-        return tuple(freeze(item) for item in cast('Sequence[object]', value))
-    raise TypeError('SG call arguments must use supported immutable value types')
-
-
 def lifecycle_changes(
     site_namespace: str,
     entity_type: str,
@@ -340,63 +467,6 @@ def lifecycle_changes(
     return tuple(GenerationChange(tag) for tag in tags)
 
 
-def opaque(value: object) -> bytes:
-    """Encode one structured SG argument as deterministic closed-codec bytes.
-
-    Raises:
-        CodecError: The value is unsupported, nonfinite, or exceeds a codec
-            bound.
-    """
-    return encode_value(value)
-
-
-def key_freeze(value: object) -> ExactValue:
-    """Detach arguments while preserving only recognized mappings as ordered pairs.
-
-    Filter-group and order-item mappings remain tuples of string-keyed pairs.
-    Other mappings become opaque closed-codec bytes; lists and tuples are
-    recursively detached.
-
-    Raises:
-        CodecError: An opaque mapping is unsupported or exceeds a codec bound.
-        TypeError: A non-container value has an unsupported type.
-    """
-    if isinstance(value, Mapping):
-        mapping = cast('Mapping[object, object]', value)
-        keys = frozenset(mapping)
-        if keys in (FILTER_GROUP_KEYS, ORDER_ITEM_KEYS):
-            return tuple(
-                (require_nonempty_string(name, 'mapping key'), key_freeze(item))
-                for name, item in mapping.items()
-            )
-        return opaque(mapping)
-    if isinstance(value, list | tuple):
-        return tuple(key_freeze(item) for item in cast('Sequence[object]', value))
-    return freeze(value)
-
-
-def entity_calls(
-    method: str, arguments: tuple[tuple[str, object], ...]
-) -> tuple[ExactCall | None, ExactCall | None]:
-    """Build analysis and exact-key calls from one ordered query vocabulary.
-
-    Args:
-        method: The `find` or `find_one` method name.
-        arguments: Bound query arguments in the official method's order.
-
-    Returns:
-        Both normalized calls, or `None` for a call whose arguments cannot be
-        represented by its closed vocabulary.
-    """
-    analysis = bound_call(
-        lambda: ExactCall(method, tuple((name, freeze(value)) for name, value in arguments))
-    )
-    key = bound_call(
-        lambda: ExactCall(method, tuple((name, key_freeze(value)) for name, value in arguments))
-    )
-    return analysis, key
-
-
 def parse_schema_view(value: object) -> SchemaView:
     """Rebuild the analyzer view from its compact stored bytes.
 
@@ -410,9 +480,72 @@ def parse_schema_view(value: object) -> SchemaView:
     return SchemaView.from_compact(value)
 
 
+def population_callback(
+    returned_fields: Mapping[str, str] | None,
+    settings: CacheSettings,
+) -> Callable[[object], AgeDecision] | None:
+    """Build a response-age callback for reads returning image or URL fields.
+
+    Args:
+        returned_fields: Returned field names mapped to schema data types.
+            The callback retains this mapping by reference.
+        settings: Cache settings governing response-derived safety caps.
+
+    Returns:
+        A callback that evaluates a response against the current UTC time, or
+        `None` when no returned field has the image or URL data type.
+    """
+    if not returned_fields or not {'image', 'url'} & set(returned_fields.values()):
+        return None
+    selected = returned_fields
+
+    def decide(value: object) -> AgeDecision:
+        return cap_response_age(value, selected, datetime.now(tz=UTC), settings)
+
+    return decide
+
+
+def require_context_namespace(settings: CacheSettings, context: ClientContext) -> None:
+    """Require a shared cache's configured namespace to match the client context.
+
+    Raises:
+        ValueError: L2 is enabled and the namespaces disagree.
+    """
+    if settings.l2.enabled and context.site_namespace != settings.site_namespace:
+        raise ValueError('shared cache context must use the configured site namespace')
+
+
 def schema_changes(site_namespace: str) -> tuple[GenerationChange, ...]:
     """Build the schema generation change for understood schema writes."""
     return (GenerationChange(DependencyTag.schema(site_namespace)),)
+
+
+def schema_entity_read_call(project_entity: object) -> ExactCall | None:
+    """Build the exact `schema_entity_read` key, or `None` for an unfreezable project."""
+    return _bound_call(
+        lambda: ExactCall(
+            'schema_entity_read',
+            (('project_entity', _key_freeze(project_entity)),),
+        )
+    )
+
+
+def schema_field_read_call(
+    entity_type: str,
+    field_name: str | None,
+    project_entity: object,
+) -> ExactCall | None:
+    """Build the exact `schema_field_read` key, or `None` for an unfreezable project."""
+    return _bound_call(
+        lambda: ExactCall(
+            'schema_field_read',
+            (
+                ('entity_type', entity_type),
+                ('field_name', field_name),
+                ('project_entity', _key_freeze(project_entity)),
+            ),
+        )
+    )
 
 
 def schema_plan(
@@ -427,12 +560,76 @@ def schema_plan(
     )
 
 
+def schema_read_call(project_entity: object) -> ExactCall | None:
+    """Build the exact `schema_read` key, or `None` for an unfreezable project."""
+    return _bound_call(
+        lambda: ExactCall('schema_read', (('project_entity', _key_freeze(project_entity)),))
+    )
+
+
+def schema_view_call(context: ClientContext) -> ExactCall:
+    """Build the key of the site's identity-scoped compact schema view."""
+    return ExactCall(
+        'schema_view',
+        (('project_entity', None), ('site_url', context.site_url)),
+    )
+
+
+def site_call(call: ExactCall, context: ClientContext) -> ExactCall:
+    """Append the site URL that every stored read key includes."""
+    return ExactCall(call.method, (*call.arguments, ('site_url', context.site_url)))
+
+
 def site_changes(site_namespace: str) -> tuple[GenerationChange, ...]:
     """Build the broad safe fallback for composite or unknown writes."""
     return (GenerationChange(DependencyTag.site(site_namespace)),)
 
 
-def create_post_changes(
+def _batch_changes(
+    site_namespace: str,
+    requests: list[dict[str, object]],
+) -> tuple[GenerationChange, ...]:
+    """Union understood batch effects or broaden the whole batch to site."""
+    changes: dict[GenerationChange, None] = {}
+    for request in requests:
+        request_type = request.get('request_type')
+        entity_type = request.get('entity_type')
+        entity_id = request.get('entity_id')
+        if not isinstance(entity_type, str) or not entity_type:
+            return site_changes(site_namespace)
+        data = request.get('data')
+        if isinstance(data, Mapping):
+            fields = cast('Mapping[object, object]', data)
+            if any(not isinstance(field, str) or not field for field in fields):
+                return site_changes(site_namespace)
+        if request_type == 'create' and isinstance(request.get('data'), Mapping):
+            current = _create_changes(
+                site_namespace,
+                entity_type,
+                cast('Mapping[str, object]', request['data']),
+            )
+        elif (
+            request_type == 'update'
+            and _positive_id(entity_id)
+            and isinstance(request.get('data'), Mapping)
+        ):
+            current = _update_changes(
+                site_namespace,
+                entity_type,
+                entity_id,
+                cast('Mapping[str, object]', request['data']),
+            )
+        elif request_type == 'delete' and _positive_id(entity_id):
+            current = lifecycle_changes(site_namespace, entity_type, entity_id)
+        else:
+            return site_changes(site_namespace)
+        changes.update(dict.fromkeys(current))
+        if len(changes) > _MAX_BATCH_CHANGES:
+            return site_changes(site_namespace)
+    return tuple(changes) if changes else site_changes(site_namespace)
+
+
+def _create_post_changes(
     site_namespace: str,
     entity_type: str,
     changes: tuple[GenerationChange, ...],
@@ -448,34 +645,19 @@ def create_post_changes(
             return site_changes(site_namespace)
     except Exception:  # noqa: BLE001 - malformed success requires a site fence
         return site_changes(site_namespace)
-    entity_change = GenerationChange(
-        DependencyTag.entity(site_namespace, entity_type, cast('int', entity_id))
-    )
+    entity_change = GenerationChange(DependencyTag.entity(site_namespace, entity_type, entity_id))
     return changes if entity_change in changes else (*changes, entity_change)
 
 
-def batch_post_changes(
+def _batch_post_changes(
     site_namespace: str,
     requests: list[dict[str, object]],
     changes: tuple[GenerationChange, ...],
     value: object,
 ) -> tuple[GenerationChange, ...]:
-    """Add created-entity tags or broaden an uncertain batch result to the site.
-
-    Args:
-        site_namespace: Shared invalidation namespace for the batch.
-        requests: Original batch requests in dispatch order.
-        changes: Conservative changes already derived before dispatch.
-        value: Raw batch response, with one result per request.
-
-    Returns:
-        The original changes when already site-wide or when no request creates
-        an entity. Otherwise, append unique created-entity tags in request
-        order, or return only the site change if a required result is
-        malformed.
-    """
+    """Add created-entity tags or broaden an uncertain batch result to the site."""
     site = site_changes(site_namespace)
-    if changes == site or not batch_has_create(requests):
+    if changes == site or not _batch_has_create(requests):
         return changes
     results = cast('list[object]', value) if isinstance(value, list) else None
     if results is None or len(results) != len(requests):
@@ -487,7 +669,7 @@ def batch_post_changes(
         entity_type = request.get('entity_type')
         if not isinstance(entity_type, str):
             return site
-        created = create_post_changes(
+        created = _create_post_changes(
             site_namespace,
             entity_type,
             (),
@@ -499,6 +681,43 @@ def batch_post_changes(
         if len(post_changes) > _MAX_BATCH_CHANGES:
             return site
     return tuple(post_changes)
+
+
+def batch_write_plan(site_namespace: str, requests: list[dict[str, object]]) -> WritePlan:
+    """Plan batch fences, broadening implicit uploads and indeterminate creates to the site."""
+    site = site_changes(site_namespace)
+    composite = any(
+        isinstance(request.get('data'), Mapping)
+        and not _IMPLICIT_UPLOAD_FIELDS.isdisjoint(cast('Mapping[str, object]', request['data']))
+        for request in requests
+    )
+    if composite:
+        return WritePlan(site, indeterminate_changes=site, repeat_on_exception=True)
+    changes = _batch_changes(site_namespace, requests)
+    return WritePlan(
+        changes,
+        post_changes=lambda value: _batch_post_changes(site_namespace, requests, changes, value),
+        indeterminate_changes=site if _batch_has_create(requests) else changes,
+    )
+
+
+def create_write_plan(
+    site_namespace: str,
+    entity_type: str,
+    data: Mapping[str, object],
+) -> WritePlan:
+    """Plan a create's fences, adding the created entity after success."""
+    site = site_changes(site_namespace)
+    if not _IMPLICIT_UPLOAD_FIELDS.isdisjoint(data):
+        return WritePlan(site, indeterminate_changes=site, repeat_on_exception=True)
+    changes = _create_changes(site_namespace, entity_type, data)
+    return WritePlan(
+        changes,
+        post_changes=lambda value: _create_post_changes(
+            site_namespace, entity_type, changes, value
+        ),
+        indeterminate_changes=site,
+    )
 
 
 def ttl_only_plan(
@@ -536,65 +755,33 @@ def unconditional_entity_plan(
     return None
 
 
-def update_changes(
+def update_write_plan(
     site_namespace: str,
     entity_type: str,
     entity_id: int,
     data: Mapping[str, object],
-) -> tuple[GenerationChange, ...]:
-    """Build exact entity, value, changed-field, and membership changes."""
-    tags = [
-        *_security_visibility_tags(site_namespace, entity_type, entity_id, data),
-        DependencyTag.entity(site_namespace, entity_type, entity_id),
-        DependencyTag.type_value(site_namespace, entity_type),
-    ]
-    tags.extend(DependencyTag.type_field(site_namespace, entity_type, field) for field in data)
-    tags.append(DependencyTag.type_membership(site_namespace, entity_type))
-    return tuple(GenerationChange(tag) for tag in tags)
+) -> WritePlan:
+    """Plan an update's fences, broadening implicit uploads to the site."""
+    if not _IMPLICIT_UPLOAD_FIELDS.isdisjoint(data):
+        return WritePlan(site_changes(site_namespace), repeat_on_exception=True)
+    return WritePlan(_update_changes(site_namespace, entity_type, entity_id, data))
 
 
-def batch_changes(
-    site_namespace: str,
-    requests: list[dict[str, object]],
-) -> tuple[GenerationChange, ...]:
-    """Union understood batch effects or broaden the whole batch to site."""
-    changes: dict[GenerationChange, None] = {}
-    for request in requests:
-        request_type = request.get('request_type')
-        entity_type = request.get('entity_type')
-        if not isinstance(entity_type, str) or not entity_type:
-            return site_changes(site_namespace)
-        data = request.get('data')
-        if isinstance(data, Mapping):
-            fields = cast('Mapping[object, object]', data)
-            if any(not isinstance(field, str) or not field for field in fields):
-                return site_changes(site_namespace)
-        if request_type == 'create' and isinstance(request.get('data'), Mapping):
-            current = create_changes(
-                site_namespace,
-                entity_type,
-                cast('Mapping[str, object]', request['data']),
-            )
-        elif (
-            request_type == 'update'
-            and _positive_id(request.get('entity_id'))
-            and isinstance(request.get('data'), Mapping)
-        ):
-            current = update_changes(
-                site_namespace,
-                entity_type,
-                cast('int', request['entity_id']),
-                cast('Mapping[str, object]', request['data']),
-            )
-        elif request_type == 'delete' and _positive_id(request.get('entity_id')):
-            current = lifecycle_changes(
-                site_namespace,
-                entity_type,
-                cast('int', request['entity_id']),
-            )
-        else:
-            return site_changes(site_namespace)
-        changes.update(dict.fromkeys(current))
-        if len(changes) > _MAX_BATCH_CHANGES:
-            return site_changes(site_namespace)
-    return tuple(changes) if changes else site_changes(site_namespace)
+def work_schedule_read_call(
+    start_date: str,
+    end_date: str,
+    project: object,
+    user: object,
+) -> ExactCall | None:
+    """Build the exact `work_schedule_read` key, or `None` for an unfreezable entity."""
+    return _bound_call(
+        lambda: ExactCall(
+            'work_schedule_read',
+            (
+                ('start_date', start_date),
+                ('end_date', end_date),
+                ('project', _key_freeze(project)),
+                ('user', _key_freeze(user)),
+            ),
+        )
+    )

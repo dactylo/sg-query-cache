@@ -1,13 +1,13 @@
-from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TypeVar, cast
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import cast
 
 import pytest
 from valkey.exceptions import ConnectionError as ValkeyConnectionError
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
 import sg_query_cache._cache as cache_module
+import sg_query_cache.valkey as valkey_module
 from sg_query_cache import daemon_plugin
 from sg_query_cache._backend import (
     BackendUnavailable,
@@ -30,10 +30,10 @@ from sg_query_cache._model import (
     Identity,
 )
 from sg_query_cache._valkey_scripts import (
+    COMMIT_SCRIPT_SHA,
     CONTROL_CREATE_SCRIPT_SHA,
     LOOKUP_SCRIPT_SHA,
     RESOLVE_SCRIPT_SHA,
-    ScriptClient,
 )
 from sg_query_cache.valkey import (
     ValkeyBackend,
@@ -44,11 +44,9 @@ from sg_query_cache.valkey import (
     _RoleClient,
     _ValkeyClient,
 )
-from tests._fakes import _FakeClock, _RecordingMetrics
+from tests._fakes import CLIENT_OPTIONS, FakeClock, RecordingMetrics, asset_call, asset_plan
+from tests.valkey._control_helpers import AtomicControlClient, ProvingClient, enabled_settings
 
-_T = TypeVar('_T')
-
-_CLIENT_OPTIONS = {'localized': False, 'convert_datetimes_to_utc': True}
 _SITE = 'production'
 
 
@@ -57,62 +55,19 @@ class _EventContext:
     event: Mapping[str, object]
 
 
-class _CapacityControlClient:
-    def __init__(self) -> None:
-        self._control: bytes | None = None
-        self._counter_key: str | None = None
-
-    def close(self) -> None:
-        return None
-
-    def epoch(self) -> tuple[int, int, None]:
-        return 0, 0, None
-
+class _CapacityControlClient(AtomicControlClient):
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         if sha == RESOLVE_SCRIPT_SHA:
             return [b'capacity']
         assert sha == CONTROL_CREATE_SCRIPT_SHA
-        assert numkeys == 2
-        _control_key, counter_key, record = cast('tuple[str, str, bytes]', keys_and_args)
-        self._counter_key = counter_key
-        if self._control is None:
-            self._control = record
-            return [b'created', record]
-        return [b'winner', self._control]
-
-    def exists(self, key: str) -> object:
-        return int(key == self._counter_key)
-
-    def get(self, key: str) -> object:
-        _ = key
-        return self._control
-
-    def info(self, section: str) -> object:
-        assert section == 'replication'
-        return {'role': 'master', 'master_replid': 'a' * 40}
-
-    @contextmanager
-    def pin(self) -> Generator['_CapacityControlClient']:
-        yield self
-
-    def refresh(self) -> None:
-        return None
-
-    def refresh_endpoint(self) -> None:
-        return None
-
-    def run_operation(self, operation: Callable[[ScriptClient], _T]) -> _T:
-        return operation(self)
-
-    def script_load(self, script: bytes | str) -> object:
-        raise AssertionError(script)
+        return super().evalsha(sha, numkeys, *keys_and_args)
 
 
 class _FailingResultClient:
     def __init__(self, failures: list[Exception]) -> None:
-        self._evalsha_calls = 0
+        self.evalsha_calls = 0
         self._failures = failures
-        self._refresh_calls = 0
+        self.refresh_calls = 0
 
     def close(self) -> None:
         return None
@@ -121,11 +76,11 @@ class _FailingResultClient:
         assert sha == LOOKUP_SCRIPT_SHA
         assert numkeys == 1
         _ = keys_and_args
-        self._evalsha_calls += 1
+        self.evalsha_calls += 1
         raise self._failures.pop(0)
 
     def refresh(self) -> None:
-        self._refresh_calls += 1
+        self.refresh_calls += 1
 
 
 class _MalformedPayloadBackend:
@@ -165,30 +120,12 @@ class _SchemaUnavailableClient:
     def __init__(self) -> None:
         self._find_calls = 0
 
-    def find(  # noqa: PLR0913, PLR0917 - official-compatible test boundary
+    def find(
         self,
         entity_type: str,
-        filters: object,
-        fields: list[str] | None = None,
-        order: list[dict[str, str]] | None = None,
-        filter_operator: str | None = None,
-        limit: int = 0,
-        retired_only: bool = False,
-        page: int = 0,
-        include_archived_projects: bool = True,
-        additional_filter_presets: object = None,
+        *_args: object,
+        **_kwargs: object,
     ) -> list[dict[str, object]]:
-        _ = (
-            filters,
-            fields,
-            order,
-            filter_operator,
-            limit,
-            retired_only,
-            page,
-            include_archived_projects,
-            additional_filter_presets,
-        )
         self._find_calls += 1
         return [{'id': self._find_calls, 'type': entity_type}]
 
@@ -213,21 +150,21 @@ class _StaticMetadata:
 
 class _TimeoutRawClient:
     def __init__(self, command_failure: Exception | None = None) -> None:
-        self._close_calls = 0
+        self.close_calls = 0
         self._command_failure = command_failure
-        self._evalsha_calls = 0
+        self.evalsha_calls = 0
 
     def client(self) -> '_TimeoutRawClient':
         return self
 
     def close(self) -> None:
-        self._close_calls += 1
+        self.close_calls += 1
 
     def evalsha(self, sha: str, numkeys: int, *keys_and_args: object) -> object:
         assert sha == LOOKUP_SCRIPT_SHA
         assert numkeys == 1
         _ = keys_and_args
-        self._evalsha_calls += 1
+        self.evalsha_calls += 1
         if self._command_failure is not None:
             raise self._command_failure
         return [b'miss']
@@ -245,41 +182,25 @@ class _TimeoutRawClient:
         raise AssertionError(script)
 
 
-def _call(entity_type: str = 'Asset') -> ExactCall:
-    return ExactCall('find', (('entity_type', entity_type), ('filters', ())))
-
-
 def _cache(backend: CacheBackend, settings: CacheSettings | None = None) -> QueryCache:
     selected = settings or CacheSettings()
     return QueryCache(
         selected,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
     )
 
 
-def _plan() -> DependencyPlan:
-    return DependencyPlan(
-        'event_aware',
-        (
-            DependencyTag.site(_SITE),
-            DependencyTag.authorization(_SITE),
-            DependencyTag.type_membership(_SITE, 'Asset'),
-        ),
-        'event_aware',
-    )
-
-
 def _read(cache: QueryCache, fetch: Callable[[], object], call: ExactCall | None = None) -> object:
-    return cache.read(call or _call(), _plan(), fetch, _CLIENT_OPTIONS)
+    return cache.read(call or asset_call(), asset_plan(), fetch, CLIENT_OPTIONS)
 
 
 def _assert_single_direct_sg_result(backend: CacheBackend, settings: CacheSettings) -> None:
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l2=backend,
     )
     calls = 0
@@ -304,7 +225,7 @@ def _shared_settings(*, circuit_failure_threshold: int = 5) -> CacheSettings:
 def test_codec_refusal_preserves_direct_sg_access(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = LocalBackend(CacheSettings(), _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(CacheSettings(), FakeClock(), RecordingMetrics())
     cache = _cache(backend)
     calls = 0
 
@@ -326,8 +247,8 @@ def test_failure_mode_cannot_extend_cached_value_past_maximum_age(
     failure_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = _FakeClock()
-    backend = LocalBackend(CacheSettings(), clock, _RecordingMetrics())
+    clock = FakeClock()
+    backend = LocalBackend(CacheSettings(), clock, RecordingMetrics())
     cache = _cache(backend)
     calls = 0
 
@@ -336,16 +257,20 @@ def test_failure_mode_cannot_extend_cached_value_past_maximum_age(
         calls += 1
         return [{'call': calls}]
 
-    monkeypatch.setattr(daemon_plugin._State, '_backend', backend)
-    monkeypatch.setattr(daemon_plugin._State, '_site_namespace', _SITE)
-    assert cache.read(_call(), _plan(), fetch, _CLIENT_OPTIONS, per_call_age=1) == [{'call': 1}]
+    monkeypatch.setattr(daemon_plugin._State, 'backend', backend)
+    monkeypatch.setattr(daemon_plugin._State, 'site_namespace', _SITE)
+    assert cache.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=1) == [
+        {'call': 1}
+    ]
     if failure_mode == 'closed-backend':
         backend.close()
     else:
-        monkeypatch.setattr(daemon_plugin._State, '_backend', None)
-        monkeypatch.setattr(daemon_plugin._State, '_site_namespace', None)
-    clock._advance(2)
-    assert cache.read(_call(), _plan(), fetch, _CLIENT_OPTIONS, per_call_age=1) == [{'call': 2}]
+        monkeypatch.setattr(daemon_plugin._State, 'backend', None)
+        monkeypatch.setattr(daemon_plugin._State, 'site_namespace', None)
+    clock.advance(2)
+    assert cache.read(asset_call(), asset_plan(), fetch, CLIENT_OPTIONS, per_call_age=1) == [
+        {'call': 2}
+    ]
 
 
 def test_malformed_cache_data_falls_back_to_direct_sg_without_population() -> None:
@@ -362,15 +287,15 @@ def test_malformed_cache_data_falls_back_to_direct_sg_without_population() -> No
 
 
 def test_real_local_metadata_capacity_preserves_direct_sg_access() -> None:
-    probe_metrics = _RecordingMetrics()
-    LocalBackend(CacheSettings(), _FakeClock(), probe_metrics)
+    probe_metrics = RecordingMetrics()
+    LocalBackend(CacheSettings(), FakeClock(), probe_metrics)
     permanent_bytes = next(
         int(value)
-        for name, value, labels in probe_metrics._observations
+        for name, value, labels in probe_metrics.observations
         if name == 'generation_metadata_bytes' and labels == {'tag_kind': 'global'}
     )
     settings = CacheSettings(l1=L1Settings(metadata_budget_bytes=permanent_bytes))
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = _cache(backend, settings)
     scoped = DependencyPlan(
         'event_aware',
@@ -379,10 +304,10 @@ def test_real_local_metadata_capacity_preserves_direct_sg_access() -> None:
     )
 
     assert cache.read(
-        _call(),
+        asset_call(),
         scoped,
         lambda: [{'source': 'sg'}],
-        _CLIENT_OPTIONS,
+        CLIENT_OPTIONS,
     ) == [{'source': 'sg'}]
 
 
@@ -393,12 +318,12 @@ def test_real_open_breaker_preserves_direct_sg_access_without_more_valkey_io() -
         cast('_ValkeyClient', client),
         _StaticMetadata(),
         settings,
-        _RecordingMetrics(),
+        RecordingMetrics(),
     )
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l2=backend,
     )
     calls = 0
@@ -410,34 +335,34 @@ def test_real_open_breaker_preserves_direct_sg_access_without_more_valkey_io() -
 
     assert _read(cache, fetch) == [{'call': 1}]
     assert _read(cache, fetch) == [{'call': 2}]
-    assert client._evalsha_calls == 1
+    assert client.evalsha_calls == 1
 
 
 def test_real_valkey_metadata_capacity_preserves_direct_sg_access() -> None:
     settings = _shared_settings()
     control_client = _CapacityControlClient()
-    metadata = ValkeyMetadataStore(control_client, settings, _RecordingMetrics())
+    metadata = ValkeyMetadataStore(control_client, settings, RecordingMetrics())
     result_client = _FailingResultClient([])
     backend = ValkeyBackend(
         cast('_ValkeyClient', result_client),
         metadata,
         settings,
-        _RecordingMetrics(),
+        RecordingMetrics(),
     )
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l2=backend,
     )
 
     assert _read(cache, lambda: [{'source': 'sg'}]) == [{'source': 'sg'}]
-    assert result_client._evalsha_calls == 0
+    assert result_client.evalsha_calls == 0
 
 
 def test_result_eviction_never_serves_an_evicted_value() -> None:
     settings = CacheSettings(l1=L1Settings(result_budget_bytes=350))
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = _cache(backend, settings)
     calls = {'Asset': 0, 'Shot': 0}
 
@@ -445,15 +370,19 @@ def test_result_eviction_never_serves_an_evicted_value() -> None:
         calls[entity_type] += 1
         return [{'type': entity_type, 'call': calls[entity_type]}]
 
-    assert _read(cache, lambda: fetch('Asset'), _call('Asset')) == [{'type': 'Asset', 'call': 1}]
-    assert _read(cache, lambda: fetch('Shot'), _call('Shot')) == [{'type': 'Shot', 'call': 1}]
-    assert _read(cache, lambda: fetch('Asset'), _call('Asset')) == [{'type': 'Asset', 'call': 2}]
+    assert _read(cache, lambda: fetch('Asset'), asset_call('Asset')) == [
+        {'type': 'Asset', 'call': 1}
+    ]
+    assert _read(cache, lambda: fetch('Shot'), asset_call('Shot')) == [{'type': 'Shot', 'call': 1}]
+    assert _read(cache, lambda: fetch('Asset'), asset_call('Asset')) == [
+        {'type': 'Asset', 'call': 2}
+    ]
 
 
 def test_skipped_callback_without_setup_flush_is_not_reported_as_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = LocalBackend(CacheSettings(), _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(CacheSettings(), FakeClock(), RecordingMetrics())
     cache = _cache(backend)
     calls = 0
 
@@ -463,26 +392,99 @@ def test_skipped_callback_without_setup_flush_is_not_reported_as_success(
         return [{'call': calls}]
 
     assert _read(cache, fetch) == [{'call': 1}]
-    monkeypatch.setattr(daemon_plugin._State, '_backend', None)
-    monkeypatch.setattr(daemon_plugin._State, '_site_namespace', None)
+    monkeypatch.setattr(daemon_plugin._State, 'backend', None)
+    monkeypatch.setattr(daemon_plugin._State, 'site_namespace', None)
 
     with pytest.raises(RuntimeError, match='setup is incomplete'):
-        daemon_plugin.callback(_EventContext({}))
+        daemon_plugin._callback(_EventContext({}))
     assert _read(cache, fetch) == [{'call': 1}]
 
-    monkeypatch.setattr(daemon_plugin._State, '_backend', backend)
-    monkeypatch.setattr(daemon_plugin._State, '_site_namespace', _SITE)
+    monkeypatch.setattr(daemon_plugin._State, 'backend', backend)
+    monkeypatch.setattr(daemon_plugin._State, 'site_namespace', _SITE)
     backend.flush_site(_SITE, 'daemon_recovery')
     assert _read(cache, fetch) == [{'call': 2}]
 
 
+def test_sync_backend_recovers_after_construction_during_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = enabled_settings('managed')
+    settings = replace(
+        settings,
+        l2=replace(settings.l2, acknowledge_mutually_trusted_clients=True),
+        limits=replace(settings.limits, circuit_failure_threshold=1),
+    )
+    clock = FakeClock()
+    outage = True
+    factory_calls: list[str] = []
+    clients: dict[str, ProvingClient] = {}
+    payloads: list[bytes] = []
+
+    class _ResultClient(ProvingClient):
+        def evalsha(self, sha: str, numkeys: int, *args: object) -> object:
+            if sha == COMMIT_SCRIPT_SHA:
+                payloads.append(next(value for value in args if isinstance(value, bytes)))
+            return super().evalsha(sha, numkeys, *args)
+
+    def create_client(**kwargs: object) -> ProvingClient:
+        host = cast('str', kwargs['host'])
+        factory_calls.append(host)
+        if outage:
+            raise ValkeyConnectionError('outage')
+        client_type = ProvingClient if host == 'metadata.example' else _ResultClient
+        client = client_type(cast('Callable[[object], None]', kwargs['valkey_connect_func']))
+        if host == 'metadata.example':
+            client.metadata_replies.extend([[b'ok', 1, 1, 1]] * 6)
+        else:
+            client.metadata_replies.extend(([b'miss'], [b'reserved'], [b'miss'], [b'committed']))
+        clients[host] = client
+        return client
+
+    monkeypatch.setattr(valkey_module, 'Valkey', create_client)
+    backend = ValkeyBackend.from_settings(
+        settings,
+        {'METADATA_PASSWORD': 'secret', 'RESULT_PASSWORD': 'secret'},
+        RecordingMetrics(),
+    )
+    metadata = cast('ValkeyMetadataStore', backend._metadata)
+    metadata._breaker = _CircuitBreaker(
+        'metadata', threshold=1, probe_seconds=10, metrics=RecordingMetrics(), clock=clock
+    )
+    assert factory_calls == []
+    cache = QueryCache(
+        settings, Identity('script', 'studio', 'render'), key_builder=KeyBuilder(), l2=backend
+    )
+    calls = 0
+
+    def fetch() -> list[dict[str, int]]:
+        nonlocal calls
+        calls += 1
+        return [{'call': calls}]
+
+    assert _read(cache, fetch) == [{'call': 1}]
+    assert factory_calls == ['metadata.example']
+    assert _read(cache, fetch) == [{'call': 2}]
+    assert factory_calls == ['metadata.example']
+    outage = False
+    clock.advance(10)
+    assert _read(cache, fetch) == [{'call': 3}]
+    result = clients['result.example']
+    # Reuse the actual committed envelope as the result server's next hit.
+    assert result.metadata_replies == []
+    result.metadata_replies.append([b'hit', payloads[0], 30000])
+    assert _read(cache, fetch) == [{'call': 3}]
+    assert calls == 3
+    assert factory_calls == ['metadata.example', 'metadata.example', 'result.example']
+    cache.close()
+
+
 def test_unavailable_schema_bypasses_cache_and_keeps_find_available() -> None:
     settings = CacheSettings(site_namespace='studio')
-    backend = LocalBackend(settings, _FakeClock(), _RecordingMetrics())
+    backend = LocalBackend(settings, FakeClock(), RecordingMetrics())
     cache = QueryCache(
         settings,
         Identity('script', 'studio', 'render'),
-        KeyBuilder(),
+        key_builder=KeyBuilder(),
         l1=backend,
     )
     client = _SchemaUnavailableClient()
@@ -490,8 +492,8 @@ def test_unavailable_schema_bypasses_cache_and_keeps_find_available() -> None:
         client,
         cache,
         ClientContext(
-            'https://example.shotgrid.autodesk.com',
-            'studio',
+            site_url='https://example.shotgrid.autodesk.com',
+            site_namespace='studio',
             localized=False,
             convert_datetimes_to_utc=True,
             records_per_page=500,
@@ -509,13 +511,13 @@ def test_valkey_command_operation_timeout_preserves_direct_sg_without_retry() ->
         cast('_ValkeyClient', client),
         _StaticMetadata(),
         settings,
-        _RecordingMetrics(),
+        RecordingMetrics(),
     )
 
     _assert_single_direct_sg_result(backend, settings)
 
-    assert client._refresh_calls == 0
-    assert client._evalsha_calls == 1
+    assert client.refresh_calls == 0
+    assert client.evalsha_calls == 1
 
 
 def test_valkey_connection_establishment_timeout_preserves_direct_sg_without_retry() -> None:
@@ -531,26 +533,27 @@ def test_valkey_connection_establishment_timeout_preserves_direct_sg_without_ret
         raise ValkeyTimeoutError('connection establishment timed out')
 
     client = _RoleClient(factory, _ConnectionGeneration())
+    client.refresh()
     backend = ValkeyBackend(
         client,
         _StaticMetadata(),
         settings,
-        _RecordingMetrics(),
+        RecordingMetrics(),
     )
-    clock = _FakeClock()
+    clock = FakeClock()
     breaker = _CircuitBreaker(
         'result',
         threshold=1,
         probe_seconds=1,
-        metrics=_RecordingMetrics(),
+        metrics=RecordingMetrics(),
         clock=clock,
     )
     breaker.fail()
-    clock._advance(1)
+    clock.advance(1)
     backend._result_breaker = breaker
 
     _assert_single_direct_sg_result(backend, settings)
 
     assert factory_calls == 2
-    assert raw._evalsha_calls == 0
-    assert raw._close_calls == 1
+    assert raw.evalsha_calls == 0
+    assert raw.close_calls == 1
